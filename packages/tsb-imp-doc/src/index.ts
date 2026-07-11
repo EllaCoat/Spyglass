@@ -1,6 +1,7 @@
 import type { ProjectInitializer } from '@spyglassmc/core'
 import { declaration as bindDeclaration } from './binder/declaration.js'
 import { impDoc as checkImpDoc } from './checker/impDoc.js'
+import { registerVisibilityCompleters } from './completer/visibility.js'
 import type {
 	ImpDocDeclarationNode,
 	ImpDocNode,
@@ -13,6 +14,20 @@ export * from './parser/impDoc.js'
 export * from './util/withinPattern.js'
 
 export const initialize: ProjectInitializer = ({ meta }) => {
+	const mcfunction = meta.getLanguageOptions('mcfunction')
+	if (!mcfunction?.parser) {
+		throw new Error(
+			'[tsb-imp-doc] mcfunction must be initialized before tsb-imp-doc',
+		)
+	}
+
+	// parser-only な CLI (= tsb-imp-doc-cli) は completer を登録しないので
+	// wrapper もスキップ。 Language Server 経路では je.initialize 後に本
+	// initialize が呼ばれるため、 3 completer が揃う。
+	if (mcfunction.completer) {
+		registerVisibilityCompleters(meta)
+	}
+
 	meta.registerParser<ImpDocNode>('impDoc', impDoc)
 	meta.registerBinder<ImpDocDeclarationNode>(
 		'impDoc:declaration',
@@ -25,10 +40,6 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		nodePredicate: (node): node is ImpDocNode => node.type === 'impDoc',
 	})
 
-	const mcfunction = meta.getLanguageOptions('mcfunction')
-	if (!mcfunction?.parser) {
-		throw new Error('[tsb-imp-doc] mcfunction must be initialized before tsb-imp-doc')
-	}
 	meta.registerLanguage('mcfunction', {
 		...mcfunction,
 		parser: extendMcfunctionParser(mcfunction.parser),

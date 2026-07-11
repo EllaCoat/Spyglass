@@ -140,6 +140,38 @@ function assertNoViolation(state: RuntimeState): void {
 	assert.deepEqual(state.node.linterErrors ?? [], [])
 }
 
+function findFunctionCall(state: RuntimeState): core.ResourceLocationNode {
+	let result: core.ResourceLocationNode | undefined
+	core.traversePreOrder(
+		state.node,
+		() => result === undefined,
+		core.ResourceLocationNode.is,
+		(node) => {
+			if (node.options.category === 'function') {
+				result = node
+			}
+		},
+	)
+	assert.ok(result)
+	return result
+}
+
+function completeFunctionCall(
+	project: core.Project,
+	state: RuntimeState,
+): core.CompletionItem[] {
+	const call = findFunctionCall(state)
+	const ctx = core.CompleterContext.create(project, {
+		doc: state.doc,
+		offset: call.range.end,
+	})
+	return core.completer.file(state.node, ctx)
+}
+
+function completionKey(item: core.CompletionItem): string {
+	return `${item.label}\0${item.range.start}:${item.range.end}`
+}
+
 function assertSingleViolation(
 	state: RuntimeState,
 	caller: string,
@@ -324,6 +356,36 @@ describe('IMP-Doc private visibility runtime', () => {
 
 	it('allows a caller selected by @within', () => {
 		assertNoViolation(getState(states, 'main'))
+	})
+
+	it('filters function completion by caller and dedupes built-in items', () => {
+		assert.ok(project)
+
+		const allowed = completeFunctionCall(project, getState(states, 'main'))
+		assert.equal(
+			allowed.filter(item => item.label === Target).length,
+			1,
+			'@within caller should receive owner:helper exactly once',
+		)
+		assert.equal(
+			allowed.filter(item => item.label === FunctionIds.main).length,
+			1,
+			'public built-in candidate should be deduped',
+		)
+		assert.equal(
+			new Set(allowed.map(completionKey)).size,
+			allowed.length,
+		)
+
+		const denied = completeFunctionCall(
+			project,
+			getState(states, 'external'),
+		)
+		assert.equal(
+			denied.filter(item => item.label === Target).length,
+			0,
+			'external caller must not receive owner:helper',
+		)
 	})
 
 	it('reports exactly one external private call', () => {
