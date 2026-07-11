@@ -1,7 +1,5 @@
 import * as core from '@spyglassmc/core'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
-import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { parseVisibility, stampVisibility } from '../util/withinPattern.js'
 
 function getCurrentFunctionSymbol(
 	ctx: core.CheckerContext,
@@ -19,6 +17,10 @@ function getCurrentFunctionSymbol(
 	return ans
 }
 
+/**
+ * Visibility stamp は binder phase (`binder/impDoc.ts`) に移行済み。
+ * checker には functionID mismatch diagnostic と child checker dispatch のみ残す。
+ */
 export const impDoc: core.Checker<ImpDocNode> = async (node, ctx) => {
 	const parsedID = node.functionID?.raw
 	const currentFunction = getCurrentFunctionSymbol(ctx)
@@ -28,28 +30,6 @@ export const impDoc: core.Checker<ImpDocNode> = async (node, ctx) => {
 			`Expected function ID “${currentFunction.identifier}”, got “${parsedID}”`,
 			node.functionID!,
 		)
-	}
-
-	// declaration doc (functionID なし) や ID mismatch header doc は
-	// function symbol の visibility を更新しない。
-	// これで _index.d の「@private header + @public declaration doc」 layout での
-	// stamp → un-stamp 事故を防ぐ (= P1a で characterize 済み)。
-	if (
-		parsedID
-		&& (!currentFunction || currentFunction.identifier === parsedID)
-	) {
-		const symbol = ctx.symbols
-			.lookup('function', [parsedID], node)
-			.symbol
-		if (symbol) {
-			const visibility = parseVisibility(node.annotations, parsedID, ctx.err)
-				?? { type: 'public' as const }
-
-			node.visibility = visibility
-			node.symbol = symbol
-			symbol.desc = ImpDocNodeUtil.getDescription(node)
-			stampVisibility(symbol, visibility)
-		}
 	}
 
 	for (const child of node.children ?? []) {

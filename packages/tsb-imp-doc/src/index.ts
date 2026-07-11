@@ -1,5 +1,6 @@
 import type { ProjectInitializer } from '@spyglassmc/core'
 import { declaration as bindDeclaration } from './binder/declaration.js'
+import { impDoc as bindImpDoc } from './binder/impDoc.js'
 import { impDoc as checkImpDoc } from './checker/impDoc.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
 import type {
@@ -29,6 +30,7 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 	}
 
 	meta.registerParser<ImpDocNode>('impDoc', impDoc)
+	meta.registerBinder<ImpDocNode>('impDoc', bindImpDoc)
 	meta.registerBinder<ImpDocDeclarationNode>(
 		'impDoc:declaration',
 		bindDeclaration,

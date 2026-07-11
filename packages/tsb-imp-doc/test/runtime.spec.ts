@@ -403,7 +403,7 @@ describe('IMP-Doc private visibility runtime', () => {
 	})
 })
 
-describe('IMP-Doc private visibility runtime — open-order dependency (P1a characterization)', () => {
+describe('IMP-Doc private visibility runtime — open-order independence (P1b binder phase)', () => {
 	let project: core.Project | undefined
 	let cacheDir: string | undefined
 	let externalState: RuntimeState | undefined
@@ -438,13 +438,10 @@ describe('IMP-Doc private visibility runtime — open-order dependency (P1a char
 		await project.init()
 		await project.ready({ projectRootsWatcher: watcher })
 
-		// Open the caller BEFORE the private helper. Checker stamps
-		// `privateOwner` metadata only when helper is checked; no re-lint
-		// pass is triggered when helper is opened later, so the external
-		// caller may silent-skip the private violation. This describe
-		// characterizes the current behavior.
-		// P1b Step 4: target の visibility stamp 後に既 check caller を
-		// invalidate/re-lint する order-independent path を実装して反転する。
+		// Open the caller BEFORE the private helper. In P1b, visibility stamp
+		// moved from checker to binder phase, and Project.ready() binds every
+		// file before any file is checked, so target metadata is available
+		// regardless of open-order and the external violation must be reported.
 		for (const file of ['index', 'external', 'helper'] as const) {
 			const uri = RuntimeFiles[file]
 			const content = await readFile(fileURLToPath(uri), 'utf8')
@@ -464,8 +461,8 @@ describe('IMP-Doc private visibility runtime — open-order dependency (P1a char
 		}
 	})
 
-	it('currently silent-skips the external caller when helper is opened after', () => {
+	it('reports the external caller even when helper is opened after it', () => {
 		assert.ok(externalState)
-		assertNoViolation(externalState)
+		assertSingleViolation(externalState, 'external:caller')
 	})
 })
