@@ -280,6 +280,21 @@ describe('IMP-Doc private visibility runtime', () => {
 		)
 	})
 
+	it('registers #declare storage symbols through the impDoc:declaration binder', () => {
+		assert.ok(project)
+		const storageSymbol = project.symbols
+			.lookup('storage', ['owner:runtime'])
+			.symbol
+		assert.ok(storageSymbol)
+		const data = getImpDocSymbolData(storageSymbol.data)
+		// _index.d の declaration doc は @public、 storage 側の visibility も public。
+		assert.deepEqual(data?.visibility, { type: 'public' })
+		assert.equal(data?.declaration?.owner, 'owner:_index.d')
+		assert.equal(data?.declaration?.uri, RuntimeFiles.index)
+		// SymbolVisibility.Public = 2 (const enum、 数値照合)。
+		assert.equal(storageSymbol.visibility, 2)
+	})
+
 	it('keeps the header @private when a following declaration doc is public', () => {
 		// P1b の checker refactor で、 function symbol を触るのは functionID
 		// を持つ header doc だけになった。 declaration doc (functionID 無し) の
