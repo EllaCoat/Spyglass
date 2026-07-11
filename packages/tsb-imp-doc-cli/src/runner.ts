@@ -247,6 +247,7 @@ async function fingerprint(
 	const hash = createHash('sha256')
 	hash.update(JSON.stringify({
 		version: CacheVersion,
+		impDocVersion: impDoc.ImpDocVersion,
 		targetDir: resolve(options.targetDir),
 		skipUnresolved: options.skipUnresolved ?? false,
 		config: options.config ?? {},
