@@ -190,6 +190,8 @@ export class Project extends EventDispatcher<{
 	readonly #symbolUpToDateUris = new Set<string>()
 	readonly #initializers: readonly ProjectInitializer[]
 	#watcher: FileWatcher | undefined
+	#registeredWatcher: FileWatcher | undefined
+	#configUpdatePromise: Promise<void> = Promise.resolve()
 	get watchedFiles() {
 		return this.#watcher?.watchedFiles ?? new UriStore()
 	}
@@ -305,10 +307,9 @@ export class Project extends EventDispatcher<{
 		this.logger.info(`[Project] [init] projectRoots = ${projectRoots.join(' ')}`)
 
 		this.#configService.on('changed', ({ config }) => {
-			const oldConfig = this.config
-			this.config = config
-			this.logger.info('[Project] [Config] Changed')
-			this.emit('configChanged', { oldConfig, newConfig: config })
+			this.#configUpdatePromise = this.#configUpdatePromise
+				.then(() => this.applyConfigUpdate(config))
+				.catch(e => this.logger.error('[Project] [Config] Failed applying update', e))
 		}).on(
 			'error',
 			({ error, uri }) => this.logger.error(`[Project] [Config] Failed loading ${uri}`, error),
@@ -351,11 +352,7 @@ export class Project extends EventDispatcher<{
 		}).on('ready', () => {
 			this.#isReady = true
 			// Recheck client managed files after the READY process, as they may have incomplete results and are user-facing.
-			const promises: Promise<unknown>[] = []
-			for (const { doc, node } of this.#clientManagedDocAndNodes.values()) {
-				promises.push(this.bind(doc, node).then(() => this.check(doc, node)))
-			}
-			Promise.all(promises).catch(e =>
+			this.recheckClientManaged().catch(e =>
 				this.logger.error(
 					'[Project#ready] Error occurred when rechecking client managed files after READY',
 					e,
@@ -438,7 +435,9 @@ export class Project extends EventDispatcher<{
 
 		this.#isReady = false
 
-		this.#watcher = projectRootsWatcher
+		if (projectRootsWatcher !== undefined) {
+			this.#watcher = projectRootsWatcher
+		}
 
 		const getDependencies = async () => {
 			const dependencies: Dependency[] = []
@@ -490,28 +489,31 @@ export class Project extends EventDispatcher<{
 				return
 			}
 
-			this.#watcher
-				.on('add', (uri) => {
-					if (this.shouldExclude(uri)) {
-						return
-					}
-					this.emit('fileCreated', { uri })
-				})
-				.on('change', (uri) => {
-					if (this.shouldExclude(uri)) {
-						return
-					}
-					this.emit('fileModified', { uri })
-				})
-				.on('unlink', (uri) => {
-					// No `this.shouldExclude(uri)` check here as `unlink` events may be sent for
-					// hot-reload file exclusions. We want to be able to clean up the symbols for these
-					// excluded files.
-					this.emit('fileDeleted', { uri })
-				})
-				.on('error', (e) => {
-					this.logger.error('[Project#watcher]', e)
-				})
+			if (this.#registeredWatcher !== this.#watcher) {
+				this.#watcher
+					.on('add', (uri) => {
+						if (this.shouldExclude(uri)) {
+							return
+						}
+						this.emit('fileCreated', { uri })
+					})
+					.on('change', (uri) => {
+						if (this.shouldExclude(uri)) {
+							return
+						}
+						this.emit('fileModified', { uri })
+					})
+					.on('unlink', (uri) => {
+						// No `this.shouldExclude(uri)` check here as `unlink` events may be sent for
+						// hot-reload file exclusions. We want to be able to clean up the symbols for these
+						// excluded files.
+						this.emit('fileDeleted', { uri })
+					})
+					.on('error', (e) => {
+						this.logger.error('[Project#watcher]', e)
+					})
+				this.#registeredWatcher = this.#watcher
+			}
 
 			await this.#watcher.ready()
 		}
@@ -606,13 +608,13 @@ export class Project extends EventDispatcher<{
 			this.#bindingInProgressUris.clear()
 			this.#symbolUpToDateUris.clear()
 			this.#readyPromise = undefined
-			await this.ready()
+			await this.ready({ projectRootsWatcher: this.#watcher })
 		} catch (e) {
 			this.logger.error('[Project#reset]', e)
 		}
 	}
 
-	resetCache(): Promise<void> {
+	async resetCache(): Promise<void> {
 		this.logger.info('[Project#resetCache] Initiated...')
 
 		// Clear existing errors.
@@ -625,7 +627,38 @@ export class Project extends EventDispatcher<{
 		this.symbols = new SymbolUtil(symbols)
 		this.symbols.buildCache()
 
-		return this.restart()
+		for (const { node } of this.#clientManagedDocAndNodes.values()) {
+			node.binderErrors = undefined
+			node.checkerErrors = undefined
+			node.linterErrors = undefined
+		}
+
+		await this.restart()
+		await this.recheckClientManaged()
+	}
+
+	private async applyConfigUpdate(config: Config): Promise<void> {
+		const oldConfig = this.config
+		this.config = config
+		this.logger.info('[Project] [Config] Changed')
+		this.emit('configChanged', { oldConfig, newConfig: config })
+
+		if (
+			this.#isInitialized
+			&& await this.cacheService.updateContext({
+				initializerContext: this.#ctx,
+				lint: config.lint,
+			})
+		) {
+			await this.resetCache()
+		}
+	}
+
+	private async recheckClientManaged(): Promise<void> {
+		await Promise.all(
+			[...this.#clientManagedDocAndNodes.values()]
+				.map(({ doc, node }) => this.bind(doc, node).then(() => this.check(doc, node))),
+		)
 	}
 
 	normalizeUri(uri: string): string {
@@ -1042,5 +1075,6 @@ export class Project extends EventDispatcher<{
 
 	public async onEditorConfigurationUpdate(editorConfiguration: PartialConfig) {
 		await this.#configService.onEditorConfigurationUpdate(editorConfiguration)
+		await this.#configUpdatePromise
 	}
 }

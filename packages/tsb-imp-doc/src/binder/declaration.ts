@@ -4,10 +4,7 @@ import type {
 	ImpDocDeclarationSource,
 	ImpDocNode,
 } from '../node/ImpDocNode.js'
-import {
-	getImpDocSymbolData,
-	ImpDocNode as ImpDocNodeUtil,
-} from '../node/ImpDocNode.js'
+import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
 import { parseVisibility, stampVisibility } from '../util/withinPattern.js'
 
 function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
@@ -24,17 +21,23 @@ function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
 function ownerForDocument(
 	ctx: core.BinderContext,
 ): string | undefined {
-	let owner: string | undefined
-	core.SymbolUtil.forEachSymbol(ctx.symbols.global, symbol => {
-		if (
-			!owner
-			&& symbol.category === 'function'
-			&& symbol.definition?.some(location => location.uri === ctx.doc.uri)
-		) {
-			owner = symbol.identifier
+	const functions = ctx.symbols.lookup('function', []).parentMap
+	let declaredOwner: string | undefined
+	for (const symbol of Object.values(functions ?? {})) {
+		if (!symbol) {
+			continue
 		}
-	})
-	return owner
+		if (symbol.definition?.some(location => location.uri === ctx.doc.uri)) {
+			return symbol.identifier
+		}
+		if (
+			declaredOwner === undefined
+			&& symbol.declaration?.some(location => location.uri === ctx.doc.uri)
+		) {
+			declaredOwner = symbol.identifier
+		}
+	}
+	return declaredOwner
 }
 
 function compareSource(
@@ -45,6 +48,23 @@ function compareSource(
 		return a.uri < b.uri ? -1 : 1
 	}
 	return a.range.start - b.range.start || a.range.end - b.range.end
+}
+
+function isFirstReboundDeclaration(
+	symbol: core.Symbol,
+	candidate: ImpDocDeclarationSource,
+): boolean {
+	return !symbol.declaration?.some(location =>
+		location.uri === candidate.uri
+		&& location.range !== undefined
+		&& (
+			location.range.start < candidate.range.start
+			|| (
+				location.range.start === candidate.range.start
+				&& location.range.end < candidate.range.end
+			)
+		)
+	)
 }
 
 export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
@@ -107,7 +127,14 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 
 		// URI/range の辞書順で canonical metadata を決定 (= 重複宣言時の
 		// 先頭を canonical とし、 再解析で metadata が非決定的に変わることを防ぐ)。
-		if (!previous || compareSource(candidate, previous) < 0) {
+		if (
+			!previous
+			|| (
+				previous.uri === candidate.uri
+				&& isFirstReboundDeclaration(symbol, candidate)
+			)
+			|| compareSource(candidate, previous) < 0
+		) {
 			stampVisibility(symbol, visibility, candidate)
 			if (core.Range.containsRange(doc.range, node.range)) {
 				symbol.desc = ImpDocNodeUtil.getDescription(doc)

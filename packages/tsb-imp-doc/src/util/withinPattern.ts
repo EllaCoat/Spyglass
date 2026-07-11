@@ -1,5 +1,4 @@
-import * as core from '@spyglassmc/core'
-import type { ErrorReporter } from '@spyglassmc/core'
+import type { ErrorReporter, Symbol } from '@spyglassmc/core'
 import type {
 	ImpDocAnnotation,
 	ImpDocDeclarationSource,
@@ -194,7 +193,7 @@ export function visibilityRestrictions(
  * 渡された場合 canonical location として保存。
  */
 export function stampVisibility(
-	symbol: core.Symbol,
+	symbol: Symbol,
 	visibility: ImpDocVisibility,
 	declaration?: ImpDocDeclarationSource,
 ): void {
@@ -217,4 +216,32 @@ export function stampVisibility(
 	// では inline されないため数値を直接使用)。
 	symbol.visibility = visibility.type === 'public' ? 2 : 3
 	symbol.visibilityRestriction = visibilityRestrictions(visibility)
+}
+
+/**
+ * Remove visibility metadata previously contributed by an IMP-Doc function
+ * header. Other symbol data and canonical declaration metadata are preserved.
+ */
+export function clearVisibility(symbol: Symbol): void {
+	const root = asRecord(symbol.data)
+	const previous = getImpDocSymbolData(symbol.data)
+	if (!previous) {
+		return
+	}
+
+	const impDoc: ImpDocSymbolData = { ...previous }
+	delete impDoc.visibility
+	delete impDoc.privateOwner
+
+	if (Object.keys(impDoc).length === 0) {
+		delete root.impDoc
+	} else {
+		root.impDoc = impDoc
+	}
+
+	symbol.data = root
+	delete symbol.desc
+	// SymbolVisibility.Public = 2 (const enum; use the runtime numeric value).
+	symbol.visibility = 2
+	delete symbol.visibilityRestriction
 }

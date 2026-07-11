@@ -202,7 +202,7 @@ export class CacheService {
 	 */
 	async activate(context: CacheContext): Promise<LoadResult> {
 		const ans: LoadResult = { symbols: {} }
-		this.#activeContextHash = await getSha1(stableStringify(context))
+		await this.updateContext(context)
 		const cache = this.#pendingCache
 		this.#pendingCache = undefined
 		if (this.project.projectRoots.length === 0) {
@@ -212,9 +212,7 @@ export class CacheService {
 		try {
 			if (!cache || cache.contextHash !== this.#activeContextHash) {
 				this.project.logger.info(
-					`[CacheService#activate] context ${
-						cache ? 'mismatch' : 'missing'
-					}; dropping cache`,
+					`[CacheService#activate] context ${cache ? 'mismatch' : 'missing'}; dropping cache`,
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
@@ -229,6 +227,19 @@ export class CacheService {
 			__profiler.finalize()
 		}
 		return ans
+	}
+
+	/**
+	 * Refresh the fingerprint used by subsequent cache saves.
+	 *
+	 * @returns Whether an already-active context changed.
+	 */
+	async updateContext(context: CacheContext): Promise<boolean> {
+		const next = await getSha1(stableStringify(context))
+		const changed = this.#activeContextHash !== undefined
+			&& this.#activeContextHash !== next
+		this.#activeContextHash = next
+		return changed
 	}
 
 	async validate(): Promise<ValidateResult> {

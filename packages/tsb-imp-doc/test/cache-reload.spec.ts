@@ -207,4 +207,49 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 		)
 		await close()
 	})
+
+	it('resets cache and re-lints open documents after a hot lint config change', async () => {
+		const project = createProject({
+			cacheDir,
+			pluginVersion: 'v-fixture-1',
+			lintLevel: 'error',
+		})
+		try {
+			await project.init()
+			const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
+			await project.ready({ projectRootsWatcher: watcher })
+
+			const callerUri = RuntimeFileUris[3]
+			assert.ok(callerUri)
+			const content = await project.externals.fs.readFile(callerUri)
+			await project.onDidOpen(
+				callerUri,
+				'mcfunction',
+				1,
+				new TextDecoder().decode(content),
+			)
+			let state = project.getClientManaged(callerUri)
+			assert.ok(state)
+			assert.equal(state.node.linterErrors?.length, 1)
+			assert.equal(state.node.linterErrors?.[0]?.severity, core.ErrorSeverity.Error)
+
+			await project.onEditorConfigurationUpdate({
+				lint: { impDocPrivate: 'warning' },
+			})
+			state = project.getClientManaged(callerUri)
+			assert.ok(state)
+			assert.equal(state.node.linterErrors?.length, 1)
+			assert.equal(state.node.linterErrors?.[0]?.severity, core.ErrorSeverity.Warning)
+		} finally {
+			await project.close()
+		}
+
+		const { restoredFileCount, close } = await runInit({
+			cacheDir,
+			pluginVersion: 'v-fixture-1',
+			lintLevel: 'warning',
+		})
+		assert.ok(restoredFileCount > 0)
+		await close()
+	})
 })
