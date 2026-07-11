@@ -1,21 +1,11 @@
 import * as core from '@spyglassmc/core'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
-import {
-	getImpDocSymbolData,
-	ImpDocNode as ImpDocNodeUtil,
-} from '../node/ImpDocNode.js'
+import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
+import { parseVisibility, stampVisibility } from '../util/withinPattern.js'
 
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-	return value && typeof value === 'object' && !Array.isArray(value)
-		? value as Record<string, unknown>
-		: {}
-}
-
-function getCurrentFunctionSymbol(ctx: core.CheckerContext): core.Symbol | undefined {
+function getCurrentFunctionSymbol(
+	ctx: core.CheckerContext,
+): core.Symbol | undefined {
 	let ans: core.Symbol | undefined
 	core.SymbolUtil.forEachSymbol(ctx.symbols.global, (symbol) => {
 		if (
@@ -30,36 +20,35 @@ function getCurrentFunctionSymbol(ctx: core.CheckerContext): core.Symbol | undef
 }
 
 export const impDoc: core.Checker<ImpDocNode> = async (node, ctx) => {
-	const isPrivate = ImpDocNodeUtil.flattenAnnotations(node.annotations)
-		.some(values => values[0]?.raw === '@private')
 	const parsedID = node.functionID?.raw
 	const currentFunction = getCurrentFunctionSymbol(ctx)
+
 	if (parsedID && currentFunction && parsedID !== currentFunction.identifier) {
 		ctx.err.report(
 			`Expected function ID “${currentFunction.identifier}”, got “${parsedID}”`,
 			node.functionID!,
 		)
 	}
-	const owner = currentFunction?.identifier ?? parsedID
 
-	if (owner) {
-		const symbol = currentFunction ?? ctx.symbols.lookup('function', [owner], node).symbol
-		if (isPrivate && symbol) {
-			node.visibility = { owner, type: 'private' }
+	// declaration doc (functionID なし) や ID mismatch header doc は
+	// function symbol の visibility を更新しない。
+	// これで _index.d の「@private header + @public declaration doc」 layout での
+	// stamp → un-stamp 事故を防ぐ (= P1a で characterize 済み)。
+	if (
+		parsedID
+		&& (!currentFunction || currentFunction.identifier === parsedID)
+	) {
+		const symbol = ctx.symbols
+			.lookup('function', [parsedID], node)
+			.symbol
+		if (symbol) {
+			const visibility = parseVisibility(node.annotations, parsedID, ctx.err)
+				?? { type: 'public' as const }
+
+			node.visibility = visibility
 			node.symbol = symbol
-			symbol.data = {
-				...asRecord(symbol.data),
-				impDoc: { privateOwner: owner },
-			}
 			symbol.desc = ImpDocNodeUtil.getDescription(node)
-			symbol.visibility = core.SymbolVisibility.Restricted
-			symbol.visibilityRestriction = [`^${escapeRegExp(owner)}$`]
-		} else if (symbol && getImpDocSymbolData(symbol.data)?.privateOwner === owner) {
-			const data = asRecord(symbol.data)
-			delete data.impDoc
-			symbol.data = Object.keys(data).length ? data : undefined
-			symbol.visibility = core.SymbolVisibility.Public
-			symbol.visibilityRestriction = undefined
+			stampVisibility(symbol, visibility)
 		}
 	}
 

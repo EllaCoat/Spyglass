@@ -263,35 +263,43 @@ describe('IMP-Doc private visibility runtime', () => {
 			[Target],
 		).symbol
 		assert.ok(rawSymbol)
-		assert.deepEqual(
-			getImpDocSymbolData(rawSymbol.data),
-			{ privateOwner: Target },
-		)
+		const helperData = getImpDocSymbolData(rawSymbol.data)
+		assert.equal(helperData?.privateOwner, Target)
+		assert.deepEqual(helperData?.visibility, {
+			type: 'within',
+			owner: Target,
+			patterns: [{
+				raw: 'owner:main',
+				targetType: 'function',
+				regex: '^owner:main$',
+			}],
+		})
 		assert.equal(
 			project.symbols.query(helper.doc, 'function', Target).symbol,
 			undefined,
 		)
 	})
 
-	it('currently un-stamps the header @private when a following @public declaration doc for the same file is checked', () => {
-		// _index.d.mcfunction の layout (@private header + @public declaration
-		// doc) では、 checker が doc2 (@public) 処理時に doc1 (@private) の
-		// stamp を un-stamp する (checker/impDoc.ts の else 分岐)。 TSB corpus
-		// の `_index.d` は全部この layout なので、 currently owner:_index.d は
-		// 最終的に Public に戻る。
-		// TODO: P1b で checker の un-stamp 条件を refine 後、
-		// assertion を SymbolVisibility.Restricted + privateOwner に反転する。
+	it('keeps the header @private when a following declaration doc is public', () => {
+		// P1b の checker refactor で、 function symbol を触るのは functionID
+		// を持つ header doc だけになった。 declaration doc (functionID 無し) の
+		// @public は function symbol の visibility を上書きしないため、
+		// owner:_index.d は最終的に Restricted のままとなる。
 		assert.ok(project)
 		const indexSymbol = project.symbols
 			.lookup('function', ['owner:_index.d'])
 			.symbol
 		assert.ok(indexSymbol)
-		// SymbolVisibility.Public = 2 (const enum、 strip-types loader では
+		// SymbolVisibility.Restricted = 3 (const enum、 strip-types loader では
 		// inline されないため runtime に enum object が存在しない、 数値で照合)。
-		assert.equal(indexSymbol.visibility, 2)
+		assert.equal(indexSymbol.visibility, 3)
 		assert.equal(
 			getImpDocSymbolData(indexSymbol.data)?.privateOwner,
-			undefined,
+			'owner:_index.d',
+		)
+		assert.deepEqual(
+			getImpDocSymbolData(indexSymbol.data)?.visibility,
+			{ type: 'private', owner: 'owner:_index.d' },
 		)
 	})
 
@@ -299,12 +307,8 @@ describe('IMP-Doc private visibility runtime', () => {
 		assertNoViolation(getState(states, 'helper'))
 	})
 
-	it('currently rejects @within until its semantics are implemented', () => {
-		// TODO: Step 3 で @within semantics 実装後、 assertNoViolation に反転する。
-		assertSingleViolation(
-			getState(states, 'main'),
-			'owner:main',
-		)
+	it('allows a caller selected by @within', () => {
+		assertNoViolation(getState(states, 'main'))
 	})
 
 	it('reports exactly one external private call', () => {
@@ -361,8 +365,9 @@ describe('IMP-Doc private visibility runtime — open-order dependency (P1a char
 		// `privateOwner` metadata only when helper is checked; no re-lint
 		// pass is triggered when helper is opened later, so the external
 		// caller may silent-skip the private violation. This describe
-		// characterizes the current behavior. P1b で checker/linter に
-		// order-independent stamp path を実装後、 assertion を反転する。
+		// characterizes the current behavior.
+		// P1b Step 4: target の visibility stamp 後に既 check caller を
+		// invalidate/re-lint する order-independent path を実装して反転する。
 		for (const file of ['index', 'external', 'helper'] as const) {
 			const uri = RuntimeFiles[file]
 			const content = await readFile(fileURLToPath(uri), 'utf8')

@@ -1,12 +1,21 @@
+import * as core from '@spyglassmc/core'
 import type { ErrorReporter } from '@spyglassmc/core'
 import type {
 	ImpDocAnnotation,
+	ImpDocDeclarationSource,
+	ImpDocSymbolData,
 	ImpDocValue,
 	ImpDocVisibility,
 	WithinPattern,
 	WithinTargetType,
 } from '../node/ImpDocNode.js'
-import { ImpDocNode } from '../node/ImpDocNode.js'
+import { getImpDocSymbolData, ImpDocNode } from '../node/ImpDocNode.js'
+
+function asRecord(value: unknown): Record<string, unknown> {
+	return value && typeof value === 'object' && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: {}
+}
 
 const RegexSpecials = new Set([
 	'\\',
@@ -177,4 +186,35 @@ export function visibilityRestrictions(
 					.map(p => p.regex),
 			]
 	}
+}
+
+/**
+ * symbol.data.impDoc に visibility metadata を stamp する。 public は
+ * `privateOwner` を削除、 restricted は owner を反映。 declaration source を
+ * 渡された場合 canonical location として保存。
+ */
+export function stampVisibility(
+	symbol: core.Symbol,
+	visibility: ImpDocVisibility,
+	declaration?: ImpDocDeclarationSource,
+): void {
+	const root = asRecord(symbol.data)
+	const previous = getImpDocSymbolData(symbol.data)
+	const impDoc: ImpDocSymbolData = {
+		...previous,
+		visibility,
+		...(declaration ? { declaration } : {}),
+	}
+
+	if (visibility.type === 'public') {
+		delete impDoc.privateOwner
+	} else {
+		impDoc.privateOwner = visibility.owner
+	}
+
+	symbol.data = { ...root, impDoc }
+	// SymbolVisibility.Public = 2、 Restricted = 3 (const enum、 strip-types loader
+	// では inline されないため数値を直接使用)。
+	symbol.visibility = visibility.type === 'public' ? 2 : 3
+	symbol.visibilityRestriction = visibilityRestrictions(visibility)
 }

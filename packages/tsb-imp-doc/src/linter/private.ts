@@ -1,7 +1,8 @@
-import type { AstNode, Logger, Linter, LinterContext, StateProxy } from '@spyglassmc/core'
+import type { AstNode, Linter, LinterContext, Logger, StateProxy } from '@spyglassmc/core'
 import { ResourceLocationNode } from '@spyglassmc/core'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
+import { matchesVisibility } from '../util/withinPattern.js'
 
 export function configValidator(_ruleName: string, value: unknown, logger: Logger): boolean {
 	if (typeof value === 'boolean') {
@@ -40,14 +41,26 @@ export const privateVisibility: Linter<AstNode> = (rawNode, ctx: LinterContext) 
 		if (!ResourceLocationNode.is(candidate) || candidate.options.category !== 'function') {
 			return
 		}
-		const owner = getImpDocSymbolData(candidate.symbol?.data)?.privateOwner
-		if (!owner || owner === caller) {
+		const data = getImpDocSymbolData(candidate.symbol?.data)
+		const visibility = data?.visibility
+
+		// metadata 無し / public は defensive に許可。
+		if (!visibility || matchesVisibility(visibility, caller, 'function')) {
+			return
+		}
+		// matchesVisibility が public を先に許可済みだが、 TypeScript の
+		// narrowing が効かないため defensive check。
+		if (visibility.type === 'public') {
 			return
 		}
 
 		const target = ResourceLocationNode.toString(candidate, 'full')
+		const scope = visibility.type === 'private'
+			? `private to “${visibility.owner}”`
+			: `restricted by “${visibility.owner}”`
+
 		ctx.err.lint(
-			`Function “${target}” is private to “${owner}” and cannot be called from “${caller}”`,
+			`Function “${target}” is ${scope} and cannot be called from “${caller}”`,
 			candidate,
 		)
 	})
