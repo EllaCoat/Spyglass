@@ -9,10 +9,12 @@ import type {
 } from './node/ImpDocNode.js'
 import { impDoc, extendMcfunctionParser } from './parser/impDoc.js'
 import { configValidator, privateVisibility } from './linter/private.js'
+import { ImpDocVersion } from './version.js'
 
 export * from './node/ImpDocNode.js'
 export * from './parser/impDoc.js'
 export * from './util/withinPattern.js'
+export { ImpDocVersion } from './version.js'
 
 export const initialize: ProjectInitializer = ({ meta }) => {
 	const mcfunction = meta.getLanguageOptions('mcfunction')
@@ -46,4 +48,8 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		...mcfunction,
 		parser: extendMcfunctionParser(mcfunction.parser),
 	})
+
+	return {
+		'plugin:@spyglassmc/tsb-imp-doc': ImpDocVersion,
+	}
 }

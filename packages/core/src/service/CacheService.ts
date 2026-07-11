@@ -8,6 +8,7 @@ import {
 import type { PosRangeLanguageError } from '../source/index.js'
 import type { UnlinkedSymbolTable } from '../symbol/index.js'
 import { SymbolTable } from '../symbol/index.js'
+import type { LinterConfig } from './Config.js'
 import { ArchiveUriSupporter } from './FileService.js'
 import type { RootUriString } from './fileUtil.js'
 import { fileUtil } from './fileUtil.js'
@@ -17,7 +18,33 @@ import type { Project } from './Project.js'
  * The format version of the cache. Should be increased when any changes that
  * could invalidate the cache are introduced to the Spyglass codebase.
  */
-export const LatestCacheVersion = 7
+export const LatestCacheVersion = 8
+
+/**
+ * Deep clone with keys sorted at every object level so that JSON.stringify is
+ * insertion-order independent. Used to fingerprint the initializer/lint context.
+ */
+function stableStringify(value: unknown): string {
+	return JSON.stringify(value, (_key, val) => {
+		if (val && typeof val === 'object' && !Array.isArray(val)) {
+			const sorted: Record<string, unknown> = {}
+			for (const k of Object.keys(val as Record<string, unknown>).sort()) {
+				sorted[k] = (val as Record<string, unknown>)[k]
+			}
+			return sorted
+		}
+		return val
+	})
+}
+
+/**
+ * Inputs whose value participates in the cache fingerprint. When these change
+ * between runs the cached symbols/errors must be dropped.
+ */
+export interface CacheContext {
+	initializerContext: Record<string, string>
+	lint: LinterConfig
+}
 
 /**
  * Checksums of cached files or roots.
@@ -40,6 +67,12 @@ type ErrorCache = Record<string, readonly PosRangeLanguageError[]>
  */
 interface CacheFile {
 	checksums: Checksums
+	/**
+	 * Fingerprint of the initializer and lint context when the cache was saved.
+	 * Set by {@link CacheService.activate}. Undefined when loading a cache from
+	 * an earlier fork version — treated as a mismatch.
+	 */
+	contextHash?: string
 	errors: ErrorCache
 	projectRoots: string[]
 	symbols: UnlinkedSymbolTable
@@ -65,6 +98,8 @@ export class CacheService {
 	checksums = Checksums.create()
 	errors: ErrorCache = {}
 	#hasValidatedFiles = false
+	#pendingCache: CacheFile | undefined
+	#activeContextHash: string | undefined
 
 	/**
 	 * @param cacheRoot File path to the directory where cache files by Spyglass should be stored.
@@ -123,16 +158,21 @@ export class CacheService {
 		return this.#cacheFilePath
 	}
 
-	async load(): Promise<LoadResult> {
-		const ans: LoadResult = { symbols: {} }
+	/**
+	 * Read and format-check the cache file. Symbols/errors/checksums are NOT
+	 * applied yet; call {@link activate} once the initializer + lint context is
+	 * available so we can compare fingerprints and drop stale caches.
+	 */
+	async loadMetadata(): Promise<void> {
+		this.#pendingCache = undefined
 		if (this.project.projectRoots.length === 0) {
-			return ans
+			return
 		}
-		const __profiler = this.project.profilers.get('cache#load')
+		const __profiler = this.project.profilers.get('cache#loadMetadata')
 		let filePath: string | undefined
 		try {
 			filePath = await this.getCacheFileUri()
-			this.project.logger.info(`[CacheService#load] symbolCachePath = ${filePath}`)
+			this.project.logger.info(`[CacheService#loadMetadata] symbolCachePath = ${filePath}`)
 			const cache = (await fileUtil.readGzippedJson(
 				this.project.externals,
 				filePath,
@@ -140,21 +180,54 @@ export class CacheService {
 			)) as CacheFile
 			__profiler.task('Read File')
 			if (cache.version === LatestCacheVersion) {
-				this.checksums = cache.checksums
-				this.errors = cache.errors
-				ans.symbols = SymbolTable.link(cache.symbols)
-				__profiler.task('Link Symbols')
+				this.#pendingCache = cache
 			} else {
 				this.project.logger.info(
-					`[CacheService#load] Unsupported cache format ${cache.version}; expected ${LatestCacheVersion}`,
+					`[CacheService#loadMetadata] Unsupported cache format ${cache.version}; expected ${LatestCacheVersion}`,
 				)
 			}
 		} catch (e) {
 			if (!this.project.externals.error.isKind(e, 'ENOENT')) {
-				this.project.logger.error('[CacheService#load] ', e)
+				this.project.logger.error('[CacheService#loadMetadata] ', e)
 			}
 		}
 		__profiler.finalize()
+	}
+
+	/**
+	 * Compare the pending cache fingerprint against the current initializer/lint
+	 * context. On match the cached symbols/errors/checksums are adopted; on
+	 * mismatch (or missing pending cache) everything is dropped so the next
+	 * {@link validate} pass treats every file as added.
+	 */
+	async activate(context: CacheContext): Promise<LoadResult> {
+		const ans: LoadResult = { symbols: {} }
+		this.#activeContextHash = await getSha1(stableStringify(context))
+		const cache = this.#pendingCache
+		this.#pendingCache = undefined
+		if (this.project.projectRoots.length === 0) {
+			return ans
+		}
+		const __profiler = this.project.profilers.get('cache#activate')
+		try {
+			if (!cache || cache.contextHash !== this.#activeContextHash) {
+				this.project.logger.info(
+					`[CacheService#activate] context ${
+						cache ? 'mismatch' : 'missing'
+					}; dropping cache`,
+				)
+				this.checksums = Checksums.create()
+				this.errors = {}
+				this.#hasValidatedFiles = false
+				return ans
+			}
+			this.checksums = cache.checksums
+			this.errors = cache.errors
+			ans.symbols = SymbolTable.link(cache.symbols)
+			__profiler.task('Link Symbols')
+		} finally {
+			__profiler.finalize()
+		}
 		return ans
 	}
 
@@ -236,6 +309,7 @@ export class CacheService {
 			filePath = await this.getCacheFileUri()
 			const cache: CacheFile = {
 				version: LatestCacheVersion,
+				contextHash: this.#activeContextHash,
 				projectRoots: this.project.projectRoots,
 				checksums: this.checksums,
 				symbols: SymbolTable.unlink(this.project.symbols.global),

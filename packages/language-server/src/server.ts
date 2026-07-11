@@ -36,8 +36,9 @@ let projectRoots!: core.RootUriString[]
 let hasShutdown = false
 
 const initializeJavaEditionAndImpDoc: core.ProjectInitializer = async (ctx) => {
-	await je.initialize(ctx)
-	await impDoc.initialize(ctx)
+	const jeContext = (await je.initialize(ctx)) ?? {}
+	const impDocContext = (await impDoc.initialize(ctx)) ?? {}
+	return { ...jeContext, ...impDocContext }
 }
 
 const logger: core.Logger = {
