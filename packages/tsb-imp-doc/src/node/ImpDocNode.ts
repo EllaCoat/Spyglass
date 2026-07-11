@@ -32,9 +32,34 @@ export interface ImpDocDeclarationBlock {
 	range: AstNode['range']
 }
 
-export interface ImpDocVisibility {
+export type WithinTargetType = '*' | 'function'
+
+/**
+ * Symbol.data/cache に保存するため RegExp ではなく文字列で保持する。
+ * 実行時は共有 `matchesVisibility()` が `new RegExp(regex)` で評価する。
+ */
+export interface WithinPattern {
+	/** annotation に書かれた原文 */
+	raw: string
+	/** Legacy の対象 file type。 Tier A の consumer は function と * を扱う。 */
+	targetType: WithinTargetType
+	/** ^...$ を含む RegExp source */
+	regex: string
+}
+
+export type ImpDocVisibility =
+	| { type: 'public' }
+	| { type: 'private'; owner: string }
+	| {
+		type: 'within'
+		owner: string
+		patterns: readonly WithinPattern[]
+	}
+
+export interface ImpDocDeclarationSource {
+	uri: string
+	range: AstNode['range']
 	owner: string
-	type: 'private'
 }
 
 export interface ImpDocNode extends AstNode {
@@ -77,6 +102,12 @@ export namespace ImpDocNode {
 }
 
 export interface ImpDocSymbolData {
+	visibility?: ImpDocVisibility
+	declaration?: ImpDocDeclarationSource
+	/**
+	 * P1a characterization / downstream compatibility 用の shortcut。
+	 * SoT は `visibility`、 Step 3 以降で撤去候補。
+	 */
 	privateOwner?: string
 }
 

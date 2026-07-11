@@ -1,7 +1,7 @@
-import type { AstNode, Logger, Linter, LinterContext, StateProxy } from '@spyglassmc/core'
+import type { AstNode, Linter, LinterContext, Logger, StateProxy } from '@spyglassmc/core'
 import { ResourceLocationNode } from '@spyglassmc/core'
-import type { ImpDocNode } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
+import { matchesVisibility } from '../util/withinPattern.js'
 
 export function configValidator(_ruleName: string, value: unknown, logger: Logger): boolean {
 	if (typeof value === 'boolean') {
@@ -18,36 +18,56 @@ function visit(node: AstNode, fn: (node: AstNode) => void): void {
 	}
 }
 
-function getRoot(node: AstNode): AstNode {
-	let root = node
-	while (root.parent) {
-		root = root.parent
+function getCaller(ctx: LinterContext): string | undefined {
+	const functions = ctx.symbols.lookup('function', []).parentMap
+	let declaration: string | undefined
+	for (const symbol of Object.values(functions ?? {})) {
+		if (!symbol) {
+			continue
+		}
+		if (symbol.definition?.some(location => location.uri === ctx.doc.uri)) {
+			return symbol.identifier
+		}
+		if (
+			declaration === undefined
+			&& symbol.declaration?.some(location => location.uri === ctx.doc.uri)
+		) {
+			declaration = symbol.identifier
+		}
 	}
-	return root
+	return declaration
 }
 
-export const privateVisibility: Linter<AstNode> = (rawNode, ctx: LinterContext) => {
-	if (rawNode.type !== 'impDoc') {
-		return
-	}
-	const node = rawNode as StateProxy<ImpDocNode>
-	const caller = node.symbol?.identifier ?? node.functionID?.raw
+export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => {
+	const caller = getCaller(ctx)
 	if (!caller) {
 		return
 	}
 
-	visit(getRoot(node), (candidate) => {
+	visit(node as StateProxy<AstNode>, (candidate) => {
 		if (!ResourceLocationNode.is(candidate) || candidate.options.category !== 'function') {
 			return
 		}
-		const owner = getImpDocSymbolData(candidate.symbol?.data)?.privateOwner
-		if (!owner || owner === caller) {
+		const data = getImpDocSymbolData(candidate.symbol?.data)
+		const visibility = data?.visibility
+
+		// metadata 無し / public は defensive に許可。
+		if (!visibility || matchesVisibility(visibility, caller, 'function')) {
+			return
+		}
+		// matchesVisibility が public を先に許可済みだが、 TypeScript の
+		// narrowing が効かないため defensive check。
+		if (visibility.type === 'public') {
 			return
 		}
 
 		const target = ResourceLocationNode.toString(candidate, 'full')
+		const scope = visibility.type === 'private'
+			? `private to “${visibility.owner}”`
+			: `restricted by “${visibility.owner}”`
+
 		ctx.err.lint(
-			`Function “${target}” is private to “${owner}” and cannot be called from “${caller}”`,
+			`Function “${target}” is ${scope} and cannot be called from “${caller}”`,
 			candidate,
 		)
 	})

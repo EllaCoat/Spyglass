@@ -7,11 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import {
-	getImpDocSymbolData,
-	ImpDocNode,
-	initialize as initializeImpDoc,
-} from '../lib/index.js'
+import { getImpDocSymbolData, ImpDocNode, initialize as initializeImpDoc } from '../lib/index.js'
 
 const Target = 'owner:helper'
 const FixtureRoot = core.fileUtil.ensureEndingSlash(
@@ -39,6 +35,10 @@ const RuntimeFiles = {
 		'./runtime/private-project/data/other/functions/denied.mcfunction',
 		import.meta.url,
 	).toString(),
+	noHeader: new URL(
+		'./runtime/private-project/data/no_header/functions/caller.mcfunction',
+		import.meta.url,
+	).toString(),
 } as const
 
 const FunctionIds = {
@@ -47,6 +47,7 @@ const FunctionIds = {
 	main: 'owner:main',
 	external: 'external:caller',
 	denied: 'other:denied',
+	noHeader: 'no_header:caller',
 } as const
 
 type RuntimeFile = keyof typeof RuntimeFiles
@@ -140,6 +141,38 @@ function assertNoViolation(state: RuntimeState): void {
 	assert.deepEqual(state.node.linterErrors ?? [], [])
 }
 
+function findFunctionCall(state: RuntimeState): core.ResourceLocationNode {
+	let result: core.ResourceLocationNode | undefined
+	core.traversePreOrder(
+		state.node,
+		() => result === undefined,
+		core.ResourceLocationNode.is,
+		(node) => {
+			if (node.options.category === 'function') {
+				result = node
+			}
+		},
+	)
+	assert.ok(result)
+	return result
+}
+
+function completeFunctionCall(
+	project: core.Project,
+	state: RuntimeState,
+): core.CompletionItem[] {
+	const call = findFunctionCall(state)
+	const ctx = core.CompleterContext.create(project, {
+		doc: state.doc,
+		offset: call.range.end,
+	})
+	return core.completer.file(state.node, ctx)
+}
+
+function completionKey(item: core.CompletionItem): string {
+	return `${item.label}\0${item.range.start}:${item.range.end}`
+}
+
 function assertSingleViolation(
 	state: RuntimeState,
 	caller: string,
@@ -195,13 +228,15 @@ describe('IMP-Doc private visibility runtime', () => {
 
 		// Check the target before callers so its Restricted metadata is present
 		// while each caller is bound.
-		for (const file of [
-			'index',
-			'helper',
-			'main',
-			'external',
-			'denied',
-		] as const) {
+		for (
+			const file of [
+				'index',
+				'helper',
+				'main',
+				'external',
+				'denied',
+			] as const
+		) {
 			const uri = RuntimeFiles[file]
 			const content = await readFile(fileURLToPath(uri), 'utf8')
 			await project.onDidOpen(uri, 'mcfunction', 1, content)
@@ -263,35 +298,116 @@ describe('IMP-Doc private visibility runtime', () => {
 			[Target],
 		).symbol
 		assert.ok(rawSymbol)
-		assert.deepEqual(
-			getImpDocSymbolData(rawSymbol.data),
-			{ privateOwner: Target },
-		)
+		const helperData = getImpDocSymbolData(rawSymbol.data)
+		assert.equal(helperData?.privateOwner, Target)
+		assert.deepEqual(helperData?.visibility, {
+			type: 'within',
+			owner: Target,
+			patterns: [{
+				raw: 'owner:main',
+				targetType: 'function',
+				regex: '^owner:main$',
+			}],
+		})
 		assert.equal(
 			project.symbols.query(helper.doc, 'function', Target).symbol,
 			undefined,
 		)
 	})
 
-	it('currently un-stamps the header @private when a following @public declaration doc for the same file is checked', () => {
-		// _index.d.mcfunction の layout (@private header + @public declaration
-		// doc) では、 checker が doc2 (@public) 処理時に doc1 (@private) の
-		// stamp を un-stamp する (checker/impDoc.ts の else 分岐)。 TSB corpus
-		// の `_index.d` は全部この layout なので、 currently owner:_index.d は
-		// 最終的に Public に戻る。
-		// TODO: P1b で checker の un-stamp 条件を refine 後、
-		// assertion を SymbolVisibility.Restricted + privateOwner に反転する。
+	it('registers #declare storage symbols through the impDoc:declaration binder', () => {
+		assert.ok(project)
+		const storageSymbol = project.symbols
+			.lookup('storage', ['owner:runtime'])
+			.symbol
+		assert.ok(storageSymbol)
+		const data = getImpDocSymbolData(storageSymbol.data)
+		// _index.d の declaration doc は @public、 storage 側の visibility も public。
+		assert.deepEqual(data?.visibility, { type: 'public' })
+		assert.equal(data?.declaration?.owner, 'owner:_index.d')
+		assert.equal(data?.declaration?.uri, RuntimeFiles.index)
+		// SymbolVisibility.Public = 2 (const enum、 数値照合)。
+		assert.equal(storageSymbol.visibility, 2)
+	})
+
+	it('re-stamps a canonical declaration edited in the same URI', async () => {
+		assert.ok(project)
+		const original = getState(states, 'index').content
+		const restricted = original.replace('# @public', '# @private')
+		assert.notEqual(restricted, original)
+
+		await project.onDidChange(RuntimeFiles.index, [{ text: restricted }], 2)
+		let storageSymbol = project.symbols
+			.lookup('storage', ['owner:runtime'])
+			.symbol
+		assert.ok(storageSymbol)
+		assert.deepEqual(
+			getImpDocSymbolData(storageSymbol.data)?.visibility,
+			{ type: 'private', owner: FunctionIds.index },
+		)
+		assert.equal(storageSymbol.visibility, 3)
+
+		await project.onDidChange(RuntimeFiles.index, [{ text: original }], 3)
+		storageSymbol = project.symbols
+			.lookup('storage', ['owner:runtime'])
+			.symbol
+		assert.ok(storageSymbol)
+		assert.deepEqual(
+			getImpDocSymbolData(storageSymbol.data)?.visibility,
+			{ type: 'public' },
+		)
+		assert.equal(storageSymbol.visibility, 2)
+	})
+
+	it('resolves a #declare owner registered as a CLI-style declaration', async () => {
+		assert.ok(project)
+		const uri = new URL(
+			'./runtime/private-project/data/cli/functions/owner.mcfunction',
+			import.meta.url,
+		).toString()
+		const owner = 'cli:owner'
+		const content = '#> cli:owner\n# @public\n\n'
+			+ '#> CLI storage\n# @private\n#declare storage cli:data\n'
+
+		project.symbols.contributeAs('uri_binder', () => {
+			project!.symbols.query(uri, 'function', owner).enter({
+				usage: { type: 'declaration' },
+			})
+		})
+		await project.onDidOpen(uri, 'mcfunction', 1, content)
+
+		const state = project.getClientManaged(uri)
+		assert.ok(state)
+		assert.deepEqual(state.node.binderErrors ?? [], [])
+		const storageSymbol = project.symbols.lookup('storage', ['cli:data']).symbol
+		assert.ok(storageSymbol)
+		assert.equal(
+			getImpDocSymbolData(storageSymbol.data)?.declaration?.owner,
+			owner,
+		)
+		project.onDidClose(uri)
+	})
+
+	it('keeps the header @private when a following declaration doc is public', () => {
+		// P1b の checker refactor で、 function symbol を触るのは functionID
+		// を持つ header doc だけになった。 declaration doc (functionID 無し) の
+		// @public は function symbol の visibility を上書きしないため、
+		// owner:_index.d は最終的に Restricted のままとなる。
 		assert.ok(project)
 		const indexSymbol = project.symbols
 			.lookup('function', ['owner:_index.d'])
 			.symbol
 		assert.ok(indexSymbol)
-		// SymbolVisibility.Public = 2 (const enum、 strip-types loader では
+		// SymbolVisibility.Restricted = 3 (const enum、 strip-types loader では
 		// inline されないため runtime に enum object が存在しない、 数値で照合)。
-		assert.equal(indexSymbol.visibility, 2)
+		assert.equal(indexSymbol.visibility, 3)
 		assert.equal(
 			getImpDocSymbolData(indexSymbol.data)?.privateOwner,
-			undefined,
+			'owner:_index.d',
+		)
+		assert.deepEqual(
+			getImpDocSymbolData(indexSymbol.data)?.visibility,
+			{ type: 'private', owner: 'owner:_index.d' },
 		)
 	})
 
@@ -299,11 +415,37 @@ describe('IMP-Doc private visibility runtime', () => {
 		assertNoViolation(getState(states, 'helper'))
 	})
 
-	it('currently rejects @within until its semantics are implemented', () => {
-		// TODO: Step 3 で @within semantics 実装後、 assertNoViolation に反転する。
-		assertSingleViolation(
-			getState(states, 'main'),
-			'owner:main',
+	it('allows a caller selected by @within', () => {
+		assertNoViolation(getState(states, 'main'))
+	})
+
+	it('filters function completion by caller and dedupes built-in items', () => {
+		assert.ok(project)
+
+		const allowed = completeFunctionCall(project, getState(states, 'main'))
+		assert.equal(
+			allowed.filter(item => item.label === Target).length,
+			1,
+			'@within caller should receive owner:helper exactly once',
+		)
+		assert.equal(
+			allowed.filter(item => item.label === FunctionIds.main).length,
+			1,
+			'public built-in candidate should be deduped',
+		)
+		assert.equal(
+			new Set(allowed.map(completionKey)).size,
+			allowed.length,
+		)
+
+		const denied = completeFunctionCall(
+			project,
+			getState(states, 'external'),
+		)
+		assert.equal(
+			denied.filter(item => item.label === Target).length,
+			0,
+			'external caller must not receive owner:helper',
 		)
 	})
 
@@ -320,9 +462,59 @@ describe('IMP-Doc private visibility runtime', () => {
 			'other:denied',
 		)
 	})
+
+	it('lints a private call from a function without an IMP-Doc header', async () => {
+		assert.ok(project)
+		const uri = RuntimeFiles.noHeader
+		const content = await readFile(fileURLToPath(uri), 'utf8')
+		await project.onDidOpen(uri, 'mcfunction', 1, content)
+		const result = project.getClientManaged(uri)
+		assert.ok(result)
+		assertSingleViolation(
+			{ ...result, content },
+			FunctionIds.noHeader,
+		)
+	})
+
+	it('clears stale function metadata when the header is deleted or mismatched', async () => {
+		assert.ok(project)
+		const original = getState(states, 'helper').content
+		const symbol = project.symbols.lookup('function', [Target]).symbol
+		assert.ok(symbol)
+
+		await project.onDidChange(
+			RuntimeFiles.helper,
+			[{ text: 'function owner:helper\n' }],
+			2,
+		)
+		assert.equal(getImpDocSymbolData(symbol.data), undefined)
+		assert.equal(symbol.visibility, 2)
+		assert.equal(symbol.visibilityRestriction, undefined)
+
+		const mismatch = '#> owner:not-helper\n# @private\n\nfunction owner:helper\n'
+		await project.onDidChange(RuntimeFiles.helper, [{ text: mismatch }], 3)
+		assert.equal(getImpDocSymbolData(symbol.data), undefined)
+		assert.equal(symbol.visibility, 2)
+		assert.equal(symbol.visibilityRestriction, undefined)
+
+		await project.onDidChange(RuntimeFiles.helper, [{ text: original }], 4)
+		assert.deepEqual(
+			getImpDocSymbolData(symbol.data)?.visibility,
+			{
+				type: 'within',
+				owner: Target,
+				patterns: [{
+					raw: 'owner:main',
+					targetType: 'function',
+					regex: '^owner:main$',
+				}],
+			},
+		)
+		assert.equal(symbol.visibility, 3)
+	})
 })
 
-describe('IMP-Doc private visibility runtime — open-order dependency (P1a characterization)', () => {
+describe('IMP-Doc private visibility runtime — open-order independence (P1b binder phase)', () => {
 	let project: core.Project | undefined
 	let cacheDir: string | undefined
 	let externalState: RuntimeState | undefined
@@ -357,12 +549,10 @@ describe('IMP-Doc private visibility runtime — open-order dependency (P1a char
 		await project.init()
 		await project.ready({ projectRootsWatcher: watcher })
 
-		// Open the caller BEFORE the private helper. Checker stamps
-		// `privateOwner` metadata only when helper is checked; no re-lint
-		// pass is triggered when helper is opened later, so the external
-		// caller may silent-skip the private violation. This describe
-		// characterizes the current behavior. P1b で checker/linter に
-		// order-independent stamp path を実装後、 assertion を反転する。
+		// Open the caller BEFORE the private helper. In P1b, visibility stamp
+		// moved from checker to binder phase, and Project.ready() binds every
+		// file before any file is checked, so target metadata is available
+		// regardless of open-order and the external violation must be reported.
 		for (const file of ['index', 'external', 'helper'] as const) {
 			const uri = RuntimeFiles[file]
 			const content = await readFile(fileURLToPath(uri), 'utf8')
@@ -382,8 +572,8 @@ describe('IMP-Doc private visibility runtime — open-order dependency (P1a char
 		}
 	})
 
-	it('currently silent-skips the external caller when helper is opened after', () => {
+	it('reports the external caller even when helper is opened after it', () => {
 		assert.ok(externalState)
-		assertNoViolation(externalState)
+		assertSingleViolation(externalState, 'external:caller')
 	})
 })
