@@ -189,23 +189,102 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 		await close()
 	})
 
-	it('drops cache when lint config changes', async () => {
-		await runFull({
+	it('drops cache errors and re-lints open documents with the new severity when lint config changes', async () => {
+		// 初回 project = Error severity で lint、 cacheService.errors に診断を確実に入れる。
+		const first = createProject({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'error',
 		})
-		const { restoredFileCount, close } = await runInit({
+		try {
+			await first.init()
+			const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
+			await first.ready({ projectRootsWatcher: watcher })
+
+			const callerUri = RuntimeFileUris[3]
+			assert.ok(callerUri)
+			const firstContent = await first.externals.fs.readFile(callerUri)
+			await first.onDidOpen(
+				callerUri,
+				'mcfunction',
+				1,
+				new TextDecoder().decode(firstContent),
+			)
+			// onDidOpen は bind/check を直接呼ぶだけで documentUpdated を emit しない
+			// (Project.ts:912-931)。 documentErrored 経路 → cacheService.errors[uri]
+			// への反映は ensureClientManagedChecked を明示的に呼ぶ必要がある
+			// (Project.ts:980-990)。
+			await first.ensureClientManagedChecked(callerUri)
+			const firstState = first.getClientManaged(callerUri)
+			assert.ok(firstState)
+			assert.equal(firstState.node.linterErrors?.length, 1)
+			assert.equal(
+				firstState.node.linterErrors?.[0]?.severity,
+				core.ErrorSeverity.Error,
+			)
+			// stale errors 検出 regression の precondition = callerUri 自身の Error
+			// 診断が cache に確実に入っている ("errors が非空" だけの assert は他
+			// fixture URI の空 entry でも成立し regression を捕捉できない)。
+			const firstCachedErrors = first.cacheService.errors[callerUri]
+			assert.ok(
+				firstCachedErrors,
+				`Expected cacheService.errors[${callerUri}] to be populated`,
+			)
+			assert.equal(firstCachedErrors.length, 1)
+			assert.equal(
+				firstCachedErrors[0]?.severity,
+				core.ErrorSeverity.Error,
+			)
+		} finally {
+			await first.close()
+		}
+
+		// 2 回目 project = lint level を warning に変えて init、 cache 破棄と再 lint を verify。
+		const second = createProject({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'warning',
 		})
-		assert.equal(
-			restoredFileCount,
-			0,
-			`Expected cache to be dropped on lint config change; got ${restoredFileCount}`,
-		)
-		await close()
+		try {
+			await second.init()
+			const restoredFileCount = Object.keys(
+				second.cacheService.checksums.files,
+			).length
+			assert.equal(
+				restoredFileCount,
+				0,
+				`Expected cache to be dropped on lint config change; got ${restoredFileCount}`,
+			)
+			// checksums だけでなく stale errors も破棄されないと、 「drop 忘れ」 regression を
+			// 後段の onDidOpen で新 lint が上書きしてしまい検出できない。
+			assert.equal(
+				Object.keys(second.cacheService.errors).length,
+				0,
+				'Expected cacheService.errors to be dropped on lint config change',
+			)
+
+			const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
+			await second.ready({ projectRootsWatcher: watcher })
+
+			const callerUri = RuntimeFileUris[3]
+			assert.ok(callerUri)
+			const content = await second.externals.fs.readFile(callerUri)
+			await second.onDidOpen(
+				callerUri,
+				'mcfunction',
+				1,
+				new TextDecoder().decode(content),
+			)
+			const state = second.getClientManaged(callerUri)
+			assert.ok(state)
+			assert.equal(state.node.linterErrors?.length, 1)
+			assert.equal(
+				state.node.linterErrors?.[0]?.severity,
+				core.ErrorSeverity.Warning,
+			)
+		} finally {
+			await second.close()
+		}
 	})
 
 	it('resets cache and re-lints open documents after a hot lint config change', async () => {
@@ -233,8 +312,10 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			assert.equal(state.node.linterErrors?.length, 1)
 			assert.equal(state.node.linterErrors?.[0]?.severity, core.ErrorSeverity.Error)
 
+			// impDocPrivate は tsb-imp-doc が dynamic 登録する custom lint rule で、
+			// core.LinterConfig の静的 shape には現れないため型を明示 escape する。
 			await project.onEditorConfigurationUpdate({
-				lint: { impDocPrivate: 'warning' },
+				lint: { impDocPrivate: 'warning' } as unknown as core.LinterConfig,
 			})
 			state = project.getClientManaged(callerUri)
 			assert.ok(state)

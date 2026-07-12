@@ -4,6 +4,7 @@
 **/.wireit
 **/*.cpuprofile
 **/*.tsbuildinfo
+**/.tsb-lint-cache.json
 
 /.helix/languages.toml
 /.history
