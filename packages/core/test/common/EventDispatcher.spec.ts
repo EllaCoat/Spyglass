@@ -15,4 +15,23 @@ describe('EventDispatcher', () => {
 		assert.deepEqual(listener.mock.calls[0].arguments, ['test-data-0'])
 		assert.deepEqual(listener.mock.calls[1].arguments, ['test-data-1'])
 	})
+
+	it('waits for asynchronous listeners when emitting asynchronously', async () => {
+		const dispatcher = new EventDispatcher<{ test: string }>()
+		const listenerStarted = Promise.withResolvers<void>()
+		const listenerRelease = Promise.withResolvers<void>()
+		let listenerFinished = false
+		dispatcher.on('test', async () => {
+			listenerStarted.resolve()
+			await listenerRelease.promise
+			listenerFinished = true
+		})
+
+		const emitted = dispatcher.emitAsync('test', 'test-data')
+		await listenerStarted.promise
+		assert.equal(listenerFinished, false)
+		listenerRelease.resolve()
+		await emitted
+		assert.equal(listenerFinished, true)
+	})
 })

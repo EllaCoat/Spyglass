@@ -18,6 +18,7 @@ import { traversePreOrder } from '../processor/index.js'
 import type { PosRangeLanguageError } from '../source/index.js'
 import { LanguageError, Range, Source } from '../source/index.js'
 import { SymbolUtil } from '../symbol/index.js'
+import type { PreparedCacheContext } from './CacheService.js'
 import { CacheService } from './CacheService.js'
 import type { Config, PartialConfig } from './Config.js'
 import { ConfigService, LinterConfigValue } from './Config.js'
@@ -105,6 +106,13 @@ interface InitializerResult {
 	meta: MetaRegistry
 	reinitializationPredicates: Set<ProjectChangePredicate>
 }
+interface ProjectRebuildTransaction {
+	commit(): void
+	rollback(): void
+}
+type ProjectDiagnosticsEvent =
+	| { data: DocumentErrorEvent; name: 'documentErrored' }
+	| { data: DocumentEvent; name: 'documentUpdated' }
 interface SymbolRegistrarEvent {
 	id: string
 	checksum: string | undefined
@@ -182,6 +190,10 @@ export class Project extends EventDispatcher<{
 
 	/** Prevent circular binding. */
 	readonly #bindingInProgressUris = new Set<string>()
+	/** Number of documents currently being bound. */
+	get bindingInProgressCount(): number {
+		return this.#bindingInProgressUris.size
+	}
 	readonly #cacheSaverIntervalId: IntervalId
 	readonly cacheService: CacheService
 	/** URI of files that are currently managed by the language client. */
@@ -194,6 +206,9 @@ export class Project extends EventDispatcher<{
 	#reinitializationGeneration = 0
 	#processedReinitializationGeneration = 0
 	#reinitializationPromise: Promise<boolean> | undefined
+	#resetGeneration = 0
+	#processedResetGeneration = 0
+	#resetPromise: Promise<void> | undefined
 	#watcher: FileWatcher | undefined
 	#registeredWatcher: FileWatcher | undefined
 	#lifecyclePromise: Promise<void> = Promise.resolve()
@@ -328,11 +343,11 @@ export class Project extends EventDispatcher<{
 			CacheAutoSaveInterval,
 		)
 
-		this.on('documentUpdated', ({ doc, node }) => {
+		this.on('documentUpdated', async ({ doc, node }) => {
 			// if (!this.#isReady) {
 			// 	return
 			// }
-			this.emit('documentErrored', {
+			await this.emitAsync('documentErrored', {
 				errors: FileNode.getErrors(node).map((e) => LanguageError.withPosRange(e, doc)),
 				uri: doc.uri,
 				version: doc.version,
@@ -379,15 +394,6 @@ export class Project extends EventDispatcher<{
 				return
 			}
 			this.requestLifecycle(process, `[Project#fileDeleted] ${uri}`)
-		}).on('ready', () => {
-			this.#isReady = true
-			// Recheck client managed files after the READY process, as they may have incomplete results and are user-facing.
-			this.recheckClientManaged().catch(e =>
-				this.logger.error(
-					'[Project#ready] Error occurred when rechecking client managed files after READY',
-					e,
-				)
-			)
 		})
 	}
 
@@ -466,6 +472,62 @@ export class Project extends EventDispatcher<{
 	}
 
 	/**
+	 * Snapshot all project and cache state that a rebuild mutates. Reinitialization and manual
+	 * cache resets share this boundary so neither operation can expose a failed partial rebuild.
+	 */
+	private beginProjectRebuildTransaction(): ProjectRebuildTransaction {
+		const snapshot = {
+			bindingInProgressUris: new Set(this.#bindingInProgressUris),
+			clientManagedDocAndNodes: new Map(this.#clientManagedDocAndNodes),
+			ctx: this.#ctx,
+			dependencyFiles: this.#dependencyFiles,
+			dependencyRoots: this.#dependencyRoots,
+			isReady: this.#isReady,
+			meta: this.#meta,
+			readyPromise: this.#readyPromise,
+			reinitializationPredicates: this.#reinitializationPredicates,
+			roots: this.#roots,
+			symbols: this.symbols,
+			symbolUpToDateUris: new Set(this.#symbolUpToDateUris),
+		}
+		const cacheTransaction = this.cacheService.beginTransaction()
+		let settled = false
+		const settle = () => {
+			if (settled) {
+				throw new Error('Project rebuild transaction has already settled')
+			}
+			settled = true
+		}
+		return {
+			commit: () => {
+				settle()
+				cacheTransaction.commit()
+			},
+			rollback: () => {
+				settle()
+				cacheTransaction.rollback()
+				this.#bindingInProgressUris.clear()
+				snapshot.bindingInProgressUris.forEach(uri => this.#bindingInProgressUris.add(uri))
+				this.#clientManagedDocAndNodes.clear()
+				snapshot.clientManagedDocAndNodes.forEach((value, uri) =>
+					this.#clientManagedDocAndNodes.set(uri, value)
+				)
+				this.#ctx = snapshot.ctx
+				this.#dependencyFiles = snapshot.dependencyFiles
+				this.#dependencyRoots = snapshot.dependencyRoots
+				this.#isReady = snapshot.isReady
+				this.#meta = snapshot.meta
+				this.#readyPromise = snapshot.readyPromise
+				this.#reinitializationPredicates = snapshot.reinitializationPredicates
+				this.#roots = snapshot.roots
+				this.symbols = snapshot.symbols
+				this.#symbolUpToDateUris.clear()
+				snapshot.symbolUpToDateUris.forEach(uri => this.#symbolUpToDateUris.add(uri))
+			},
+		}
+	}
+
+	/**
 	 * Run project initializers again and rebuild the project when their cache
 	 * context changed.
 	 */
@@ -526,51 +588,20 @@ export class Project extends EventDispatcher<{
 			return false
 		}
 
-		const snapshot = {
-			bindingInProgressUris: new Set(this.#bindingInProgressUris),
-			clientManagedDocAndNodes: new Map(this.#clientManagedDocAndNodes),
-			ctx: this.#ctx,
-			dependencyFiles: this.#dependencyFiles,
-			dependencyRoots: this.#dependencyRoots,
-			isReady: this.#isReady,
-			meta: this.#meta,
-			readyPromise: this.#readyPromise,
-			reinitializationPredicates: this.#reinitializationPredicates,
-			roots: this.#roots,
-			symbols: this.symbols,
-			symbolUpToDateUris: new Set(this.#symbolUpToDateUris),
-		}
-		const cacheTransaction = this.cacheService.beginTransaction()
+		const transaction = this.beginProjectRebuildTransaction()
+		let diagnostics: ProjectDiagnosticsEvent[]
 		try {
 			this.commitInitializers(staged)
-			this.#isReady = false
-			this.reparseClientManaged()
-			await this.resetCache()
+			diagnostics = await this.rebuildProjectFromEmptyCache()
 			this.cacheService.commitContext(preparedContext)
-			cacheTransaction.commit()
-			this.emit('reinitialized', { contextChanged: true })
-			return true
+			transaction.commit()
 		} catch (e) {
-			cacheTransaction.rollback()
-			this.#bindingInProgressUris.clear()
-			snapshot.bindingInProgressUris.forEach(uri => this.#bindingInProgressUris.add(uri))
-			this.#clientManagedDocAndNodes.clear()
-			snapshot.clientManagedDocAndNodes.forEach((value, uri) =>
-				this.#clientManagedDocAndNodes.set(uri, value)
-			)
-			this.#ctx = snapshot.ctx
-			this.#dependencyFiles = snapshot.dependencyFiles
-			this.#dependencyRoots = snapshot.dependencyRoots
-			this.#isReady = snapshot.isReady
-			this.#meta = snapshot.meta
-			this.#readyPromise = snapshot.readyPromise
-			this.#reinitializationPredicates = snapshot.reinitializationPredicates
-			this.#roots = snapshot.roots
-			this.symbols = snapshot.symbols
-			this.#symbolUpToDateUris.clear()
-			snapshot.symbolUpToDateUris.forEach(uri => this.#symbolUpToDateUris.add(uri))
+			transaction.rollback()
 			throw e
 		}
+		await this.publishRebuildEvents(diagnostics)
+		this.emit('reinitialized', { contextChanged: true })
+		return true
 	}
 
 	private shouldReinitializeFor(uri: string): boolean {
@@ -620,12 +651,18 @@ export class Project extends EventDispatcher<{
 		return (this.#readyPromise ??= this.#ready(options))
 	}
 
-	async #ready({ projectRootsWatcher }: ProjectReadyOptions = {}): Promise<this> {
+	async #ready(
+		{ projectRootsWatcher }: ProjectReadyOptions = {},
+		diagnostics?: ProjectDiagnosticsEvent[],
+		propagateProcessorErrors = false,
+	): Promise<this> {
 		if (!this.#isInitialized) {
 			throw new Error('Project.ready() must be called after Project.init() resolves')
 		}
 
 		this.#isReady = false
+		const stagedDiagnostics = diagnostics ?? []
+		const shouldPublishEvents = diagnostics === undefined
 
 		if (projectRootsWatcher !== undefined) {
 			this.#watcher = projectRootsWatcher
@@ -735,7 +772,10 @@ export class Project extends EventDispatcher<{
 		__profiler.task('Register Symbols')
 
 		for (const [uri, values] of Object.entries(this.cacheService.errors)) {
-			this.emit('documentErrored', { errors: values, uri })
+			stagedDiagnostics.push({
+				data: { errors: values, uri },
+				name: 'documentErrored',
+			})
 		}
 		__profiler.task('Pop Errors')
 
@@ -771,16 +811,24 @@ export class Project extends EventDispatcher<{
 		const __parseProfiler = this.profilers.get('project#ready#parse', 'top-n', 50)
 		const __bindProfiler = this.profilers.get('project#ready#bind', 'top-n', 50)
 		for (const uri of files) {
-			await this.#parseAndBindForReady(uri, __parseProfiler, __bindProfiler)
+			await this.#parseAndBindForReady(
+				uri,
+				__parseProfiler,
+				__bindProfiler,
+				stagedDiagnostics,
+				propagateProcessorErrors,
+			)
 		}
 		__parseProfiler.finalize()
 		__bindProfiler.finalize()
 		__profiler.task('Bind Files')
 
-		__profiler.finalize()
-		this.emit('ready', {})
-
+		await this.rebindAndCheckClientManaged(stagedDiagnostics, propagateProcessorErrors)
 		this.#isReady = true
+		__profiler.finalize()
+		if (shouldPublishEvents) {
+			await this.publishRebuildEvents(stagedDiagnostics)
+		}
 
 		return this
 	}
@@ -797,16 +845,85 @@ export class Project extends EventDispatcher<{
 	async restart(): Promise<void> {
 		this.#bindingInProgressUris.clear()
 		this.#symbolUpToDateUris.clear()
-		this.#readyPromise = undefined
-		await this.ready({ projectRootsWatcher: this.#watcher })
+		const readyPromise = this.#ready({ projectRootsWatcher: this.#watcher })
+		this.#readyPromise = readyPromise
+		await readyPromise
 	}
 
+	private async restartForRebuild(diagnostics: ProjectDiagnosticsEvent[]): Promise<void> {
+		this.#bindingInProgressUris.clear()
+		this.#symbolUpToDateUris.clear()
+		const readyPromise = this.#ready(
+			{ projectRootsWatcher: this.#watcher },
+			diagnostics,
+			true,
+		)
+		this.#readyPromise = readyPromise
+		await readyPromise
+	}
+
+	/** Schedule a complete project cache reset behind other project lifecycle operations. */
+	async reset(): Promise<void> {
+		this.#resetGeneration += 1
+		if (!this.#resetPromise) {
+			const operation = this.enqueueLifecycle(() => this.drainResets())
+			const tracked = operation.finally(() => {
+				if (this.#resetPromise === tracked) {
+					this.#resetPromise = undefined
+				}
+			})
+			this.#resetPromise = tracked
+		}
+		await this.#resetPromise
+	}
+
+	/** Kept as the public cache-reset API while callers migrate to {@link reset}. */
 	async resetCache(): Promise<void> {
+		await this.reset()
+	}
+
+	private async drainResets(): Promise<void> {
+		let lastError: unknown
+		while (this.#processedResetGeneration < this.#resetGeneration) {
+			const generation = this.#resetGeneration
+			try {
+				await this.resetOnce()
+				lastError = undefined
+			} catch (e) {
+				lastError = e
+			}
+			this.#processedResetGeneration = generation
+		}
+		if (lastError !== undefined) {
+			throw lastError
+		}
+	}
+
+	private async resetOnce(preparedContext?: PreparedCacheContext): Promise<void> {
+		const transaction = this.beginProjectRebuildTransaction()
+		let diagnostics: ProjectDiagnosticsEvent[]
+		try {
+			diagnostics = await this.rebuildProjectFromEmptyCache()
+			if (preparedContext) {
+				this.cacheService.commitContext(preparedContext)
+			}
+			transaction.commit()
+		} catch (e) {
+			transaction.rollback()
+			throw e
+		}
+		await this.publishRebuildEvents(diagnostics)
+	}
+
+	private async rebuildProjectFromEmptyCache(): Promise<ProjectDiagnosticsEvent[]> {
 		this.logger.info('[Project#resetCache] Initiated...')
+		this.#isReady = false
+		this.reparseClientManaged()
+		const diagnostics: ProjectDiagnosticsEvent[] = []
 
 		// Clear existing errors.
 		for (const uri of Object.keys(this.cacheService.errors)) {
-			this.emit('documentErrored', { errors: [], uri })
+			diagnostics.push({ data: { errors: [], uri }, name: 'documentErrored' })
 		}
 
 		// Reset cache.
@@ -814,14 +931,8 @@ export class Project extends EventDispatcher<{
 		this.symbols = new SymbolUtil(symbols)
 		this.symbols.buildCache()
 
-		for (const { node } of this.#clientManagedDocAndNodes.values()) {
-			node.binderErrors = undefined
-			node.checkerErrors = undefined
-			node.linterErrors = undefined
-		}
-
-		await this.restart()
-		await this.recheckClientManaged()
+		await this.restartForRebuild(diagnostics)
+		return diagnostics
 	}
 
 	private async applyConfigUpdate(config: Config): Promise<void> {
@@ -830,22 +941,46 @@ export class Project extends EventDispatcher<{
 		this.logger.info('[Project] [Config] Changed')
 		this.emit('configChanged', { oldConfig, newConfig: config })
 
-		if (
-			this.#isInitialized
-			&& await this.cacheService.updateContext({
+		if (this.#isInitialized) {
+			const preparedContext = await this.cacheService.prepareContext({
 				initializerContext: this.#ctx,
 				lint: config.lint,
 			})
-		) {
-			await this.resetCache()
+			if (preparedContext.changed) {
+				await this.resetOnce(preparedContext)
+			}
 		}
 	}
 
-	private async recheckClientManaged(): Promise<void> {
+	private async rebindAndCheckClientManaged(
+		diagnostics: ProjectDiagnosticsEvent[],
+		propagateProcessorErrors: boolean,
+	): Promise<void> {
+		const entries = [...this.#clientManagedDocAndNodes.entries()]
+		// Rebuild all bindings first, then complete every check before staging any diagnostics.
+		for (const [, { doc, node }] of entries) {
+			await this.bind(doc, node, propagateProcessorErrors)
+		}
 		await Promise.all(
-			[...this.#clientManagedDocAndNodes.values()]
-				.map(({ doc, node }) => this.bind(doc, node).then(() => this.check(doc, node))),
+			entries.map(([, { doc, node }]) => this.check(doc, node, propagateProcessorErrors)),
 		)
+		for (const [uri, value] of entries) {
+			if (this.#clientManagedDocAndNodes.get(uri) === value) {
+				diagnostics.push({ data: value, name: 'documentUpdated' })
+			}
+		}
+	}
+
+	private async publishRebuildEvents(diagnostics: ProjectDiagnosticsEvent[]): Promise<void> {
+		// Diagnostics listeners (including the LSP publisher) must settle before READY is visible.
+		for (const event of diagnostics) {
+			if (event.name === 'documentErrored') {
+				await this.emitAsync(event.name, event.data)
+			} else {
+				await this.emitAsync(event.name, event.data)
+			}
+		}
+		await this.emitAsync('ready', {})
 	}
 
 	private reparseClientManaged(): void {
@@ -955,12 +1090,16 @@ export class Project extends EventDispatcher<{
 	}
 
 	@SingletonPromise()
-	private async bind(doc: TextDocument, node: FileNode<AstNode>): Promise<void> {
-		if (node.binderErrors) {
-			return
-		}
+	private async bind(
+		doc: TextDocument,
+		node: FileNode<AstNode>,
+		propagateErrors = false,
+	): Promise<void> {
+		this.#bindingInProgressUris.add(doc.uri)
 		try {
-			this.#bindingInProgressUris.add(doc.uri)
+			if (node.binderErrors) {
+				return
+			}
 			const binder = this.meta.getBinder(node.type)
 			const ctx = BinderContext.create(this, { doc })
 			ctx.symbols.clear({ contributor: 'binder', uri: doc.uri })
@@ -969,15 +1108,23 @@ export class Project extends EventDispatcher<{
 				await binder(proxy, ctx)
 				node.binderErrors = ctx.err.dump()
 			})
-			this.#bindingInProgressUris.delete(doc.uri)
 			this.#symbolUpToDateUris.add(doc.uri)
 		} catch (e) {
 			this.logger.error(`[Project] [bind] Failed for ${doc.uri} # ${doc.version}`, e)
+			if (propagateErrors) {
+				throw e
+			}
+		} finally {
+			this.#bindingInProgressUris.delete(doc.uri)
 		}
 	}
 
 	@SingletonPromise()
-	private async check(doc: TextDocument, node: FileNode<AstNode>): Promise<void> {
+	private async check(
+		doc: TextDocument,
+		node: FileNode<AstNode>,
+		propagateErrors = false,
+	): Promise<void> {
 		if (node.checkerErrors) {
 			return
 		}
@@ -996,6 +1143,9 @@ export class Project extends EventDispatcher<{
 			})
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
+			if (propagateErrors) {
+				throw e
+			}
 		} finally {
 			__checkProfiler.finalize()
 			__lintProfiler.finalize()
@@ -1051,21 +1201,26 @@ export class Project extends EventDispatcher<{
 		}
 
 		this.#bindingInProgressUris.add(uri)
+		try {
+			const doc = await this.read(uri)
+			if (!doc || !(await this.cacheService.hasFileChangedSinceCache(doc))) {
+				return
+			}
 
-		const doc = await this.read(uri)
-		if (!doc || !(await this.cacheService.hasFileChangedSinceCache(doc))) {
-			return
+			const node = this.parse(doc)
+			await this.bind(doc, node)
+			this.emit('documentUpdated', { doc, node })
+		} finally {
+			this.#bindingInProgressUris.delete(uri)
 		}
-
-		const node = this.parse(doc)
-		await this.bind(doc, node)
-		this.emit('documentUpdated', { doc, node })
 	}
 
 	async #parseAndBindForReady(
 		uri: string,
 		parseProfiler: Profiler,
 		bindProfiler: Profiler,
+		diagnostics: ProjectDiagnosticsEvent[],
+		propagateProcessorErrors: boolean,
 	): Promise<void> {
 		uri = this.normalizeUri(uri)
 		if (this.#symbolUpToDateUris.has(uri) || this.#bindingInProgressUris.has(uri)) {
@@ -1073,17 +1228,20 @@ export class Project extends EventDispatcher<{
 		}
 
 		this.#bindingInProgressUris.add(uri)
+		try {
+			const doc = await this.read(uri)
+			if (!doc || !(await this.cacheService.hasFileChangedSinceCache(doc))) {
+				return
+			}
 
-		const doc = await this.read(uri)
-		if (!doc || !(await this.cacheService.hasFileChangedSinceCache(doc))) {
-			return
+			const node = this.parse(doc)
+			parseProfiler.task(uri)
+			await this.bind(doc, node, propagateProcessorErrors)
+			bindProfiler.task(uri)
+			diagnostics.push({ data: { doc, node }, name: 'documentUpdated' })
+		} finally {
+			this.#bindingInProgressUris.delete(uri)
 		}
-
-		const node = this.parse(doc)
-		parseProfiler.task(uri)
-		await this.bind(doc, node)
-		bindProfiler.task(uri)
-		this.emit('documentUpdated', { doc, node })
 	}
 
 	private bindUri(param: string | string[]): void {
