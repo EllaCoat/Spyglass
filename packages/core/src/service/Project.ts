@@ -111,9 +111,7 @@ interface ProjectRebuildTransaction {
 	commit(): void
 	rollback(): void
 }
-type ProjectDiagnosticsEvent =
-	| { data: DocumentErrorEvent; name: 'documentErrored' }
-	| { data: DocumentEvent; name: 'documentUpdated' }
+type ProjectDiagnosticsEvent = { data: DocumentErrorEvent; name: 'documentErrored' }
 interface SymbolRegistrarEvent {
 	id: string
 	checksum: string | undefined
@@ -354,11 +352,7 @@ export class Project extends EventDispatcher<{
 			// if (!this.#isReady) {
 			// 	return
 			// }
-			await this.emitAsync('documentErrored', {
-				errors: FileNode.getErrors(node).map((e) => LanguageError.withPosRange(e, doc)),
-				uri: doc.uri,
-				version: doc.version,
-			})
+			await this.emitAsync('documentErrored', this.createDocumentErrorEvent(doc, node))
 		}).on('documentRemoved', ({ uri }) => {
 			this.emit('documentErrored', { errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
@@ -655,7 +649,7 @@ export class Project extends EventDispatcher<{
 	 * Finish the initial run of parsing, binding, and checking the entire project.
 	 */
 	async ready(options: ProjectReadyOptions = {}): Promise<this> {
-		return (this.#readyPromise ??= this.#ready(options))
+		return (this.#readyPromise ??= this.enqueueLifecycle(() => this.#ready(options)))
 	}
 
 	async #ready(
@@ -822,7 +816,7 @@ export class Project extends EventDispatcher<{
 				uri,
 				__parseProfiler,
 				__bindProfiler,
-				stagedDiagnostics,
+				shouldPublishEvents ? undefined : stagedDiagnostics,
 				propagateProcessorErrors,
 			)
 		}
@@ -830,7 +824,7 @@ export class Project extends EventDispatcher<{
 		__bindProfiler.finalize()
 		__profiler.task('Bind Files')
 
-		await this.rebindAndCheckClientManaged(stagedDiagnostics, propagateProcessorErrors)
+		await this.rebindAndCheckClientManaged(propagateProcessorErrors)
 		this.#isReady = true
 		__profiler.finalize()
 		if (shouldPublishEvents) {
@@ -846,7 +840,18 @@ export class Project extends EventDispatcher<{
 	async close(): Promise<void> {
 		clearInterval(this.#cacheSaverIntervalId)
 		await this.#watcher?.close()
-		await this.cacheService.save()
+		for (;;) {
+			const lifecycle = this.#lifecyclePromise
+			await lifecycle
+			if (lifecycle === this.#lifecyclePromise) {
+				break
+			}
+		}
+		try {
+			await this.cacheService.save()
+		} catch (e) {
+			this.logger.error('[Project#close] Failed saving cache', e)
+		}
 	}
 
 	async restart(): Promise<void> {
@@ -960,34 +965,40 @@ export class Project extends EventDispatcher<{
 	}
 
 	private async rebindAndCheckClientManaged(
-		diagnostics: ProjectDiagnosticsEvent[],
 		propagateProcessorErrors: boolean,
 	): Promise<void> {
 		const entries = [...this.#clientManagedDocAndNodes.entries()]
-		// Rebuild all bindings first, then complete every check before staging any diagnostics.
+		// Rebuild all bindings first, then complete every check before publishing any diagnostics.
 		for (const [, { doc, node }] of entries) {
 			await this.bind(doc, node, propagateProcessorErrors)
 		}
 		await Promise.all(
 			entries.map(([, { doc, node }]) => this.check(doc, node, propagateProcessorErrors)),
 		)
-		for (const [uri, value] of entries) {
-			if (this.#clientManagedDocAndNodes.get(uri) === value) {
-				diagnostics.push({ data: value, name: 'documentUpdated' })
-			}
-		}
 	}
 
 	private async publishRebuildEvents(diagnostics: ProjectDiagnosticsEvent[]): Promise<void> {
 		// Diagnostics listeners (including the LSP publisher) must settle before READY is visible.
 		for (const event of diagnostics) {
-			if (event.name === 'documentErrored') {
-				await this.emitAsync(event.name, event.data)
-			} else {
-				await this.emitAsync(event.name, event.data)
-			}
+			await this.emitAsync(event.name, event.data)
+		}
+		// Client-managed ASTs are retained by design. Resolve them only after commit so queued editor
+		// mutations cannot be overwritten by rollback and no rebuild staging array owns an AST.
+		for (const value of this.#clientManagedDocAndNodes.values()) {
+			await this.emitAsync('documentUpdated', value)
 		}
 		await this.emitAsync('ready', {})
+	}
+
+	private createDocumentErrorEvent(
+		doc: TextDocument,
+		node: FileNode<AstNode>,
+	): DocumentErrorEvent {
+		return {
+			errors: FileNode.getErrors(node).map((e) => LanguageError.withPosRange(e, doc)),
+			uri: doc.uri,
+			version: doc.version,
+		}
 	}
 
 	private reparseClientManaged(): void {
@@ -1234,7 +1245,7 @@ export class Project extends EventDispatcher<{
 		uri: string,
 		parseProfiler: Profiler,
 		bindProfiler: Profiler,
-		diagnostics: ProjectDiagnosticsEvent[],
+		diagnostics: ProjectDiagnosticsEvent[] | undefined,
 		propagateProcessorErrors: boolean,
 	): Promise<void> {
 		uri = this.normalizeUri(uri)
@@ -1253,7 +1264,17 @@ export class Project extends EventDispatcher<{
 			parseProfiler.task(uri)
 			await this.bind(doc, node, propagateProcessorErrors)
 			bindProfiler.task(uri)
-			diagnostics.push({ data: { doc, node }, name: 'documentUpdated' })
+			if (diagnostics) {
+				this.cacheService.trackDocumentUpdate(doc)
+				diagnostics.push({
+					data: this.createDocumentErrorEvent(doc, node),
+					name: 'documentErrored',
+				})
+			} else {
+				// Initial scans have no rollback boundary, so preserve per-file streaming and let the
+				// document/AST become collectible before processing the next file.
+				await this.emitAsync('documentUpdated', { doc, node })
+			}
 		} finally {
 			this.#bindingInProgressUris.delete(uri)
 		}
@@ -1281,6 +1302,15 @@ export class Project extends EventDispatcher<{
 	 * Notify that a new document was opened in the editor.
 	 */
 	async onDidOpen(
+		uri: string,
+		languageID: string,
+		version: number,
+		content: string,
+	): Promise<void> {
+		await this.enqueueLifecycle(() => this.onDidOpenOnce(uri, languageID, version, content))
+	}
+
+	private async onDidOpenOnce(
 		uri: string,
 		languageID: string,
 		version: number,
@@ -1317,6 +1347,14 @@ export class Project extends EventDispatcher<{
 		changes: TextDocumentContentChangeEvent[],
 		version: number,
 	): Promise<void> {
+		await this.enqueueLifecycle(() => this.onDidChangeOnce(uri, changes, version))
+	}
+
+	private async onDidChangeOnce(
+		uri: string,
+		changes: TextDocumentContentChangeEvent[],
+		version: number,
+	): Promise<void> {
 		const clientUri = normalizeUri(uri)
 		const isCacheUri = this.isCacheUri(clientUri)
 		uri = this.normalizeUri(clientUri)
@@ -1346,6 +1384,10 @@ export class Project extends EventDispatcher<{
 	 * Notify that an existing document was closed in the editor.
 	 */
 	async onDidClose(uri: string): Promise<void> {
+		await this.enqueueLifecycle(() => this.onDidCloseOnce(uri))
+	}
+
+	private async onDidCloseOnce(uri: string): Promise<void> {
 		const clientUri = normalizeUri(uri)
 		const isCacheUri = this.isCacheUri(clientUri)
 		uri = this.normalizeUri(clientUri)

@@ -255,23 +255,6 @@ function createLogger(): core.Logger {
 	}
 }
 
-async function mapLimit<T, R>(
-	values: readonly T[],
-	limit: number,
-	fn: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-	const results = new Array<R>(values.length)
-	let nextIndex = 0
-	const workers = Array.from({ length: Math.min(limit, values.length) }, async () => {
-		while (nextIndex < values.length) {
-			const index = nextIndex++
-			results[index] = await fn(values[index], index)
-		}
-	})
-	await Promise.all(workers)
-	return results
-}
-
 function inferFunctionId(file: string): string | undefined {
 	const parts = file.replace(/\\/g, '/').split('/')
 	for (let i = parts.length - 2; i >= 0; i--) {
@@ -382,7 +365,7 @@ async function readInputs(
 	diagnostics: LintDiagnostic[],
 	skipUnresolved: boolean,
 ): Promise<Map<string, FileInput>> {
-	const entries = await mapLimit(files, parallel, async (file) => {
+	const entries = await core.mapLimit(files, parallel, async (file) => {
 		try {
 			const content = await readFile(file, 'utf8')
 			return { file, content, sha1: sha1(content) } satisfies FileInput
@@ -511,7 +494,7 @@ async function checksumBarrier(
 	if (inputs.size !== files.length) {
 		return false
 	}
-	const matches = await mapLimit(files, parallel, async (file) => {
+	const matches = await core.mapLimit(files, parallel, async (file) => {
 		try {
 			return sha1(await readFile(file, 'utf8')) === inputs.get(file)?.sha1
 		} catch {
@@ -531,6 +514,7 @@ export async function runImpDocLint(
 	}
 
 	const normalizedFiles = [...new Set(files.map(file => resolve(file)))].sort()
+	const normalizedFileSet = new Set(normalizedFiles)
 	const cachePath = options.cachePath ? resolve(options.cachePath) : undefined
 	const activeContextHash = contextHash(options)
 	const cacheSnapshot = cachePath
@@ -554,7 +538,7 @@ export async function runImpDocLint(
 			}
 		}
 		for (const file of Object.keys(activated.cache.manifest.files)) {
-			if (!normalizedFiles.includes(file)) {
+			if (!normalizedFileSet.has(file)) {
 				changedFiles.add(file)
 			}
 		}
@@ -637,7 +621,8 @@ export async function runImpDocLint(
 	const processInputs = [...affectedFiles]
 		.map(file => inputs.get(file))
 		.filter((input): input is FileInput => input !== undefined)
-	const parsed = await mapLimit(processInputs, options.parallel, async (input) => {
+	const parsed = await core.mapLimit(processInputs, options.parallel, async (input) => {
+		const uri = pathToFileURL(input.file).toString()
 		try {
 			return createFileState(input, projectData)
 		} catch (error) {
@@ -705,8 +690,8 @@ export async function runImpDocLint(
 	}
 	const indexStates = states.filter(state => basename(state.file) === '_index.d.mcfunction')
 	const regularStates = states.filter(state => basename(state.file) !== '_index.d.mcfunction')
-	await mapLimit(indexStates, options.parallel, check)
-	await mapLimit(regularStates, options.parallel, check)
+	await core.mapLimit(indexStates, options.parallel, check)
+	await core.mapLimit(regularStates, options.parallel, check)
 	checkProfiler.finalize()
 
 	const lintConfig = config.lint as unknown as Record<string, unknown>
@@ -717,7 +702,7 @@ export async function runImpDocLint(
 		const registration = meta.getLinter(ImpDocPrivateRule)
 		if (registration.configValidator(ImpDocPrivateRule, lintValue.ruleValue, logger)) {
 			const lintProfiler = projectData.profilers.get('project#lint', 'top-n', 50)
-			await mapLimit(states, options.parallel, async (state) => {
+			await core.mapLimit(states, options.parallel, async (state) => {
 				try {
 					const err = new core.LinterErrorReporter(
 						ImpDocPrivateRule,
