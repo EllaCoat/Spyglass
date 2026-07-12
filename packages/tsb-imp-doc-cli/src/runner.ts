@@ -2,15 +2,36 @@ import * as core from '@spyglassmc/core'
 import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import * as impDoc from '@spyglassmc/tsb-imp-doc'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import { basename, dirname, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { TextDocument } from 'vscode-languageserver-textdocument'
+import { rawCacheToken, writeCacheAtomically } from './cache-file.js'
+import {
+	createDependencyGraph,
+	type DependencyGraph,
+	expandAffectedFiles,
+	isDependencyGraph,
+	isDependencyGraphConsistent,
+	toSymbolKey,
+} from './graph.js'
+import {
+	type ExportSymbolSummary,
+	type FileManifestEntry,
+	isPerFileManifest,
+	type PerFileManifest,
+} from './manifest.js'
 import type { DiagnosticSeverity, LintDiagnostic } from './reporter.js'
 
-const CacheVersion = 1
+const CacheVersion = 2
 const ImpDocPrivateRule = 'impDocPrivate'
 const UnresolvedRule = 'unresolved'
+const ExportUsageTypes = [
+	'declaration',
+	'definition',
+	'implementation',
+	'typeDefinition',
+] as const
 
 export interface RunnerOptions {
 	targetDir: string
@@ -23,27 +44,65 @@ export interface RunnerOptions {
 export interface RunResult {
 	diagnostics: LintDiagnostic[]
 	filesScanned: number
+	/** Number of files parsed, bound, checked, and linted during this invocation. */
+	filesProcessed: number
+	/** True only when a valid cache made the invocation a true no-op. */
 	cacheHit: boolean
+	/** True when no valid cache could be activated and every readable file was processed. */
+	fullScan: boolean
 }
 
-interface FileState {
+interface FileInput {
 	file: string
-	uri: string
 	content: string
+	sha1: string
+}
+
+interface FileState extends FileInput {
+	uri: string
 	doc: TextDocument
 	node: core.FileNode<core.AstNode>
 }
 
 interface ResultCache {
 	version: number
-	fingerprint: string
-	diagnostics: LintDiagnostic[]
+	contextHash: string
+	generation: number
+	manifest: PerFileManifest
+	graph: DependencyGraph
+	symbols: core.UnlinkedSymbolTable
 	filesScanned: number
+}
+
+interface ActivatedCache {
+	cache: ResultCache
+	symbols: core.SymbolTable
+}
+
+interface CacheSnapshot {
+	activated?: ActivatedCache
+	token?: string
 }
 
 interface CliMcfunctionNode extends core.AstNode {
 	type: 'tsb-imp-doc-cli:mcfunction'
 	children: core.AstNode[]
+}
+
+function sha1(value: string): string {
+	return createHash('sha1').update(value).digest('hex')
+}
+
+function stableStringify(value: unknown): string {
+	return JSON.stringify(value, (_key, item) => {
+		if (item && typeof item === 'object' && !Array.isArray(item)) {
+			return Object.fromEntries(
+				Object.entries(item as Record<string, unknown>)
+					.sort(([a], [b]) => a.localeCompare(b)),
+			)
+		}
+		return item
+	})
 }
 
 function severityName(severity: core.ErrorSeverity): DiagnosticSeverity {
@@ -117,7 +176,7 @@ function parseResourceLocation(
 }
 
 /**
- * Minimal base parser for the CI vertical slice. Spike B's initializer wraps this parser and
+ * Minimal base parser for the CI vertical slice. The IMP-Doc initializer wraps this parser and
  * replaces the emitted legacy comment nodes with its own ImpDocNode implementation.
  */
 const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
@@ -214,7 +273,7 @@ async function mapLimit<T, R>(
 
 function inferFunctionId(file: string): string | undefined {
 	const parts = file.replace(/\\/g, '/').split('/')
-	for (let i = parts.length - 3; i >= 0; i--) {
+	for (let i = parts.length - 2; i >= 0; i--) {
 		if (parts[i] !== 'functions' && parts[i] !== 'function') {
 			continue
 		}
@@ -244,84 +303,224 @@ function getImpDocFunctionIds(node: core.AstNode): string[] {
 	return ids
 }
 
-async function fingerprint(
-	files: readonly string[],
-	options: RunnerOptions,
-): Promise<string> {
-	const hash = createHash('sha256')
-	hash.update(JSON.stringify({
+function contextHash(options: RunnerOptions): string {
+	return sha1(stableStringify({
 		version: CacheVersion,
 		impDocVersion: impDoc.ImpDocVersion,
 		targetDir: resolve(options.targetDir),
 		skipUnresolved: options.skipUnresolved ?? false,
 		config: options.config ?? {},
 	}))
-	const stats = await mapLimit(files, options.parallel, async (file) => {
-		const value = await stat(file)
-		return `${file}\0${value.size}\0${value.mtimeMs}`
-	})
-	for (const value of stats) {
-		hash.update(value)
-	}
-	return hash.digest('hex')
 }
 
-function isResultCache(value: unknown): value is ResultCache {
-	if (!value || typeof value !== 'object') {
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isResultCache(value: unknown, expectedContextHash: string): value is ResultCache {
+	if (!isRecord(value)) {
 		return false
 	}
-	const cache = value as Partial<ResultCache>
-	return cache.version === CacheVersion
-		&& typeof cache.fingerprint === 'string'
-		&& typeof cache.filesScanned === 'number'
-		&& Array.isArray(cache.diagnostics)
+	const generation = value.generation
+	return value.version === CacheVersion
+		&& value.contextHash === expectedContextHash
+		&& Number.isSafeInteger(generation)
+		&& (generation as number) > 0
+		&& typeof value.filesScanned === 'number'
+		&& isRecord(value.symbols)
+		&& isPerFileManifest(value.manifest, generation as number)
+		&& isDependencyGraph(value.graph, generation as number)
+		&& isDependencyGraphConsistent(value.graph, value.manifest)
 }
 
-async function readResultCache(
+async function readCacheSnapshot(
 	path: string,
-	expectedFingerprint: string,
-): Promise<RunResult | undefined> {
+	expectedContextHash: string,
+): Promise<CacheSnapshot> {
+	let rawBytes: Buffer
 	try {
-		const value: unknown = JSON.parse(await readFile(path, 'utf8'))
-		if (isResultCache(value) && value.fingerprint === expectedFingerprint) {
-			return {
-				diagnostics: value.diagnostics,
-				filesScanned: value.filesScanned,
-				cacheHit: true,
-			}
+		rawBytes = await readFile(path)
+	} catch {
+		return {}
+	}
+
+	const token = rawCacheToken(rawBytes)
+	let value: unknown
+	try {
+		value = JSON.parse(rawBytes.toString('utf8'))
+	} catch {
+		return { token }
+	}
+	if (!isResultCache(value, expectedContextHash)) {
+		return { token }
+	}
+	try {
+		return {
+			activated: {
+				cache: value,
+				symbols: core.SymbolTable.link(value.symbols),
+			},
+			token,
 		}
 	} catch {
-		// Missing, stale, or malformed cache files are intentionally ignored.
+		return { token }
 	}
-	return undefined
 }
 
 async function writeResultCache(
 	path: string,
-	fingerprintValue: string,
-	result: RunResult,
-): Promise<void> {
-	try {
-		await mkdir(dirname(path), { recursive: true })
-		const tempPath = `${path}.${process.pid}.tmp`
-		await writeFile(
-			tempPath,
-			JSON.stringify(
-				{
-					version: CacheVersion,
-					fingerprint: fingerprintValue,
-					diagnostics: result.diagnostics,
-					filesScanned: result.filesScanned,
-				} satisfies ResultCache,
-			),
-		)
-		await rename(tempPath, path)
-	} catch {
-		// A cache write failure must never change the lint result.
-	}
+	expectedToken: string | undefined,
+	cache: ResultCache,
+): Promise<boolean> {
+	return writeCacheAtomically(path, expectedToken, JSON.stringify(cache))
 }
 
-/** Runs Spike B's registered parser, checker, and private linter over scanner output. */
+async function readInputs(
+	files: readonly string[],
+	parallel: number,
+	diagnostics: LintDiagnostic[],
+	skipUnresolved: boolean,
+): Promise<Map<string, FileInput>> {
+	const entries = await mapLimit(files, parallel, async (file) => {
+		try {
+			const content = await readFile(file, 'utf8')
+			return { file, content, sha1: sha1(content) } satisfies FileInput
+		} catch (error) {
+			if (!skipUnresolved) {
+				diagnostics.push(runnerError(file, error))
+			}
+			return undefined
+		}
+	})
+	return new Map(
+		entries
+			.filter((entry): entry is FileInput => entry !== undefined)
+			.map(entry => [entry.file, entry]),
+	)
+}
+
+function discoverExportKeys(input: FileInput): string[] {
+	const keys = new Set<string>()
+	const inferredId = inferFunctionId(input.file)
+	if (inferredId) {
+		keys.add(toSymbolKey('function', [inferredId]))
+	}
+	for (const match of input.content.matchAll(/^\s*#>\s*(\S+)/gm)) {
+		keys.add(toSymbolKey('function', [match[1]]))
+	}
+	for (
+		const match of input.content.matchAll(
+			/^\s*#declare\s+(tag|storage|score_holder)\s+(\S+)/gm,
+		)
+	) {
+		keys.add(toSymbolKey(match[1], [match[2]]))
+	}
+	return [...keys]
+}
+
+function createFileState(
+	input: FileInput,
+	projectData: core.ProjectData,
+): FileState {
+	const uri = pathToFileURL(input.file).toString()
+	const doc = TextDocument.create(uri, 'mcfunction', 0, input.content)
+	const parser = projectData.meta.getParserForLanguageId<core.AstNode>('mcfunction')!
+	const node = core.file(parser)(
+		new core.Source(input.content),
+		core.ParserContext.create(projectData, { doc }),
+	)
+	return { ...input, uri, doc, node }
+}
+
+function collectReferences(state: FileState): string[] {
+	const references = new Set<string>()
+	core.traversePreOrder(
+		state.node,
+		() => true,
+		() => true,
+		(candidate) => {
+			if (core.ResourceLocationNode.is(candidate) && candidate.options.category) {
+				const symbolPath = core.SymbolPath.fromSymbol(candidate.symbol)
+				const category = candidate.isTag
+					? `tag/${candidate.options.category}`
+					: candidate.options.category
+				references.add(
+					symbolPath
+						? toSymbolKey(symbolPath.category, symbolPath.path)
+						: toSymbolKey(category, [
+							core.ResourceLocationNode.toString(candidate, 'full'),
+						]),
+				)
+			} else if (
+				core.SymbolNode.is(candidate)
+				&& candidate.value
+				&& (candidate.options.usageType ?? 'reference') === 'reference'
+			) {
+				const symbolPath = core.SymbolPath.fromSymbol(candidate.symbol)
+				references.add(
+					symbolPath
+						? toSymbolKey(symbolPath.category, symbolPath.path)
+						: toSymbolKey(candidate.options.category, [
+							...(candidate.options.parentPath ?? []),
+							candidate.value,
+						]),
+				)
+			}
+		},
+	)
+	return [...references].sort()
+}
+
+function collectExports(symbols: core.SymbolUtil, uri: string): ExportSymbolSummary[] {
+	const exports: ExportSymbolSummary[] = []
+	core.SymbolUtil.forEachSymbol(symbols.global, (symbol) => {
+		const usage = ExportUsageTypes.filter(type =>
+			symbol[type]?.some(location => location.uri === uri)
+		)
+		if (usage.length === 0) {
+			return
+		}
+		exports.push({
+			category: symbol.category,
+			path: [...symbol.path],
+			key: toSymbolKey(symbol.category, symbol.path),
+			usage: [...usage],
+			...('data' in symbol ? { data: symbol.data } : {}),
+			...(symbol.desc === undefined ? {} : { description: symbol.desc }),
+		})
+	})
+	return exports.sort((a, b) => a.key.localeCompare(b.key))
+}
+
+function sortDiagnostics(diagnostics: LintDiagnostic[]): void {
+	diagnostics.sort((a, b) =>
+		a.file.localeCompare(b.file)
+		|| a.line - b.line
+		|| a.col - b.col
+		|| a.rule.localeCompare(b.rule)
+		|| a.message.localeCompare(b.message)
+	)
+}
+
+async function checksumBarrier(
+	files: readonly string[],
+	inputs: ReadonlyMap<string, FileInput>,
+	parallel: number,
+): Promise<boolean> {
+	if (inputs.size !== files.length) {
+		return false
+	}
+	const matches = await mapLimit(files, parallel, async (file) => {
+		try {
+			return sha1(await readFile(file, 'utf8')) === inputs.get(file)?.sha1
+		} catch {
+			return false
+		}
+	})
+	return matches.every(Boolean)
+}
+
+/** Runs the registered parser, checker, and private linter over scanner output. */
 export async function runImpDocLint(
 	files: readonly string[],
 	options: RunnerOptions,
@@ -330,12 +529,61 @@ export async function runImpDocLint(
 		throw new Error(`parallel must be a positive integer, got ${options.parallel}`)
 	}
 
+	const normalizedFiles = [...new Set(files.map(file => resolve(file)))].sort()
 	const cachePath = options.cachePath ? resolve(options.cachePath) : undefined
-	const fingerprintValue = cachePath ? await fingerprint(files, options) : undefined
-	if (cachePath && fingerprintValue) {
-		const cached = await readResultCache(cachePath, fingerprintValue)
-		if (cached) {
-			return cached
+	const activeContextHash = contextHash(options)
+	const cacheSnapshot = cachePath
+		? await readCacheSnapshot(cachePath, activeContextHash)
+		: {}
+	const activated = cacheSnapshot.activated
+	const fullScan = activated === undefined
+	const readDiagnostics: LintDiagnostic[] = []
+	const inputs = await readInputs(
+		normalizedFiles,
+		options.parallel,
+		readDiagnostics,
+		options.skipUnresolved ?? false,
+	)
+
+	const changedFiles = new Set<string>()
+	if (activated) {
+		for (const file of normalizedFiles) {
+			if (activated.cache.manifest.files[file]?.sha1 !== inputs.get(file)?.sha1) {
+				changedFiles.add(file)
+			}
+		}
+		for (const file of Object.keys(activated.cache.manifest.files)) {
+			if (!normalizedFiles.includes(file)) {
+				changedFiles.add(file)
+			}
+		}
+	} else {
+		for (const file of normalizedFiles) {
+			changedFiles.add(file)
+		}
+	}
+
+	const discoveredExportKeys = [...changedFiles]
+		.flatMap(file => inputs.has(file) ? discoverExportKeys(inputs.get(file)!) : [])
+	const affectedFiles = activated
+		? expandAffectedFiles(
+			changedFiles,
+			discoveredExportKeys,
+			activated.cache.manifest,
+			activated.cache.graph,
+		)
+		: new Set(normalizedFiles)
+
+	if (activated && affectedFiles.size === 0 && readDiagnostics.length === 0) {
+		const diagnostics = Object.values(activated.cache.manifest.files)
+			.flatMap(entry => entry.diagnostics)
+		sortDiagnostics(diagnostics)
+		return {
+			diagnostics,
+			filesScanned: normalizedFiles.length,
+			filesProcessed: 0,
+			cacheHit: true,
+			fullScan: false,
 		}
 	}
 
@@ -346,7 +594,14 @@ export async function runImpDocLint(
 	)
 	const logger = createLogger()
 	const meta = new core.MetaRegistry()
-	const symbols = new core.SymbolUtil({})
+	const symbols = new core.SymbolUtil(activated?.symbols ?? {})
+	if (activated) {
+		symbols.buildCache()
+		for (const file of affectedFiles) {
+			symbols.clear({ uri: pathToFileURL(file).toString() })
+		}
+		symbols.trim(symbols.global)
+	}
 	const config = createConfig(options.config)
 	const projectData: core.ProjectData = {
 		cacheRoot,
@@ -370,30 +625,30 @@ export async function runImpDocLint(
 	})
 	await impDoc.initialize({ ...projectData, reinitializeOnChange: () => {} })
 
-	const diagnostics: LintDiagnostic[] = []
-	const parsed = await mapLimit(files, options.parallel, async (file) => {
+	const diagnostics = activated
+		? Object.entries(activated.cache.manifest.files)
+			.filter(([file]) => inputs.has(file) && !affectedFiles.has(file))
+			.flatMap(([, entry]) => entry.diagnostics)
+		: []
+	diagnostics.push(...readDiagnostics)
+
+	const processInputs = [...affectedFiles]
+		.map(file => inputs.get(file))
+		.filter((input): input is FileInput => input !== undefined)
+	const parsed = await mapLimit(processInputs, options.parallel, async (input) => {
 		try {
-			const content = await readFile(file, 'utf8')
-			const uri = pathToFileURL(file).toString()
-			const doc = TextDocument.create(uri, 'mcfunction', 0, content)
-			const parser = meta.getParserForLanguageId<core.AstNode>('mcfunction')!
-			const node = core.file(parser)(
-				new core.Source(content),
-				core.ParserContext.create(projectData, { doc }),
-			)
-			return { file, uri, content, doc, node } satisfies FileState
+			return createFileState(input, projectData)
 		} catch (error) {
 			if (!options.skipUnresolved) {
-				diagnostics.push(runnerError(file, error))
+				diagnostics.push(runnerError(input.file, error))
 			}
 			return undefined
 		}
 	})
 	const states = parsed.filter((state): state is FileState => state !== undefined)
 
-	// Enter declarations, rather than definitions, so the Spike B checker only assigns function
-	// visibility to components that carry a function ID. Local `#declare` @private annotations stay
-	// out of scope as required by the Spike B vertical slice.
+	// Enter declarations, rather than definitions, so the checker only assigns function visibility
+	// to components that carry a function ID.
 	symbols.contributeAs('uri_binder', () => {
 		const entered = new Set<string>()
 		for (const state of states) {
@@ -487,20 +742,54 @@ export async function runImpDocLint(
 			diagnostics.push(toDiagnostic(state, error, ImpDocPrivateRule))
 		}
 	}
+	sortDiagnostics(diagnostics)
 
-	diagnostics.sort((a, b) =>
-		a.file.localeCompare(b.file)
-		|| a.line - b.line
-		|| a.col - b.col
-		|| a.rule.localeCompare(b.rule)
-	)
+	const generation = (activated?.cache.generation ?? 0) + 1
+	const manifestFiles: Record<string, FileManifestEntry> = {}
+	if (activated) {
+		for (const [file, entry] of Object.entries(activated.cache.manifest.files)) {
+			if (inputs.has(file) && !affectedFiles.has(file)) {
+				manifestFiles[file] = { ...entry, generation }
+			}
+		}
+	}
+	for (const state of states) {
+		manifestFiles[state.file] = {
+			generation,
+			sha1: state.sha1,
+			parse: {
+				bytes: new TextEncoder().encode(state.content).byteLength,
+				lines: state.content.split(/\r?\n/).length,
+				parserErrors: state.node.parserErrors.length,
+			},
+			exports: collectExports(symbols, state.uri),
+			references: collectReferences(state),
+			diagnostics: diagnostics.filter(diagnostic => diagnostic.file === state.file),
+		}
+	}
+	const manifest: PerFileManifest = { generation, files: manifestFiles }
+	const graph = createDependencyGraph(manifest)
 	const result: RunResult = {
 		diagnostics,
-		filesScanned: files.length,
+		filesScanned: normalizedFiles.length,
+		filesProcessed: states.length,
 		cacheHit: false,
+		fullScan,
 	}
-	if (cachePath && fingerprintValue) {
-		await writeResultCache(cachePath, fingerprintValue, result)
+
+	if (
+		cachePath
+		&& await checksumBarrier(normalizedFiles, inputs, options.parallel)
+	) {
+		await writeResultCache(cachePath, cacheSnapshot.token, {
+			version: CacheVersion,
+			contextHash: activeContextHash,
+			generation,
+			manifest,
+			graph,
+			symbols: core.SymbolTable.unlink(symbols.global),
+			filesScanned: normalizedFiles.length,
+		})
 	}
 	return result
 }
