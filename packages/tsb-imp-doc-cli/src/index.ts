@@ -8,6 +8,8 @@ import { report, type ReportFormat } from './reporter.js'
 import { runImpDocLint } from './runner.js'
 import { scanMcfunctionFiles } from './scanner.js'
 
+export * from './assetPerformance.js'
+
 const usage = `\
 tsb-lint-imp-doc [options] <target-dir>
 

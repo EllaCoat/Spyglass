@@ -25,6 +25,25 @@ export interface Profiler {
 	finalize(): void
 }
 
+export interface ProfilerTaskSummary {
+	name: string
+	durationMs: number
+}
+
+export interface ProfilerSummary {
+	id: string
+	style: SummaryStyle
+	totalTasks: number
+	totalMs: number
+	minMs: number
+	avgMs: number
+	maxMs: number
+	tasks: ProfilerTaskSummary[]
+	topN?: number
+}
+
+export type ProfilerReporter = (summary: ProfilerSummary) => void
+
 class TopNImpl implements Profiler {
 	#finalized = false
 	readonly #startTime: number
@@ -38,6 +57,7 @@ class TopNImpl implements Profiler {
 		private readonly id: string,
 		private readonly logger: Logger,
 		private readonly n: number,
+		private readonly reporter?: ProfilerReporter,
 	) {
 		this.#startTime = this.#lastTime = performance.now()
 	}
@@ -86,6 +106,17 @@ class TopNImpl implements Profiler {
 				} - ${time} ms (${(time / totalDuration) * 100}%)`,
 			)
 		}
+		this.reporter?.({
+			id: this.id,
+			style: 'top-n',
+			totalTasks: this.#taskCount,
+			totalMs: totalDuration,
+			minMs: this.#taskCount === 0 ? 0 : this.#minTime,
+			avgMs: this.#taskCount === 0 ? 0 : totalDuration / this.#taskCount,
+			maxMs: this.#maxTime,
+			tasks: this.#topTasks.map(([name, durationMs]) => ({ name, durationMs })),
+			topN: this.n,
+		})
 	}
 }
 
@@ -98,7 +129,11 @@ class TotalImpl implements Profiler {
 	readonly #tasks: [string, number][] = []
 	#longestTaskNameLength = 0
 
-	constructor(private readonly id: string, private readonly logger: Logger) {
+	constructor(
+		private readonly id: string,
+		private readonly logger: Logger,
+		private readonly reporter?: ProfilerReporter,
+	) {
 		this.#startTime = this.#lastTime = performance.now()
 	}
 
@@ -127,6 +162,21 @@ class TotalImpl implements Profiler {
 				} - ${time} ms`,
 			)
 		}
+		const taskSummaries = this.#tasks
+			.filter(([name]) => name !== TotalTaskName)
+			.map(([name, durationMs]) => ({ name, durationMs }))
+		const taskDurations = taskSummaries.map(task => task.durationMs)
+		const totalMs = this.#lastTime - this.#startTime
+		this.reporter?.({
+			id: this.id,
+			style: 'total',
+			totalTasks: taskSummaries.length,
+			totalMs,
+			minMs: taskDurations.length === 0 ? 0 : Math.min(...taskDurations),
+			avgMs: taskDurations.length === 0 ? 0 : totalMs / taskDurations.length,
+			maxMs: taskDurations.length === 0 ? 0 : Math.max(...taskDurations),
+			tasks: taskSummaries,
+		})
 	}
 }
 
@@ -137,12 +187,16 @@ class NoopImpl implements Profiler {
 	finalize(): void {}
 }
 
-type SummaryStyle = 'top-n' | 'total'
+export type SummaryStyle = 'top-n' | 'total'
 
 export class ProfilerFactory {
 	readonly #enabledProfilers: Set<string>
 
-	constructor(private readonly logger: Logger, enabledProfilers: string[]) {
+	constructor(
+		private readonly logger: Logger,
+		enabledProfilers: string[],
+		private readonly reporter?: ProfilerReporter,
+	) {
 		this.#enabledProfilers = new Set(enabledProfilers)
 	}
 
@@ -152,9 +206,9 @@ export class ProfilerFactory {
 		if (this.#enabledProfilers.has(id)) {
 			switch (style) {
 				case 'top-n':
-					return new TopNImpl(id, this.logger, n!)
+					return new TopNImpl(id, this.logger, n!, this.reporter)
 				case 'total':
-					return new TotalImpl(id, this.logger)
+					return new TotalImpl(id, this.logger, this.reporter)
 				default:
 					return Dev.assertNever(style)
 			}
