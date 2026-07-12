@@ -125,9 +125,7 @@ function getResourceLabels(
 		: [id]
 
 	if (node.options.namespacePathSep === '.') {
-		labels = labels.map(label =>
-			label.replace(core.ResourceLocation.NamespacePathSep, '.')
-		)
+		labels = labels.map(label => label.replace(core.ResourceLocation.NamespacePathSep, '.'))
 	}
 
 	return labels

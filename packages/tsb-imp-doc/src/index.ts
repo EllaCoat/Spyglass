@@ -4,11 +4,15 @@ import { impDoc as bindImpDoc } from './binder/impDoc.js'
 import { mcfunction as bindMcfunction } from './binder/mcfunction.js'
 import { impDoc as checkImpDoc } from './checker/impDoc.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
+import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
 import { configValidator, privateVisibility } from './linter/private.js'
 import type { ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
 import { extendMcfunctionParser, impDoc } from './parser/impDoc.js'
+import { registerContractSignatureHelpProvider } from './signatureHelp/contract.js'
 import { ImpDocVersion } from './version.js'
 
+export { bindContract, cloneContract, stampContract } from './binder/contract.js'
+export { getContractCheckSeverity, type ImpDocContractCheckSeverity } from './linter/contract.js'
 export * from './node/ImpDocNode.js'
 export * from './parser/impDoc.js'
 export * from './util/withinPattern.js'
@@ -37,10 +41,16 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		bindDeclaration,
 	)
 	meta.registerChecker<ImpDocNode>('impDoc', checkImpDoc)
+	registerContractSignatureHelpProvider(meta)
 	meta.registerLinter('impDocPrivate', {
 		configValidator,
 		linter: privateVisibility,
 		nodePredicate: node => node.type === 'file',
+	})
+	meta.registerLinter('impDocContractCheck', {
+		configValidator: contractConfigValidator,
+		linter: contractCheckLinter,
+		nodePredicate: () => false,
 	})
 
 	meta.registerLanguage('mcfunction', {

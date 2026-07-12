@@ -12,7 +12,7 @@ const FixtureDir = fileURLToPath(
 describe('tsb-imp-doc CLI smoke test', () => {
 	it('scans and runs all A3 fixtures without a private visibility violation', async () => {
 		const files = await scanMcfunctionFiles(FixtureDir)
-		assert.equal(files.length, 9)
+		assert.equal(files.length, 13)
 
 		const result = await runImpDocLint(files, {
 			targetDir: FixtureDir,
@@ -26,7 +26,7 @@ describe('tsb-imp-doc CLI smoke test', () => {
 
 		const stats = { filesScanned: result.filesScanned, executionTimeMs: 1 }
 		const text = report(result.diagnostics, stats, 'text')
-		assert.match(text.stdout, /9 files scanned/)
+		assert.match(text.stdout, /13 files scanned/)
 		const json = report(result.diagnostics, stats, 'json')
 		assert.deepEqual(JSON.parse(json.stdout), [])
 		const tap = report(result.diagnostics, stats, 'tap')

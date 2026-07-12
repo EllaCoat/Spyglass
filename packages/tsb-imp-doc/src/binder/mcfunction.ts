@@ -1,6 +1,7 @@
 import * as core from '@spyglassmc/core'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
 import { clearVisibility } from '../util/withinPattern.js'
+import { clearContract } from './contract.js'
 
 interface McfunctionEntryNode extends core.AstNode {
 	type: 'mcfunction:entry'
@@ -39,6 +40,7 @@ export const mcfunction = core.AsyncBinder.create<McfunctionEntryNode>(
 		const currentFunction = getFunctionForDocument(ctx)
 		if (currentFunction && getImpDocSymbolData(currentFunction.data)) {
 			clearVisibility(currentFunction)
+			clearContract(currentFunction)
 		}
 
 		for (const child of node.children ?? []) {
