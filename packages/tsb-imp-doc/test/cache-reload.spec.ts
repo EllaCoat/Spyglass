@@ -210,6 +210,11 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 				1,
 				new TextDecoder().decode(firstContent),
 			)
+			// onDidOpen は bind/check を直接呼ぶだけで documentUpdated を emit しない
+			// (Project.ts:912-931)。 documentErrored 経路 → cacheService.errors[uri]
+			// への反映は ensureClientManagedChecked を明示的に呼ぶ必要がある
+			// (Project.ts:980-990)。
+			await first.ensureClientManagedChecked(callerUri)
 			const firstState = first.getClientManaged(callerUri)
 			assert.ok(firstState)
 			assert.equal(firstState.node.linterErrors?.length, 1)
@@ -217,10 +222,18 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 				firstState.node.linterErrors?.[0]?.severity,
 				core.ErrorSeverity.Error,
 			)
-			// stale errors 検出 regression の precondition = errors が確実に保存されている。
+			// stale errors 検出 regression の precondition = callerUri 自身の Error
+			// 診断が cache に確実に入っている ("errors が非空" だけの assert は他
+			// fixture URI の空 entry でも成立し regression を捕捉できない)。
+			const firstCachedErrors = first.cacheService.errors[callerUri]
 			assert.ok(
-				Object.keys(first.cacheService.errors).length > 0,
-				'Expected initial run to populate cacheService.errors',
+				firstCachedErrors,
+				`Expected cacheService.errors[${callerUri}] to be populated`,
+			)
+			assert.equal(firstCachedErrors.length, 1)
+			assert.equal(
+				firstCachedErrors[0]?.severity,
+				core.ErrorSeverity.Error,
 			)
 		} finally {
 			await first.close()
