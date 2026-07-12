@@ -189,23 +189,50 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 		await close()
 	})
 
-	it('drops cache when lint config changes', async () => {
+	it('drops cache and re-lints open documents with the new severity when lint config changes', async () => {
 		await runFull({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'error',
 		})
-		const { restoredFileCount, close } = await runInit({
+		const project = createProject({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'warning',
 		})
-		assert.equal(
-			restoredFileCount,
-			0,
-			`Expected cache to be dropped on lint config change; got ${restoredFileCount}`,
-		)
-		await close()
+		try {
+			await project.init()
+			const restoredFileCount = Object.keys(
+				project.cacheService.checksums.files,
+			).length
+			assert.equal(
+				restoredFileCount,
+				0,
+				`Expected cache to be dropped on lint config change; got ${restoredFileCount}`,
+			)
+
+			const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
+			await project.ready({ projectRootsWatcher: watcher })
+
+			const callerUri = RuntimeFileUris[3]
+			assert.ok(callerUri)
+			const content = await project.externals.fs.readFile(callerUri)
+			await project.onDidOpen(
+				callerUri,
+				'mcfunction',
+				1,
+				new TextDecoder().decode(content),
+			)
+			const state = project.getClientManaged(callerUri)
+			assert.ok(state)
+			assert.equal(state.node.linterErrors?.length, 1)
+			assert.equal(
+				state.node.linterErrors?.[0]?.severity,
+				core.ErrorSeverity.Warning,
+			)
+		} finally {
+			await project.close()
+		}
 	})
 
 	it('resets cache and re-lints open documents after a hot lint config change', async () => {
