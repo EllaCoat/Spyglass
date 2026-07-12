@@ -1,0 +1,37 @@
+{
+  "impDocVersion": "0.0.3-contract-preview.0",
+  "public": {
+    "visibility": {
+      "type": "public"
+    }
+  },
+  "private": {
+    "visibility": {
+      "type": "private",
+      "owner": "example:owner"
+    },
+    "privateOwner": "example:owner"
+  },
+  "withinDeclaration": {
+    "visibility": {
+      "type": "within",
+      "owner": "example:owner",
+      "patterns": [
+        {
+          "raw": "example:allowed/**",
+          "targetType": "function",
+          "regex": "^example:allowed/.*$"
+        }
+      ]
+    },
+    "declaration": {
+      "uri": "file:///fixture/_index.d.mcfunction",
+      "range": {
+        "start": 10,
+        "end": 20
+      },
+      "owner": "example:owner"
+    },
+    "privateOwner": "example:owner"
+  }
+}
