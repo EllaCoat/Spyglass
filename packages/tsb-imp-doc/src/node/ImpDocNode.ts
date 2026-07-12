@@ -5,11 +5,112 @@ export interface ImpDocValue {
 	range: AstNode['range']
 }
 
-export interface ImpDocAnnotation extends AstNode {
-	type: 'impDoc:annotation'
+export interface ImpDocAnnotationBase extends AstNode {
 	value: ImpDocValue
 	children?: ImpDocAnnotation[]
 }
+
+/** An annotation which is not part of the Phase 2 function contract. */
+export interface ImpDocGenericAnnotation extends ImpDocAnnotationBase {
+	type: 'impDoc:annotation'
+}
+
+export type ImpDocContractDirection = 'input' | 'output'
+
+export type ImpDocContractChannel =
+	| 'args'
+	| 'storage'
+	| 'score'
+	| 'tag'
+	| 'executor'
+	| 'result'
+	| 'unknown'
+
+/**
+ * Known input spellings get literal types while custom Legacy subtypes remain
+ * lossless. `as player` is normalized to `as_player`.
+ */
+export type ImpDocInputKind = 'args' | 'as_player' | (string & {})
+
+/** A `Key: Type` declaration. Nested keys model indented NBT-shaped fields. */
+export interface ImpDocContractField {
+	raw: ImpDocValue
+	key: ImpDocValue
+	optional: boolean
+	valueType?: ImpDocValue
+	children?: ImpDocContractField[]
+}
+
+/**
+ * One normalized contract clause. The original annotation tree remains on the
+ * typed annotation node, while `raw` and all component ranges make this view
+ * safe for hover, diagnostics, and future type-expression parsing.
+ */
+export interface ImpDocContractEntry {
+	direction: ImpDocContractDirection
+	channel: ImpDocContractChannel
+	kind: string
+	raw: ImpDocValue
+	target?: ImpDocValue
+	path?: ImpDocValue
+	fields: ImpDocContractField[]
+}
+
+export interface ImpDocInput extends ImpDocAnnotationBase {
+	type: 'impDoc:input'
+	kind?: ImpDocInputKind
+	entries: ImpDocContractEntry[]
+}
+
+export interface ImpDocOutput extends ImpDocAnnotationBase {
+	type: 'impDoc:output'
+	kind?: string
+	entries: ImpDocContractEntry[]
+}
+
+export interface ImpDocApi extends ImpDocAnnotationBase {
+	type: 'impDoc:api'
+	audience: 'api'
+}
+
+export type ImpDocExecutorKind = 'player' | 'entity' | 'server' | 'unknown'
+
+export interface ImpDocUser extends ImpDocAnnotationBase {
+	type: 'impDoc:user'
+	executor: {
+		kind: ImpDocExecutorKind
+		explicit: boolean
+		raw?: ImpDocValue
+	}
+}
+
+export interface ImpDocDeprecated extends ImpDocAnnotationBase {
+	type: 'impDoc:deprecated'
+	message?: ImpDocValue
+}
+
+export type ImpDocContractAnnotation =
+	| ImpDocInput
+	| ImpDocOutput
+	| ImpDocApi
+	| ImpDocUser
+	| ImpDocDeprecated
+
+/**
+ * Normalized function-contract view. Arrays deliberately retain duplicate
+ * markers so P2b can characterize or diagnose them without reparsing raw text.
+ */
+export interface ImpDocContract {
+	inputs: ImpDocInput[]
+	outputs: ImpDocOutput[]
+	apis: ImpDocApi[]
+	users: ImpDocUser[]
+	deprecated: ImpDocDeprecated[]
+}
+
+export type ImpDocAnnotation =
+	| ImpDocGenericAnnotation
+	| ImpDocContractAnnotation
 
 export interface ImpDocDeclarationLine {
 	indent: string
@@ -65,6 +166,7 @@ export interface ImpDocDeclarationSource {
 export interface ImpDocNode extends AstNode {
 	type: 'impDoc'
 	annotations: ImpDocAnnotation[]
+	contract: ImpDocContract
 	declaration?: ImpDocDeclarationBlock
 	functionID?: ImpDocValue
 	plainText: string

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import type { ImpDocDeclarationNode } from '../lib/index.js'
-import { ImpDocNode, impDoc } from '../lib/index.js'
+import { impDoc, ImpDocNode } from '../lib/index.js'
 
 function fixtureUrl(name: string): URL {
 	return new URL(`./fixtures/${name}`, import.meta.url)
@@ -27,10 +27,14 @@ function parseAll(content: string): { docs: ImpDocNode[]; err: ErrorReporter } {
 
 	while (src.canRead()) {
 		src.skipWhitespace()
-		if (!src.canRead()) break
+		if (!src.canRead()) {
+			break
+		}
 		const prevCursor = src.cursor
 		const result = impDoc(src, ctx)
-		if (result === Failure) assert.fail('IMP-Doc component expected')
+		if (result === Failure) {
+			assert.fail('IMP-Doc component expected')
+		}
 		docs.push(result)
 		assert.ok(
 			src.cursor > prevCursor,
@@ -38,6 +42,21 @@ function parseAll(content: string): { docs: ImpDocNode[]; err: ErrorReporter } {
 		)
 	}
 	return { docs, err }
+}
+
+async function parseFixture(name: string): Promise<{
+	content: string
+	doc: ImpDocNode
+	err: ErrorReporter
+}> {
+	const content = await loadFixture(name)
+	const src = new Source(content)
+	const err = new ErrorReporter()
+	const result = impDoc(src, createParserContext(err))
+	if (result === Failure) {
+		assert.fail('IMP-Doc component expected')
+	}
+	return { content, doc: result, err }
 }
 
 function declarationsOf(docs: readonly ImpDocNode[]): ImpDocDeclarationNode[] {
@@ -67,6 +86,191 @@ function assertTokenRanges(
 }
 
 describe('IMP-Doc parser', () => {
+	it('parses all five contract annotations into a lossless typed AST', async () => {
+		const { content, doc, err } = await parseFixture(
+			'12-contract-showcase.mcfunction',
+		)
+		assert.equal(err.errors.length, 0)
+
+		assert.deepEqual(
+			doc.annotations.map(annotation => annotation.type),
+			[
+				'impDoc:input',
+				'impDoc:input',
+				'impDoc:input',
+				'impDoc:output',
+				'impDoc:user',
+				'impDoc:api',
+				'impDoc:deprecated',
+				'impDoc:annotation',
+			],
+		)
+		assert.deepEqual(
+			doc.contract.inputs.map(input => ({
+				type: input.type,
+				kind: input.kind,
+				entries: input.entries.map(entry => ({
+					channel: entry.channel,
+					kind: entry.kind,
+					target: entry.target?.raw,
+					fields: entry.fields.map(field => ({
+						key: field.key.raw,
+						optional: field.optional,
+						valueType: field.valueType?.raw,
+					})),
+				})),
+			})),
+			[
+				{
+					type: 'impDoc:input',
+					kind: 'args',
+					entries: [{
+						channel: 'args',
+						kind: 'args',
+						target: undefined,
+						fields: [
+							{ key: 'Difficulty', optional: false, valueType: 'int' },
+							{ key: 'Label', optional: true, valueType: 'string | text' },
+						],
+					}],
+				},
+				{
+					type: 'impDoc:input',
+					kind: 'as_player',
+					entries: [{
+						channel: 'executor',
+						kind: 'as_player',
+						target: 'player',
+						fields: [],
+					}],
+				},
+				{
+					type: 'impDoc:input',
+					kind: 'storage',
+					entries: [{
+						channel: 'storage',
+						kind: 'storage',
+						target: 'example:',
+						fields: [{
+							key: 'Payload',
+							optional: false,
+							valueType: undefined,
+						}],
+					}],
+				},
+			],
+		)
+		const nestedField = doc.contract.inputs[2]?.entries[0]?.fields[0]
+		assert.deepEqual(
+			nestedField?.children?.map(field => ({
+				key: field.key.raw,
+				valueType: field.valueType?.raw,
+			})),
+			[{ key: 'Count', valueType: 'int' }],
+		)
+
+		const [output] = doc.contract.outputs
+		assert.ok(output)
+		assert.deepEqual(
+			output.entries.map(entry => ({
+				direction: entry.direction,
+				channel: entry.channel,
+				target: entry.target?.raw,
+				path: entry.path?.raw,
+			})),
+			[{
+				direction: 'output',
+				channel: 'tag',
+				target: '@s',
+				path: 'Ready',
+			}],
+		)
+		assert.deepEqual(doc.contract.users[0]?.executor, {
+			kind: 'player',
+			explicit: false,
+		})
+		assert.equal(doc.contract.apis[0]?.audience, 'api')
+		assert.equal(
+			doc.contract.deprecated[0]?.message?.raw,
+			'use `example:contract/v2`',
+		)
+		assert.equal(doc.annotations.at(-1)?.type, 'impDoc:annotation')
+
+		for (const annotation of doc.annotations) {
+			assert.equal(
+				content.slice(annotation.value.range.start, annotation.value.range.end),
+				annotation.value.raw,
+			)
+		}
+		const argsField = doc.contract.inputs[0]?.entries[0]?.fields[0]
+		assert.ok(argsField)
+		assert.equal(
+			content.slice(argsField.raw.range.start, argsField.raw.range.end),
+			argsField.raw.raw,
+		)
+		assert.match(ImpDocNode.getDescription(doc), /@api/)
+	})
+
+	it('keeps empty and unknown contract forms parseable for preview semantics', () => {
+		const content = '#> example:empty\n'
+			+ '# @input\n'
+			+ '# @output\n'
+			+ '# @user as entity\n'
+			+ '# @deprecated\n'
+			+ '# @unknown custom syntax\n\n'
+		const src = new Source(content)
+		const err = new ErrorReporter()
+		const result = impDoc(src, createParserContext(err))
+		if (result === Failure) {
+			assert.fail('IMP-Doc component expected')
+		}
+
+		assert.deepEqual(result.contract.inputs[0]?.entries, [])
+		assert.deepEqual(result.contract.outputs[0]?.entries, [])
+		const executor = result.contract.users[0]?.executor
+		assert.deepEqual(
+			executor && {
+				kind: executor.kind,
+				explicit: executor.explicit,
+				raw: executor.raw?.raw,
+			},
+			{ kind: 'entity', explicit: true, raw: 'as entity' },
+		)
+		assert.equal(result.contract.deprecated[0]?.message, undefined)
+		assert.equal(result.annotations.at(-1)?.type, 'impDoc:annotation')
+		assert.deepEqual(err.errors, [])
+	})
+
+	it('parses the real mixed storage/executor input fixture', async () => {
+		const { doc, err } = await parseFixture('09-deprecated-fn.mcfunction')
+		assert.equal(err.errors.length, 0)
+		const input = doc.contract.inputs[0]
+		assert.ok(input)
+		assert.equal(input.kind, undefined)
+		assert.deepEqual(
+			input.entries.map(entry => [
+				entry.channel,
+				entry.kind,
+				entry.target?.raw,
+			]),
+			[
+				['executor', 'as_entity', 'entity'],
+				['storage', 'storage', 'lib:'],
+			],
+		)
+		assert.deepEqual(
+			input.entries[1]?.fields.map(field => [
+				field.key.raw,
+				field.optional,
+				field.valueType?.raw,
+			]),
+			[
+				['Argument.KnockbackResist', true, 'boolean'],
+				['Argument.VectorMagnitude', false, 'double'],
+			],
+		)
+	})
+
 	it('parses the private function doc and its declaration block fixture', async () => {
 		const content = await loadFixture('01-index-d-private.mcfunction')
 		const src = new Source(content)

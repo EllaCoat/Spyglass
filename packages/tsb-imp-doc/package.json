@@ -1,6 +1,6 @@
 {
   "name": "@spyglassmc/tsb-imp-doc",
-  "version": "0.0.2-tier-a-access-alpha.0",
+  "version": "0.0.3-contract-preview.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
