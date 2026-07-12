@@ -225,7 +225,7 @@ describe('incremental runner cache', () => {
 		assert.equal(result.filesProcessed, 3)
 	})
 
-	it('uses raw bytes for cache tokens and rolls back a token mismatch', async () => {
+	it('uses raw-byte cache tokens and permits only one writer for a shared token', async () => {
 		const first = Buffer.from([0x80])
 		const second = Buffer.from([0x81])
 		assert.equal(first.toString('utf8'), second.toString('utf8'))
@@ -239,8 +239,16 @@ describe('incremental runner cache', () => {
 			false,
 		)
 		assert.deepEqual(await readFile(cachePath), second)
+
+		const sharedToken = rawCacheToken(second)
+		const replacements = ['{"writer":1}', '{"writer":2}']
+		const results = await Promise.all(
+			replacements.map(content => writeCacheAtomically(cachePath, sharedToken, content)),
+		)
+		assert.deepEqual([...results].sort(), [false, true])
+		assert.ok(replacements.includes(await readFile(cachePath, 'utf8')))
 		assert.equal(
-			(await readdir(projectDir)).some(name => name.endsWith('.tmp')),
+			(await readdir(projectDir)).some(name => name.endsWith('.tmp') || name.endsWith('.lock')),
 			false,
 		)
 	})

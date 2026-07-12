@@ -448,6 +448,7 @@ describe('Project cache reset (#1975)', () => {
 		},
 	}
 	type ResetHooks = {
+		beforeCheck?: (uri: string) => Promise<void>
 		checkedUris: Set<string>
 		failBindUri?: string
 	}
@@ -494,6 +495,7 @@ describe('Project cache reset (#1975)', () => {
 				}),
 			)
 			ctx.meta.registerChecker('file', async (node, checkerCtx) => {
+				await hooks.beforeCheck?.(checkerCtx.doc.uri)
 				await Promise.all(
 					(node.children ?? []).map(child => core.checker.fallback(child, checkerCtx)),
 				)
@@ -565,6 +567,33 @@ describe('Project cache reset (#1975)', () => {
 			await project.ensureClientManagedChecked(fixtureFiles.caller)
 
 			assert.deepEqual(getLinterErrors(project), [])
+
+			const checkStarted = Promise.withResolvers<void>()
+			const releaseCheck = Promise.withResolvers<void>()
+			let shouldBlockCheck = true
+			hooks.beforeCheck = async (uri) => {
+				if (shouldBlockCheck && uri === fixtureFiles.caller) {
+					shouldBlockCheck = false
+					checkStarted.resolve()
+					await releaseCheck.promise
+				}
+			}
+			const reset = project.reset()
+			await checkStarted.promise
+			const queuedChange = project.onDidChange(
+				fixtureFiles.caller,
+				[{ text: `${content}\n# queued during rebuild` }],
+				3,
+			)
+			await new Promise<void>(resolve => setImmediate(resolve))
+			assert.equal(project.getClientManaged(fixtureFiles.caller)?.doc.version, 2)
+			releaseCheck.resolve()
+			await Promise.all([reset, queuedChange])
+			assert.equal(project.getClientManaged(fixtureFiles.caller)?.doc.version, 3)
+			assert.match(
+				project.getClientManaged(fixtureFiles.caller)?.doc.getText() ?? '',
+				/queued during rebuild/,
+			)
 		} finally {
 			await project.close()
 			await rm(cacheDir, { recursive: true, force: true })

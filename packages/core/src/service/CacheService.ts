@@ -4,11 +4,12 @@ import {
 	bigintJsonLosslessReviver,
 	bufferToString,
 	getSha1,
+	mapLimit,
 	Uri,
 } from '../common/index.js'
 import type { PosRangeLanguageError } from '../source/index.js'
 import type { UnlinkedSymbolTable } from '../symbol/index.js'
-import { SymbolTable } from '../symbol/index.js'
+import { SymbolTable, SymbolUtil } from '../symbol/index.js'
 import type { LinterConfig } from './Config.js'
 import { ArchiveUriSupporter } from './FileService.js'
 import type { RootUriString } from './fileUtil.js'
@@ -20,6 +21,7 @@ import type { Project } from './Project.js'
  * could invalidate the cache are introduced to the Spyglass codebase.
  */
 export const LatestCacheVersion = 9
+const ChecksumReadConcurrency = 32
 
 /**
  * Deep clone with keys sorted at every object level so that JSON.stringify is
@@ -116,7 +118,7 @@ interface ValidateResult {
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
-	return !!value && typeof value === 'object'
+	return !!value && typeof value === 'object' && !Array.isArray(value)
 		&& Object.values(value).every(item => typeof item === 'string')
 }
 
@@ -165,55 +167,7 @@ export class CacheService {
 	 */
 	constructor(private readonly cacheRoot: RootUriString, private readonly project: Project) {
 		this.project.on('documentUpdated', ({ doc }) => {
-			if (
-				!this.#hasValidatedFiles
-				// Do not save checksums for file schemes that we cannot map to disk (e.g. 'untitled:'
-				// for untitled files in VS Code)
-				|| !(doc.uri.startsWith(ArchiveUriSupporter.Protocol) || doc.uri.startsWith('file:'))
-			) {
-				return
-			}
-			this.#hashUpdateGeneration += 1
-			const checksums = this.checksums
-			const token = ++this.#nextHashUpdateToken
-			this.#fileContentUpdateTokens.set(doc.uri, token)
-			const text = doc.getText()
-			this.trackHashUpdate(async () => {
-				try {
-					// TODO: Don't update this for every single change.
-					const stateHash = await getSha1(text)
-					let fileContentHash: string | undefined
-					let fileHash: string | undefined
-					try {
-						const bytes = await this.project.fs.readFile(doc.uri)
-						const hashes = await Promise.all([
-							getSha1(bufferToString(bytes)),
-							getSha1(bytes),
-						])
-						fileContentHash = hashes[0]
-						fileHash = hashes[1]
-					} catch (e) {
-						if (!this.project.externals.error.isKind(e, 'EISDIR')) {
-							this.project.logger.error(`[CacheService#hash-file] ${doc.uri}`, e)
-						}
-					}
-					if (
-						this.checksums === checksums
-						&& this.#fileContentUpdateTokens.get(doc.uri) === token
-					) {
-						checksums.fileContents[doc.uri] = stateHash
-						if (fileContentHash === stateHash && fileHash !== undefined) {
-							checksums.files[doc.uri] = fileHash
-						} else {
-							delete checksums.files[doc.uri]
-						}
-					}
-				} catch (e) {
-					if (!this.project.externals.error.isKind(e, 'EISDIR')) {
-						this.project.logger.error(`[CacheService#hash-file] ${doc.uri}`)
-					}
-				}
-			})
+			this.trackDocumentUpdate(doc)
 		})
 		this.project.on('rootsUpdated', ({ roots }) => {
 			if (!this.#hasValidatedFiles) {
@@ -258,6 +212,59 @@ export class CacheService {
 		}
 	}
 
+	/** Track a processed document without requiring its AST to remain live until publication. */
+	trackDocumentUpdate(doc: TextDocument): void {
+		if (
+			!this.#hasValidatedFiles
+			// Do not save checksums for file schemes that we cannot map to disk (e.g. 'untitled:'
+			// for untitled files in VS Code)
+			|| !(doc.uri.startsWith(ArchiveUriSupporter.Protocol) || doc.uri.startsWith('file:'))
+		) {
+			return
+		}
+		this.#hashUpdateGeneration += 1
+		const checksums = this.checksums
+		const token = ++this.#nextHashUpdateToken
+		this.#fileContentUpdateTokens.set(doc.uri, token)
+		const text = doc.getText()
+		this.trackHashUpdate(async () => {
+			try {
+				// TODO: Don't update this for every single change.
+				const stateHash = await getSha1(text)
+				let fileContentHash: string | undefined
+				let fileHash: string | undefined
+				try {
+					const bytes = await this.project.fs.readFile(doc.uri)
+					const hashes = await Promise.all([
+						getSha1(bufferToString(bytes)),
+						getSha1(bytes),
+					])
+					fileContentHash = hashes[0]
+					fileHash = hashes[1]
+				} catch (e) {
+					if (!this.project.externals.error.isKind(e, 'EISDIR')) {
+						this.project.logger.error(`[CacheService#hash-file] ${doc.uri}`, e)
+					}
+				}
+				if (
+					this.checksums === checksums
+					&& this.#fileContentUpdateTokens.get(doc.uri) === token
+				) {
+					checksums.fileContents[doc.uri] = stateHash
+					if (fileContentHash === stateHash && fileHash !== undefined) {
+						checksums.files[doc.uri] = fileHash
+					} else {
+						delete checksums.files[doc.uri]
+					}
+				}
+			} catch (e) {
+				if (!this.project.externals.error.isKind(e, 'EISDIR')) {
+					this.project.logger.error(`[CacheService#hash-file] ${doc.uri}`)
+				}
+			}
+		})
+	}
+
 	/** Prevent cache publication while an async symbol/error mutation is in progress. */
 	beginStateMutation(): () => void {
 		this.#hashUpdateGeneration += 1
@@ -291,8 +298,10 @@ export class CacheService {
 		checksums: Checksums,
 		generation: number,
 	): Promise<Checksums | undefined> {
-		const updates = await Promise.all(
-			this.project.getTrackedFiles().map(async (uri) => {
+		const updates = await mapLimit(
+			this.project.getTrackedFiles(),
+			ChecksumReadConcurrency,
+			async (uri) => {
 				try {
 					const bytes = await this.project.fs.readFile(uri)
 					const clientDocument = this.project.getClientManaged(uri)?.doc
@@ -306,7 +315,7 @@ export class CacheService {
 					this.project.logger.error(`[CacheService#hash-file] ${uri}`, e)
 					throw e
 				}
-			}),
+			},
 		)
 		if (
 			this.checksums !== checksums
@@ -502,20 +511,28 @@ export class CacheService {
 	}
 
 	/**
-	 * Invalidate cached file-derived state without discarding the linked symbol table.
+	 * Invalidate cached file-derived state.
 	 * Callers may target a subset of files; omitting `uris` invalidates every cached file.
-	 * Initializer invalidation additionally forces roots and symbol registrars to be rebuilt.
+	 * Initializer invalidation always discards all linked symbols and file-derived state because a
+	 * removed initializer provider cannot identify its former contributions in a new registry.
 	 */
 	invalidatePartial(
 		hashKind: CacheHashKind,
 		uris?: Iterable<string>,
 	): void {
 		this.#hashUpdateGeneration += 1
-		const targets = uris ?? new Set([
-			...Object.keys(this.checksums.fileContents),
-			...Object.keys(this.checksums.files),
-			...Object.keys(this.errors),
-		])
+		const targets = hashKind === 'initializer'
+			? new Set([
+				...this.project.getTrackedFiles(),
+				...Object.keys(this.checksums.fileContents),
+				...Object.keys(this.checksums.files),
+				...Object.keys(this.errors),
+			])
+			: uris ?? new Set([
+				...Object.keys(this.checksums.fileContents),
+				...Object.keys(this.checksums.files),
+				...Object.keys(this.errors),
+			])
 		for (const uri of targets) {
 			this.#invalidatedFiles.add(uri)
 			this.#fileContentUpdateTokens.delete(uri)
@@ -524,9 +541,12 @@ export class CacheService {
 			delete this.errors[uri]
 		}
 		if (hashKind === 'initializer') {
+			this.#pendingCache = undefined
 			this.#rootUpdateTokens.clear()
 			this.checksums.roots = {}
 			this.checksums.symbolRegistrars = {}
+			this.project.symbols = new SymbolUtil({})
+			this.project.symbols.buildCache()
 		}
 		this.#hasValidatedFiles = false
 	}

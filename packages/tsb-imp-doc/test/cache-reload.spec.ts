@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { initialize as initializeImpDoc } from '../lib/index.js'
+import { getImpDocSymbolData, initialize as initializeImpDoc } from '../lib/index.js'
 
 const FixtureRoot = core.fileUtil.ensureEndingSlash(
 	new URL('./runtime/private-project/', import.meta.url).toString(),
@@ -32,6 +32,14 @@ const RuntimeFileUris = [
 	).toString(),
 	new URL(
 		'./runtime/private-project/data/other/functions/denied.mcfunction',
+		import.meta.url,
+	).toString(),
+	new URL(
+		'./runtime/private-project/data/contract/functions/target.mcfunction',
+		import.meta.url,
+	).toString(),
+	new URL(
+		'./runtime/private-project/data/contract/functions/caller.mcfunction',
 		import.meta.url,
 	).toString(),
 ]
@@ -141,6 +149,7 @@ async function runFull(options: RunOptions): Promise<void> {
 
 async function runInit(options: RunOptions): Promise<{
 	restoredFileCount: number
+	restoredContractInputCount: number
 	close: () => Promise<void>
 }> {
 	const project = createProject(options)
@@ -148,7 +157,10 @@ async function runInit(options: RunOptions): Promise<{
 	const restoredFileCount = Object.keys(
 		project.cacheService.checksums.files,
 	).length
-	return { restoredFileCount, close: () => project.close() }
+	const restoredContractInputCount = getImpDocSymbolData(
+		project.symbols.lookup('function', ['contract:target']).symbol?.data,
+	)?.contract?.inputs.length ?? 0
+	return { restoredFileCount, restoredContractInputCount, close: () => project.close() }
 }
 
 describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
@@ -164,7 +176,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 
 	it('reuses cache when initializer context matches', async () => {
 		await runFull({ cacheDir, pluginVersion: 'v-fixture-1' })
-		const { restoredFileCount, close } = await runInit({
+		const { restoredContractInputCount, restoredFileCount, close } = await runInit({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 		})
@@ -172,6 +184,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			restoredFileCount > 0,
 			`Expected cache to restore checksums; got ${restoredFileCount}`,
 		)
+		assert.ok(restoredContractInputCount > 0, 'Expected cached IMP-Doc contract data')
 		await close()
 	})
 

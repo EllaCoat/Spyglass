@@ -399,6 +399,27 @@ export function sleep(delayMs: number): Promise<void> {
 	return new Promise(resolve => setTimeout(resolve, delayMs))
 }
 
+/** Map values in input order while bounding the number of active asynchronous workers. */
+export async function mapLimit<T, R>(
+	values: readonly T[],
+	limit: number,
+	fn: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	if (!Number.isSafeInteger(limit) || limit < 1) {
+		throw new RangeError(`limit must be a positive integer, got ${limit}`)
+	}
+	const results = new Array<R>(values.length)
+	let nextIndex = 0
+	const workers = Array.from({ length: Math.min(limit, values.length) }, async () => {
+		while (nextIndex < values.length) {
+			const index = nextIndex++
+			results[index] = await fn(values[index], index)
+		}
+	})
+	await Promise.all(workers)
+	return results
+}
+
 /**
  * Return a read-write TARGET type if the INPUT type is read-write, and a
  * readonly TARGET type if the INPUT type is readonly, and `never` if the INPUT

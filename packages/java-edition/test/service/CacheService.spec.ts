@@ -367,6 +367,23 @@ describe('CacheService binary file hashing (#1706)', () => {
 			const result = await project.cacheService.validate()
 			assert.deepEqual(result.changedFiles, [binaryUri])
 			assert.deepEqual(result.addedFiles, [])
+
+			project.symbols.query(binaryUri, 'fixture', 'stale-initializer-symbol').enter({
+				usage: { type: 'declaration' },
+			})
+			project.cacheService.checksums.roots[project.projectRoots[0]] = 'stale-root'
+			project.cacheService.checksums.symbolRegistrars.stale = 'stale-registrar'
+			assert.ok(project.symbols.lookup('fixture', ['stale-initializer-symbol']).symbol)
+
+			project.cacheService.invalidatePartial('initializer', [])
+			assert.equal(
+				project.symbols.lookup('fixture', ['stale-initializer-symbol']).symbol,
+				undefined,
+			)
+			assert.deepEqual(project.cacheService.checksums.roots, {})
+			assert.deepEqual(project.cacheService.checksums.symbolRegistrars, {})
+			const initializerResult = await project.cacheService.validate()
+			assert.deepEqual(initializerResult.changedFiles, [binaryUri])
 		} finally {
 			await project.close()
 		}
