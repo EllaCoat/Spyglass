@@ -175,6 +175,41 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 		await close()
 	})
 
+	it('fingerprints initializer and lint cache context independently', async () => {
+		const project = createProject({ cacheDir, pluginVersion: 'v-fixture-1' })
+		try {
+			await project.init()
+			const base = await project.cacheService.prepareContext({
+				initializerContext: project.ctx,
+				lint: project.config.lint,
+			})
+			assert.equal(base.changed, false)
+			assert.deepEqual(base.changedHashKinds, [])
+
+			const lint = structuredClone(project.config.lint) as
+				& core.LinterConfig
+				& Record<string, unknown>
+			lint.impDocPrivate = 'warning'
+			const lintChanged = await project.cacheService.prepareContext({
+				initializerContext: project.ctx,
+				lint,
+			})
+			assert.deepEqual(lintChanged.changedHashKinds, ['lint'])
+			assert.equal(lintChanged.initializerHash, base.initializerHash)
+			assert.notEqual(lintChanged.lintHash, base.lintHash)
+
+			const initializerChanged = await project.cacheService.prepareContext({
+				initializerContext: { ...project.ctx, binaryHashFixture: 'v2' },
+				lint: project.config.lint,
+			})
+			assert.deepEqual(initializerChanged.changedHashKinds, ['initializer'])
+			assert.notEqual(initializerChanged.initializerHash, base.initializerHash)
+			assert.equal(initializerChanged.lintHash, base.lintHash)
+		} finally {
+			await project.close()
+		}
+	})
+
 	it('drops cache when initializer version changes', async () => {
 		await runFull({ cacheDir, pluginVersion: 'v-fixture-1' })
 		const { restoredFileCount, close } = await runInit({

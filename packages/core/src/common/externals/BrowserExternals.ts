@@ -43,6 +43,17 @@ class BrowserFileSystem implements ExternalFileSystem {
 		}
 		return new Uint8Array(arrayBufferFromBase64(entry.content))
 	}
+	async rename(oldLocation: FsLocation, newLocation: FsLocation): Promise<void> {
+		oldLocation = oldLocation.toString()
+		newLocation = newLocation.toString()
+		const entry = this.states[oldLocation]
+		if (!entry) {
+			throw new Error(`ENOENT: ${oldLocation}`)
+		}
+		this.states[newLocation] = entry
+		delete this.states[oldLocation]
+		this.saveStates()
+	}
 	async rm(_location: FsLocation, _options?: { recursive?: boolean }): Promise<void> {
 		throw new Error('Not implemented')
 	}

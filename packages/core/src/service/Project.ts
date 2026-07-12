@@ -342,7 +342,11 @@ export class Project extends EventDispatcher<{
 		)
 
 		this.#cacheSaverIntervalId = setInterval(
-			() => this.cacheService.save(),
+			() => {
+				void this.cacheService.save().catch(e =>
+					this.logger.error('[Project#cache-autosave]', e)
+				)
+			},
 			CacheAutoSaveInterval,
 		)
 
@@ -1102,11 +1106,12 @@ export class Project extends EventDispatcher<{
 		node: FileNode<AstNode>,
 		propagateErrors = false,
 	): Promise<void> {
+		if (node.binderErrors) {
+			return
+		}
 		this.#bindingInProgressUris.add(doc.uri)
+		const endCacheMutation = this.cacheService.beginStateMutation()
 		try {
-			if (node.binderErrors) {
-				return
-			}
 			const binder = this.meta.getBinder(node.type)
 			const ctx = BinderContext.create(this, { doc })
 			ctx.symbols.clear({ contributor: 'binder', uri: doc.uri })
@@ -1123,6 +1128,7 @@ export class Project extends EventDispatcher<{
 			}
 		} finally {
 			this.#bindingInProgressUris.delete(doc.uri)
+			endCacheMutation()
 		}
 	}
 
@@ -1135,6 +1141,7 @@ export class Project extends EventDispatcher<{
 		if (node.checkerErrors) {
 			return
 		}
+		const endCacheMutation = this.cacheService.beginStateMutation()
 		const __checkProfiler = this.profilers.get('project#check', 'top-n', 50)
 		const __lintProfiler = this.profilers.get('project#lint', 'top-n', 50)
 		try {
@@ -1154,6 +1161,7 @@ export class Project extends EventDispatcher<{
 				throw e
 			}
 		} finally {
+			endCacheMutation()
 			__checkProfiler.finalize()
 			__lintProfiler.finalize()
 		}
@@ -1253,15 +1261,20 @@ export class Project extends EventDispatcher<{
 
 	private bindUri(param: string | string[]): void {
 		const ctx = UriBinderContext.create(this)
-		if (typeof param === 'string') {
-			ctx.symbols.clear({ contributor: 'uri_binder', uri: param })
-		}
-		ctx.symbols.contributeAs('uri_binder', () => {
-			const uris = Array.isArray(param) ? param : [param]
-			for (const binder of this.meta.uriBinders) {
-				binder(uris, ctx)
+		const uris = Array.isArray(param) ? param : [param]
+		const endCacheMutation = this.cacheService.beginStateMutation()
+		try {
+			for (const uri of uris) {
+				ctx.symbols.clear({ contributor: 'uri_binder', uri })
 			}
-		})
+			ctx.symbols.contributeAs('uri_binder', () => {
+				for (const binder of this.meta.uriBinders) {
+					binder(uris, ctx)
+				}
+			})
+		} finally {
+			endCacheMutation()
+		}
 	}
 
 	/**

@@ -2,6 +2,7 @@ import type { ProjectInitializer } from '@spyglassmc/core'
 import { declaration as bindDeclaration } from './binder/declaration.js'
 import { impDoc as bindImpDoc } from './binder/impDoc.js'
 import { mcfunction as bindMcfunction } from './binder/mcfunction.js'
+import { getImpDocCacheContext } from './cachePolicy.js'
 import { impDoc as checkImpDoc } from './checker/impDoc.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
 import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
@@ -9,9 +10,9 @@ import { configValidator, privateVisibility } from './linter/private.js'
 import type { ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
 import { extendMcfunctionParser, impDoc } from './parser/impDoc.js'
 import { registerContractSignatureHelpProvider } from './signatureHelp/contract.js'
-import { ImpDocVersion } from './version.js'
 
 export { bindContract, cloneContract, stampContract } from './binder/contract.js'
+export * from './cachePolicy.js'
 export { getContractCheckSeverity, type ImpDocContractCheckSeverity } from './linter/contract.js'
 export * from './node/ImpDocNode.js'
 export * from './parser/impDoc.js'
@@ -58,7 +59,5 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		parser: extendMcfunctionParser(mcfunction.parser),
 	})
 
-	return {
-		'plugin:@spyglassmc/tsb-imp-doc': ImpDocVersion,
-	}
+	return getImpDocCacheContext()
 }

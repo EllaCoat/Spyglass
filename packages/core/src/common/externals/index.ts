@@ -46,6 +46,8 @@ export interface ExternalFileSystem {
 		location: FsLocation,
 	): Promise<ExternalDirEntry[]>
 	readFile(location: FsLocation): Promise<Uint8Array<ArrayBuffer>>
+	/** Atomically replace `newLocation` with `oldLocation` when supported by the platform. */
+	rename(oldLocation: FsLocation, newLocation: FsLocation): Promise<void>
 	rm(location: FsLocation, options?: { recursive?: boolean }): Promise<void>
 	/**
 	 * Show the file/directory in the platform-specific explorer program.
