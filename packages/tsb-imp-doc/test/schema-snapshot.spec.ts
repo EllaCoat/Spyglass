@@ -1,25 +1,41 @@
-import type { Symbol as SpyglassSymbol } from '@spyglassmc/core'
+import * as core from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import {
 	getImpDocSymbolData,
+	impDoc,
+	type ImpDocContract,
 	type ImpDocDeclarationSource,
+	type ImpDocNode,
 	ImpDocVersion,
 	type ImpDocVisibility,
+	stampContract,
 	stampVisibility,
 } from '../lib/index.js'
 
-function emptySymbol(): SpyglassSymbol {
-	return { data: {} } as SpyglassSymbol
+const EmptyContract: ImpDocContract = {
+	inputs: [],
+	outputs: [],
+	apis: [],
+	users: [],
+	deprecated: [],
+}
+
+function emptySymbol(): core.Symbol {
+	return { data: {} } as core.Symbol
 }
 
 function stamp(
 	visibility: ImpDocVisibility,
 	declaration?: ImpDocDeclarationSource,
+	contract?: ImpDocContract,
 ): unknown {
 	const symbol = emptySymbol()
 	stampVisibility(symbol, visibility, declaration)
+	if (contract) {
+		stampContract(symbol, contract)
+	}
 	return getImpDocSymbolData(symbol.data)
 }
 
@@ -36,10 +52,24 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 			range: { start: 10, end: 20 },
 			owner: 'example:owner',
 		}
+		const showcaseSource = await readFile(
+			new URL('./fixtures/12-contract-showcase.mcfunction', import.meta.url),
+			'utf8',
+		)
+		const showcase = impDoc(
+			new core.Source(showcaseSource),
+			{ err: new core.ErrorReporter() } as Parameters<typeof impDoc>[1],
+		)
+		assert.notEqual(showcase, core.Failure)
+		const showcaseContract = (showcase as ImpDocNode).contract
 		const actual = {
 			impDocVersion: ImpDocVersion,
-			public: stamp({ type: 'public' }),
-			private: stamp({ type: 'private', owner: 'example:owner' }),
+			public: stamp({ type: 'public' }, undefined, EmptyContract),
+			private: stamp(
+				{ type: 'private', owner: 'example:owner' },
+				undefined,
+				EmptyContract,
+			),
 			withinDeclaration: stamp({
 				type: 'within',
 				owner: 'example:owner',
@@ -49,6 +79,14 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 					regex: '^example:allowed/.*$',
 				}],
 			}, declaration),
+			representativeContract: stamp(
+				{ type: 'public' },
+				undefined,
+				{
+					...showcaseContract,
+					inputs: [showcaseContract.inputs[2]!],
+				},
+			),
 		}
 
 		assert.deepEqual(actual, expected)

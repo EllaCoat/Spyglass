@@ -1,32 +1,15 @@
-import * as core from '@spyglassmc/core'
+import type * as core from '@spyglassmc/core'
+import { getCurrentFunctionSymbol } from '../binder/contract.js'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
-
-/**
- * URI binder が登録した function symbol の parentMap から直接引く。
- * `SymbolUtil.forEachSymbol` で global symbol table 全走査するのは O(N_all_symbols)
- * per impDoc node で、 Asset 規模 (16094 file × 10000+ symbol) では check time の
- * 半分を占める hotspot になる。 function category だけ走査する形に絞る。
- */
-function getCurrentFunctionSymbol(
-	ctx: core.CheckerContext,
-): core.Symbol | undefined {
-	const functions = ctx.symbols.lookup('function', []).parentMap
-	for (const symbol of Object.values(functions ?? {})) {
-		if (
-			symbol
-			&& symbol.definition?.some(location => location.uri === ctx.doc.uri)
-		) {
-			return symbol
-		}
-	}
-	return undefined
-}
+import { checkContract } from './contract.js'
 
 /**
  * Visibility stamp は binder phase (`binder/impDoc.ts`) に移行済み。
  * checker には functionID mismatch diagnostic と child checker dispatch のみ残す。
  */
 export const impDoc: core.Checker<ImpDocNode> = async (node, ctx) => {
+	checkContract(node, ctx)
+
 	const parsedID = node.functionID?.raw
 	const currentFunction = getCurrentFunctionSymbol(ctx)
 

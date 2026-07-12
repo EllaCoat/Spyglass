@@ -139,7 +139,8 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				)
 			}
 
-			const referencePattern = /\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
+			const referencePattern =
+				/\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
 			for (const match of line.matchAll(referencePattern)) {
 				const raw = match[1]
 				const targetStart = offset + match.index + match[0].lastIndexOf(raw)
@@ -149,9 +150,10 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				))
 			}
 		}
-		offset += line.length + (src.string.slice(offset + line.length, offset + line.length + 2) === '\r\n'
-			? 2
-			: 1)
+		offset += line.length
+			+ (src.string.slice(offset + line.length, offset + line.length + 2) === '\r\n'
+				? 2
+				: 1)
 	}
 
 	src.cursor = src.string.length
@@ -175,8 +177,10 @@ function createConfig(overrides: Record<string, unknown> | undefined): core.Conf
 	for (const rule of Object.keys(core.VanillaConfig.lint)) {
 		delete lint[rule]
 	}
-	if (!(overrides?.lint && typeof overrides.lint === 'object'
-		&& ImpDocPrivateRule in overrides.lint)) {
+	if (
+		!(overrides?.lint && typeof overrides.lint === 'object'
+			&& ImpDocPrivateRule in overrides.lint)
+	) {
 		lint[ImpDocPrivateRule] = 'error'
 	}
 	return config
@@ -273,7 +277,10 @@ function isResultCache(value: unknown): value is ResultCache {
 		&& Array.isArray(cache.diagnostics)
 }
 
-async function readResultCache(path: string, expectedFingerprint: string): Promise<RunResult | undefined> {
+async function readResultCache(
+	path: string,
+	expectedFingerprint: string,
+): Promise<RunResult | undefined> {
 	try {
 		const value: unknown = JSON.parse(await readFile(path, 'utf8'))
 		if (isResultCache(value) && value.fingerprint === expectedFingerprint) {
@@ -297,12 +304,17 @@ async function writeResultCache(
 	try {
 		await mkdir(dirname(path), { recursive: true })
 		const tempPath = `${path}.${process.pid}.tmp`
-		await writeFile(tempPath, JSON.stringify({
-			version: CacheVersion,
-			fingerprint: fingerprintValue,
-			diagnostics: result.diagnostics,
-			filesScanned: result.filesScanned,
-		} satisfies ResultCache))
+		await writeFile(
+			tempPath,
+			JSON.stringify(
+				{
+					version: CacheVersion,
+					fingerprint: fingerprintValue,
+					diagnostics: result.diagnostics,
+					filesScanned: result.filesScanned,
+				} satisfies ResultCache,
+			),
+		)
 		await rename(tempPath, path)
 	} catch {
 		// A cache write failure must never change the lint result.
@@ -329,7 +341,9 @@ export async function runImpDocLint(
 
 	const targetDir = resolve(options.targetDir)
 	const rootUri = core.fileUtil.ensureEndingSlash(pathToFileURL(targetDir).toString())
-	const cacheRoot = core.fileUtil.ensureEndingSlash(pathToFileURL(dirname(cachePath ?? targetDir)).toString())
+	const cacheRoot = core.fileUtil.ensureEndingSlash(
+		pathToFileURL(dirname(cachePath ?? targetDir)).toString(),
+	)
 	const logger = createLogger()
 	const meta = new core.MetaRegistry()
 	const symbols = new core.SymbolUtil({})
@@ -459,11 +473,13 @@ export async function runImpDocLint(
 
 	for (const state of states) {
 		if (!options.skipUnresolved) {
-			for (const error of [
-				...state.node.parserErrors,
-				...state.node.binderErrors ?? [],
-				...state.node.checkerErrors ?? [],
-			]) {
+			for (
+				const error of [
+					...state.node.parserErrors,
+					...state.node.binderErrors ?? [],
+					...state.node.checkerErrors ?? [],
+				]
+			) {
 				diagnostics.push(toDiagnostic(state, error, UnresolvedRule))
 			}
 		}

@@ -1,5 +1,5 @@
 {
-  "impDocVersion": "0.0.3-contract-preview.0",
+  "impDocVersion": "0.0.4-contract-semantics.0",
   "public": {
     "visibility": {
       "type": "public"
@@ -33,5 +33,201 @@
       "owner": "example:owner"
     },
     "privateOwner": "example:owner"
+  },
+  "representativeContract": {
+    "visibility": {
+      "type": "public"
+    },
+    "contract": {
+      "inputs": [
+        {
+          "range": {
+            "start": 141,
+            "end": 194
+          },
+          "value": {
+            "raw": "@input",
+            "range": {
+              "start": 141,
+              "end": 147
+            }
+          },
+          "type": "impDoc:input",
+          "kind": "storage",
+          "entries": [
+            {
+              "direction": "input",
+              "channel": "storage",
+              "kind": "storage",
+              "raw": {
+                "raw": "storage example:\n#   Payload:\n#     Count: int",
+                "range": {
+                  "start": 148,
+                  "end": 194
+                }
+              },
+              "target": {
+                "raw": "example:",
+                "range": {
+                  "start": 156,
+                  "end": 164
+                }
+              },
+              "fields": [
+                {
+                  "raw": {
+                    "raw": "Payload:\n#     Count: int",
+                    "range": {
+                      "start": 169,
+                      "end": 194
+                    }
+                  },
+                  "key": {
+                    "raw": "Payload",
+                    "range": {
+                      "start": 169,
+                      "end": 176
+                    }
+                  },
+                  "optional": false,
+                  "children": [
+                    {
+                      "raw": {
+                        "raw": "Count: int",
+                        "range": {
+                          "start": 184,
+                          "end": 194
+                        }
+                      },
+                      "key": {
+                        "raw": "Count",
+                        "range": {
+                          "start": 184,
+                          "end": 189
+                        }
+                      },
+                      "optional": false,
+                      "valueType": {
+                        "raw": "int",
+                        "range": {
+                          "start": 191,
+                          "end": 194
+                        }
+                      }
+                    }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "outputs": [
+        {
+          "range": {
+            "start": 197,
+            "end": 217
+          },
+          "value": {
+            "raw": "@output",
+            "range": {
+              "start": 197,
+              "end": 204
+            }
+          },
+          "type": "impDoc:output",
+          "kind": "tag",
+          "entries": [
+            {
+              "direction": "output",
+              "channel": "tag",
+              "kind": "tag",
+              "raw": {
+                "raw": "tag @s Ready",
+                "range": {
+                  "start": 205,
+                  "end": 217
+                }
+              },
+              "target": {
+                "raw": "@s",
+                "range": {
+                  "start": 209,
+                  "end": 211
+                }
+              },
+              "path": {
+                "raw": "Ready",
+                "range": {
+                  "start": 212,
+                  "end": 217
+                }
+              },
+              "fields": []
+            }
+          ]
+        }
+      ],
+      "apis": [
+        {
+          "range": {
+            "start": 228,
+            "end": 232
+          },
+          "value": {
+            "raw": "@api",
+            "range": {
+              "start": 228,
+              "end": 232
+            }
+          },
+          "type": "impDoc:api",
+          "audience": "api"
+        }
+      ],
+      "users": [
+        {
+          "range": {
+            "start": 220,
+            "end": 225
+          },
+          "value": {
+            "raw": "@user",
+            "range": {
+              "start": 220,
+              "end": 225
+            }
+          },
+          "type": "impDoc:user",
+          "executor": {
+            "kind": "player",
+            "explicit": false
+          }
+        }
+      ],
+      "deprecated": [
+        {
+          "range": {
+            "start": 235,
+            "end": 272
+          },
+          "value": {
+            "raw": "@deprecated",
+            "range": {
+              "start": 235,
+              "end": 246
+            }
+          },
+          "type": "impDoc:deprecated",
+          "message": {
+            "raw": "use `example:contract/v2`",
+            "range": {
+              "start": 247,
+              "end": 272
+            }
+          }
+        }
+      ]
+    }
   }
 }

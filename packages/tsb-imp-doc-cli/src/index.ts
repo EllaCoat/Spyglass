@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-import { availableParallelism } from 'node:os'
 import { readFile } from 'node:fs/promises'
+import { availableParallelism } from 'node:os'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'

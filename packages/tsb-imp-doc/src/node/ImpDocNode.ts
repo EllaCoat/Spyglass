@@ -206,6 +206,8 @@ export namespace ImpDocNode {
 export interface ImpDocSymbolData {
 	visibility?: ImpDocVisibility
 	declaration?: ImpDocDeclarationSource
+	/** Serializable function contract copied from the bound IMP-Doc header. */
+	contract?: ImpDocContract
 	/**
 	 * P1a characterization / downstream compatibility 用の shortcut。
 	 * SoT は `visibility`、 Step 3 以降で撤去候補。

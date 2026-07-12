@@ -42,7 +42,9 @@ export function summarize(
 }
 
 function formatSummary(summary: ReportSummary): string {
-	return `${summary.filesScanned} files scanned, ${summary.violations} violations, ${summary.warnings} warnings, ${(summary.executionTimeMs / 1_000).toFixed(2)} seconds`
+	return `${summary.filesScanned} files scanned, ${summary.violations} violations, ${summary.warnings} warnings, ${
+		(summary.executionTimeMs / 1_000).toFixed(2)
+	} seconds`
 }
 
 function oneLine(value: string): string {
@@ -51,7 +53,9 @@ function oneLine(value: string): string {
 
 function formatText(diagnostics: readonly LintDiagnostic[], summary: ReportSummary): string {
 	const lines = diagnostics.map(diagnostic =>
-		`${diagnostic.file}:${diagnostic.line}:${diagnostic.col} [${diagnostic.severity}] ${diagnostic.rule}: ${oneLine(diagnostic.message)}`
+		`${diagnostic.file}:${diagnostic.line}:${diagnostic.col} [${diagnostic.severity}] ${diagnostic.rule}: ${
+			oneLine(diagnostic.message)
+		}`
 	)
 	lines.push(formatSummary(summary))
 	return lines.join('\n')
