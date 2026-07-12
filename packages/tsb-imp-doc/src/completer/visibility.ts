@@ -236,8 +236,10 @@ export function registerVisibilityCompleters(meta: core.MetaRegistry): void {
 		(node, ctx) => {
 			const baseItems = baseScoreHolder(node, ctx)
 			// cursor が selector 引数内 (= `@a[scores={...` 等) の時は IMP-Doc score
-			// holder 名を追加しない。 base completer の分岐 (java-edition の
-			// `argument.ts:scoreHolder`) と揃え、 selector 先頭記号内でのみ追加する。
+			// holder 名を追加しない。 base je completer (`argument.ts:scoreHolder`) は
+			// ScoreHolderNode 直下の `node.children[0]` を判定するが、 ここでは「引数内で
+			// 候補外」 が目的なので selector の先頭 literal 範囲 (= `@a` の頭記号) で
+			// 判定する。
 			if (node.selector) {
 				const selectorHead = node.selector.children?.[0]
 				if (
