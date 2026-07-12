@@ -122,7 +122,11 @@ connection.onInitialize(async (params) => {
 		})
 		service.project.on('documentErrored', async ({ errors, uri, version }) => {
 			if (uri.startsWith('archive://')) {
-				return
+				const clientUri = service.project.getClientManagedUri(uri)
+				if (!clientUri) {
+					return
+				}
+				uri = clientUri
 			}
 
 			try {
@@ -346,7 +350,7 @@ connection.onDidChangeTextDocument(({ contentChanges, textDocument: { uri, versi
 	return service.project.onDidChange(uri, contentChanges, version)
 })
 connection.onDidCloseTextDocument(({ textDocument: { uri } }) => {
-	service.project.onDidClose(uri)
+	return service.project.onDidClose(uri)
 })
 
 connection.onCodeAction(async ({ textDocument: { uri }, range }) => {
