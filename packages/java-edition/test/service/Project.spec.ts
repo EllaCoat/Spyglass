@@ -2,11 +2,12 @@ import * as core from '@spyglassmc/core'
 import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import * as json from '@spyglassmc/json'
 import assert from 'node:assert/strict'
-import { copyFile, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { pathToFileURL } from 'node:url'
+import * as je from '../../lib/index.js'
 import { getPackFormatContext, getProjectPacks } from '../../lib/packFormat.js'
 
 const FixtureRoot = new URL(
@@ -409,6 +410,261 @@ describe('Project pack format reinitialization (#1212)', () => {
 			assert.deepEqual(seenDeepFormats, [6, 42])
 		} finally {
 			await project.close()
+		}
+	})
+})
+
+describe('Project cache reset (#1975)', () => {
+	const fixtureRoot = core.fileUtil.ensureEndingSlash(
+		new URL('./fixture/reset-project-cache/', import.meta.url).toString(),
+	)
+	const fixtureFiles = {
+		pack: new URL('./fixture/reset-project-cache/pack.mcmeta', import.meta.url).toString(),
+		caller: new URL(
+			'./fixture/reset-project-cache/data/example/functions/a.mcfunction',
+			import.meta.url,
+		).toString(),
+		callee: new URL(
+			'./fixture/reset-project-cache/data/example/functions/b.mcfunction',
+			import.meta.url,
+		).toString(),
+	} as const
+	const commands: je.dependency.McmetaCommands = {
+		type: 'root',
+		children: {
+			function: {
+				type: 'literal',
+				children: {
+					name: {
+						type: 'argument',
+						parser: 'minecraft:function',
+						executable: true,
+					},
+				},
+			},
+		},
+	}
+	type ResetHooks = {
+		checkedUris: Set<string>
+		failBindUri?: string
+	}
+
+	class ResetFixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
+		implements core.FileWatcher
+	{
+		readonly watchedFiles = new core.UriStore()
+
+		constructor(uris: readonly string[]) {
+			super()
+			for (const uri of uris) {
+				this.watchedFiles.add(uri)
+			}
+		}
+
+		async ready(): Promise<void> {}
+		async close(): Promise<void> {}
+	}
+
+	function getLinterErrors(project: core.Project): readonly core.LanguageError[] {
+		const caller = project.getClientManaged(fixtureFiles.caller)
+		assert.ok(caller)
+		return caller.node.linterErrors ?? []
+	}
+
+	async function createResetProject(hooks: ResetHooks): Promise<{
+		cacheDir: string
+		project: core.Project
+	}> {
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-reset-cache-'))
+		const initializer: core.ProjectInitializer = (ctx) => {
+			ctx.meta.registerUriBinder(je.binder.uriBinder)
+			je.mcf.initialize(ctx, commands, '1.20.4')
+			ctx.meta.registerBinder(
+				'file',
+				core.AsyncBinder.create(async (node, binderCtx) => {
+					if (hooks.failBindUri === binderCtx.doc.uri) {
+						throw new Error(`Injected bind failure for ${binderCtx.doc.uri}`)
+					}
+					await Promise.all(
+						(node.children ?? []).map(child => core.binder.fallback(child, binderCtx)),
+					)
+				}),
+			)
+			ctx.meta.registerChecker('file', async (node, checkerCtx) => {
+				await Promise.all(
+					(node.children ?? []).map(child => core.checker.fallback(child, checkerCtx)),
+				)
+				hooks.checkedUris.add(checkerCtx.doc.uri)
+			})
+			return { loadedVersion: '1.20.4', errorSource: '1.20.4' }
+		}
+		const project = new core.Project({
+			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
+				env: { dependencies: [], exclude: [], gameVersion: '1.20.4' },
+			}),
+			externals: NodeJsExternals,
+			initializers: [initializer],
+			logger: core.Logger.noop(),
+			projectRoots: [fixtureRoot],
+		})
+		return { cacheDir, project }
+	}
+
+	it('publishes all open-document diagnostics after every check and before ready', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new ResetFixtureWatcher(Object.values(fixtureFiles)),
+			})
+			const openUris = [fixtureFiles.caller, fixtureFiles.callee]
+			for (const uri of openUris) {
+				await project.onDidOpen(uri, 'mcfunction', 1, await readFile(new URL(uri), 'utf8'))
+			}
+			assert.deepEqual(getLinterErrors(project), [])
+
+			hooks.checkedUris.clear()
+			const updatedUris = new Set<string>()
+			const completedDiagnostics = new Set<string>()
+			const eventOrder: string[] = []
+			project.on('documentUpdated', ({ doc }) => {
+				if (openUris.includes(doc.uri)) {
+					assert.deepEqual(hooks.checkedUris, new Set(openUris))
+					updatedUris.add(doc.uri)
+					eventOrder.push(`updated:${doc.uri}`)
+				}
+			}).on('documentErrored', async ({ uri }) => {
+				if (openUris.includes(uri)) {
+					assert.deepEqual(hooks.checkedUris, new Set(openUris))
+					await new Promise<void>(resolve => setImmediate(resolve))
+					completedDiagnostics.add(uri)
+					eventOrder.push(`errored:${uri}`)
+				}
+			}).on('ready', () => {
+				assert.deepEqual(completedDiagnostics, new Set(openUris))
+				eventOrder.push('ready')
+			})
+
+			await project.resetCache()
+			assert.deepEqual(updatedUris, new Set(openUris))
+			assert.deepEqual(completedDiagnostics, new Set(openUris))
+			assert.equal(eventOrder.at(-1), 'ready')
+			assert.deepEqual(getLinterErrors(project), [])
+
+			const content = await readFile(new URL(fixtureFiles.caller), 'utf8')
+			await project.onDidChange(
+				fixtureFiles.caller,
+				[{ text: `${content}\n` }],
+				2,
+			)
+			await project.ensureClientManagedChecked(fixtureFiles.caller)
+
+			assert.deepEqual(getLinterErrors(project), [])
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('rolls back state without publishing staged diagnostics when binding fails', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new ResetFixtureWatcher(Object.values(fixtureFiles)),
+			})
+			await project.onDidOpen(
+				fixtureFiles.caller,
+				'mcfunction',
+				1,
+				'function example:missing',
+			)
+			await project.onDidOpen(
+				fixtureFiles.callee,
+				'mcfunction',
+				1,
+				await readFile(new URL(fixtureFiles.callee), 'utf8'),
+			)
+			let displayedDiagnostics: readonly core.PosRangeLanguageError[] = []
+			project.on('documentErrored', ({ errors, uri }) => {
+				if (uri === fixtureFiles.caller) {
+					displayedDiagnostics = errors
+				}
+			})
+			await project.ensureClientManagedChecked(fixtureFiles.caller)
+			assert.ok(getLinterErrors(project).length > 0)
+			const previousDisplayedDiagnostics = structuredClone(displayedDiagnostics)
+			assert.ok(previousDisplayedDiagnostics.length > 0)
+
+			const previous = {
+				caller: project.getClientManaged(fixtureFiles.caller),
+				callee: project.getClientManaged(fixtureFiles.callee),
+				checksums: structuredClone(project.cacheService.checksums),
+				errors: structuredClone(project.cacheService.errors),
+				symbols: project.symbols,
+			}
+			const publishedEvents: string[] = []
+			project.on('documentUpdated', ({ doc }) => publishedEvents.push(`updated:${doc.uri}`))
+				.on('documentErrored', ({ uri }) => publishedEvents.push(`errored:${uri}`))
+				.on('ready', () => publishedEvents.push('ready'))
+
+			hooks.failBindUri = fixtureFiles.callee
+			await assert.rejects(project.reset(), /Injected bind failure/)
+
+			assert.equal(project.bindingInProgressCount, 0)
+			assert.equal(project.getClientManaged(fixtureFiles.caller), previous.caller)
+			assert.equal(project.getClientManaged(fixtureFiles.callee), previous.callee)
+			assert.deepEqual(project.cacheService.checksums, previous.checksums)
+			assert.deepEqual(project.cacheService.errors, previous.errors)
+			assert.equal(project.symbols, previous.symbols)
+			assert.equal(project.isReady, true)
+			assert.deepEqual(publishedEvents, [])
+			assert.deepEqual(displayedDiagnostics, previousDisplayedDiagnostics)
+			assert.ok(getLinterErrors(project).length > 0)
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('keeps the old context hash after a failed config rebuild so the same update retries', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new ResetFixtureWatcher(Object.values(fixtureFiles)),
+			})
+			await project.onDidOpen(
+				fixtureFiles.caller,
+				'mcfunction',
+				1,
+				await readFile(new URL(fixtureFiles.caller), 'utf8'),
+			)
+			const previousSymbols = project.symbols
+			let readyCount = 0
+			project.on('ready', () => {
+				readyCount += 1
+			})
+
+			hooks.failBindUri = fixtureFiles.caller
+			await project.onEditorConfigurationUpdate({ lint: { undeclaredSymbol: 'error' } })
+			assert.equal(readyCount, 0)
+			assert.equal(project.symbols, previousSymbols)
+			assert.equal(project.isReady, true)
+			assert.equal(project.bindingInProgressCount, 0)
+
+			hooks.failBindUri = undefined
+			await project.onEditorConfigurationUpdate({ lint: { undeclaredSymbol: 'error' } })
+			assert.equal(readyCount, 1)
+			assert.notEqual(project.symbols, previousSymbols)
+			assert.equal(project.isReady, true)
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
 		}
 	})
 })

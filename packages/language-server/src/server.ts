@@ -525,7 +525,7 @@ connection.languages.inlayHint.on(async ({ textDocument: { uri }, range }) => {
 })
 
 connection.onRequest('spyglassmc/resetProjectCache', async (): Promise<void> => {
-	return service.project.resetCache()
+	return service.project.reset()
 })
 
 connection.onRequest('spyglassmc/showCacheRoot', async (): Promise<void> => {
