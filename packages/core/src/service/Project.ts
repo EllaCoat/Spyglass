@@ -39,29 +39,21 @@ import type { FileWatcher } from './FileWatcher.js'
 import { MetaRegistry } from './MetaRegistry.js'
 import type { Profiler } from './Profiler.js'
 import { ProfilerFactory } from './Profiler.js'
+import type {
+	ProjectChangePredicate,
+	ProjectInitializer,
+	ProjectInitializerContext,
+} from './ProjectInitializer.js'
+
+export type {
+	AsyncProjectInitializer,
+	ProjectChangePredicate,
+	ProjectInitializer,
+	ProjectInitializerContext,
+	SyncProjectInitializer,
+} from './ProjectInitializer.js'
 
 const CacheAutoSaveInterval = 600_000 // 10 Minutes.
-
-export type ProjectInitializerContext = Pick<
-	Project,
-	| 'cacheRoot'
-	| 'config'
-	| 'externals'
-	| 'isDebugging'
-	| 'logger'
-	| 'meta'
-	| 'profilers'
-	| 'projectRoots'
->
-export type SyncProjectInitializer = (
-	this: void,
-	ctx: ProjectInitializerContext,
-) => Record<string, string> | void
-export type AsyncProjectInitializer = (
-	this: void,
-	ctx: ProjectInitializerContext,
-) => PromiseLike<Record<string, string> | void>
-export type ProjectInitializer = SyncProjectInitializer | AsyncProjectInitializer
 
 export interface ProjectOptions {
 	cacheRoot: RootUriString
@@ -104,6 +96,14 @@ interface FileEvent {
 interface EmptyEvent {}
 interface RootsEvent {
 	roots: readonly RootUriString[]
+}
+interface ReinitializedEvent {
+	contextChanged: boolean
+}
+interface InitializerResult {
+	ctx: Record<string, string>
+	meta: MetaRegistry
+	reinitializationPredicates: Set<ProjectChangePredicate>
 }
 interface SymbolRegistrarEvent {
 	id: string
@@ -173,6 +173,7 @@ export class Project extends EventDispatcher<{
 	fileModified: FileEvent
 	fileDeleted: FileEvent
 	ready: EmptyEvent
+	reinitialized: ReinitializedEvent
 	rootsUpdated: RootsEvent
 	symbolRegistrarExecuted: SymbolRegistrarEvent
 	configChanged: ConfigChangeEvent
@@ -189,8 +190,13 @@ export class Project extends EventDispatcher<{
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
 	readonly #initializers: readonly ProjectInitializer[]
+	#reinitializationPredicates = new Set<ProjectChangePredicate>()
+	#reinitializationGeneration = 0
+	#processedReinitializationGeneration = 0
+	#reinitializationPromise: Promise<boolean> | undefined
 	#watcher: FileWatcher | undefined
 	#registeredWatcher: FileWatcher | undefined
+	#lifecyclePromise: Promise<void> = Promise.resolve()
 	#configUpdatePromise: Promise<void> = Promise.resolve()
 	get watchedFiles() {
 		return this.#watcher?.watchedFiles ?? new UriStore()
@@ -209,7 +215,10 @@ export class Project extends EventDispatcher<{
 	readonly fs: FileService
 	readonly isDebugging: boolean
 	readonly logger: Logger
-	readonly meta = new MetaRegistry()
+	#meta = new MetaRegistry()
+	get meta(): MetaRegistry {
+		return this.#meta
+	}
 	readonly profilers: ProfilerFactory
 	readonly projectRoots: RootUriString[]
 	symbols: SymbolUtil
@@ -307,8 +316,7 @@ export class Project extends EventDispatcher<{
 		this.logger.info(`[Project] [init] projectRoots = ${projectRoots.join(' ')}`)
 
 		this.#configService.on('changed', ({ config }) => {
-			this.#configUpdatePromise = this.#configUpdatePromise
-				.then(() => this.applyConfigUpdate(config))
+			this.#configUpdatePromise = this.enqueueLifecycle(() => this.applyConfigUpdate(config))
 				.catch(e => this.logger.error('[Project] [Config] Failed applying update', e))
 		}).on(
 			'error',
@@ -331,24 +339,46 @@ export class Project extends EventDispatcher<{
 			})
 		}).on('documentRemoved', ({ uri }) => {
 			this.emit('documentErrored', { errors: [], uri })
-		}).on('fileCreated', async ({ uri }) => {
-			if (uri.endsWith(Project.RootSuffix)) {
-				this.updateRoots()
-			}
-			this.bindUri(uri)
-			return this.ensureBindingStarted(uri)
-		}).on('fileModified', async ({ uri }) => {
-			this.#symbolUpToDateUris.delete(uri)
-			if (this.isOnlyWatched(uri)) {
+		}).on('fileCreated', ({ uri }) => {
+			const process = async () => {
+				if (uri.endsWith(Project.RootSuffix)) {
+					this.updateRoots()
+				}
+				this.bindUri(uri)
 				await this.ensureBindingStarted(uri)
 			}
-		}).on('fileDeleted', ({ uri }) => {
-			if (uri.endsWith(Project.RootSuffix)) {
-				this.updateRoots()
+			if (this.shouldReinitializeFor(uri)) {
+				this.requestReinitialization(uri, process)
+				return
 			}
-			this.#symbolUpToDateUris.delete(uri)
-			this.symbols.clear({ uri })
-			this.tryClearingCache(uri)
+			this.requestLifecycle(process, `[Project#fileCreated] ${uri}`)
+		}).on('fileModified', ({ uri }) => {
+			const process = async () => {
+				this.#symbolUpToDateUris.delete(uri)
+				this.removeCachedTextDocument(uri)
+				if (this.isOnlyWatched(uri)) {
+					await this.ensureBindingStarted(uri)
+				}
+			}
+			if (this.shouldReinitializeFor(uri)) {
+				this.requestReinitialization(uri, process)
+				return
+			}
+			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
+		}).on('fileDeleted', ({ uri }) => {
+			const process = () => {
+				if (uri.endsWith(Project.RootSuffix)) {
+					this.updateRoots()
+				}
+				this.#symbolUpToDateUris.delete(uri)
+				this.symbols.clear({ uri })
+				this.tryClearingCache(uri)
+			}
+			if (this.shouldReinitializeFor(uri)) {
+				this.requestReinitialization(uri, process)
+				return
+			}
+			this.requestLifecycle(process, `[Project#fileDeleted] ${uri}`)
 		}).on('ready', () => {
 			this.#isReady = true
 			// Recheck client managed files after the READY process, as they may have incomplete results and are user-facing.
@@ -371,32 +401,6 @@ export class Project extends EventDispatcher<{
 	async #init(): Promise<this> {
 		this.#isInitialized = false
 
-		const callIntializers = async () => {
-			const initCtx: ProjectInitializerContext = {
-				cacheRoot: this.cacheRoot,
-				config: this.config,
-				externals: this.externals,
-				isDebugging: this.isDebugging,
-				logger: this.logger,
-				meta: this.meta,
-				profilers: this.profilers,
-				projectRoots: this.projectRoots,
-			}
-			const results = await Promise.allSettled(this.#initializers.map((init) => init(initCtx)))
-			let ctx: Record<string, string> = {}
-			results.forEach(async (r, i) => {
-				if (r.status === 'rejected') {
-					this.logger.error(
-						`[Project] [callInitializers] [${i}] “${this.#initializers[i].name}”`,
-						r.reason,
-					)
-				} else if (r.value) {
-					ctx = { ...ctx, ...r.value }
-				}
-			})
-			this.#ctx = ctx
-		}
-
 		const __profiler = this.profilers.get('project#init')
 
 		await this.cacheService.loadMetadata()
@@ -405,7 +409,7 @@ export class Project extends EventDispatcher<{
 		this.config = await this.#configService.load()
 		__profiler.task('Load Config')
 
-		await callIntializers()
+		this.commitInitializers(await this.runInitializers(false))
 		__profiler.task('Initialize')
 
 		const { symbols } = await this.cacheService.activate({
@@ -419,6 +423,194 @@ export class Project extends EventDispatcher<{
 		this.#isInitialized = true
 
 		return this
+	}
+
+	private async runInitializers(failOnError: boolean): Promise<InitializerResult> {
+		const meta = new MetaRegistry()
+		const reinitializationPredicates = new Set<ProjectChangePredicate>()
+		const initCtx: ProjectInitializerContext = {
+			cacheRoot: this.cacheRoot,
+			config: this.config,
+			externals: this.externals,
+			isDebugging: this.isDebugging,
+			logger: this.logger,
+			meta,
+			profilers: this.profilers,
+			projectRoots: this.projectRoots,
+			reinitializeOnChange: (predicate) => reinitializationPredicates.add(predicate),
+		}
+		const results = await Promise.allSettled(this.#initializers.map((init) => init(initCtx)))
+		let ctx: Record<string, string> = {}
+		const errors: unknown[] = []
+		results.forEach((result, i) => {
+			if (result.status === 'rejected') {
+				errors.push(result.reason)
+				this.logger.error(
+					`[Project] [runInitializers] [${i}] “${this.#initializers[i].name}”`,
+					result.reason,
+				)
+			} else if (result.value) {
+				ctx = { ...ctx, ...result.value }
+			}
+		})
+		if (failOnError && errors.length > 0) {
+			throw new AggregateError(errors, 'One or more project initializers failed')
+		}
+		return { ctx, meta, reinitializationPredicates }
+	}
+
+	private commitInitializers(result: InitializerResult): void {
+		this.#meta = result.meta
+		this.#reinitializationPredicates = result.reinitializationPredicates
+		this.#ctx = result.ctx
+	}
+
+	/**
+	 * Run project initializers again and rebuild the project when their cache
+	 * context changed.
+	 */
+	async reinitialize(): Promise<this> {
+		await this.scheduleReinitialization()
+		return this
+	}
+
+	private scheduleReinitialization(): Promise<boolean> {
+		this.#reinitializationGeneration += 1
+		if (!this.#reinitializationPromise) {
+			const operation = this.enqueueLifecycle(() => this.drainReinitializations())
+			const tracked = operation.finally(() => {
+				if (this.#reinitializationPromise === tracked) {
+					this.#reinitializationPromise = undefined
+				}
+			})
+			this.#reinitializationPromise = tracked
+		}
+		return this.#reinitializationPromise
+	}
+
+	private async drainReinitializations(): Promise<boolean> {
+		let lastError: unknown
+		let contextChanged = false
+		while (
+			this.#processedReinitializationGeneration < this.#reinitializationGeneration
+		) {
+			const generation = this.#reinitializationGeneration
+			try {
+				contextChanged = await this.reinitializeOnce()
+				lastError = undefined
+			} catch (e) {
+				lastError = e
+			}
+			this.#processedReinitializationGeneration = generation
+		}
+		if (lastError !== undefined) {
+			throw lastError
+		}
+		return contextChanged
+	}
+
+	private async reinitializeOnce(): Promise<boolean> {
+		if (!this.#isInitialized) {
+			return false
+		}
+
+		this.logger.info('[Project#reinitialize] Initiated...')
+		const staged = await this.runInitializers(true)
+		const preparedContext = await this.cacheService.prepareContext({
+			initializerContext: staged.ctx,
+			lint: this.config.lint,
+		})
+		if (!preparedContext.changed) {
+			this.commitInitializers(staged)
+			this.emit('reinitialized', { contextChanged: false })
+			return false
+		}
+
+		const snapshot = {
+			bindingInProgressUris: new Set(this.#bindingInProgressUris),
+			clientManagedDocAndNodes: new Map(this.#clientManagedDocAndNodes),
+			ctx: this.#ctx,
+			dependencyFiles: this.#dependencyFiles,
+			dependencyRoots: this.#dependencyRoots,
+			isReady: this.#isReady,
+			meta: this.#meta,
+			readyPromise: this.#readyPromise,
+			reinitializationPredicates: this.#reinitializationPredicates,
+			roots: this.#roots,
+			symbols: this.symbols,
+			symbolUpToDateUris: new Set(this.#symbolUpToDateUris),
+		}
+		const cacheTransaction = this.cacheService.beginTransaction()
+		try {
+			this.commitInitializers(staged)
+			this.#isReady = false
+			this.reparseClientManaged()
+			await this.resetCache()
+			this.cacheService.commitContext(preparedContext)
+			cacheTransaction.commit()
+			this.emit('reinitialized', { contextChanged: true })
+			return true
+		} catch (e) {
+			cacheTransaction.rollback()
+			this.#bindingInProgressUris.clear()
+			snapshot.bindingInProgressUris.forEach(uri => this.#bindingInProgressUris.add(uri))
+			this.#clientManagedDocAndNodes.clear()
+			snapshot.clientManagedDocAndNodes.forEach((value, uri) =>
+				this.#clientManagedDocAndNodes.set(uri, value)
+			)
+			this.#ctx = snapshot.ctx
+			this.#dependencyFiles = snapshot.dependencyFiles
+			this.#dependencyRoots = snapshot.dependencyRoots
+			this.#isReady = snapshot.isReady
+			this.#meta = snapshot.meta
+			this.#readyPromise = snapshot.readyPromise
+			this.#reinitializationPredicates = snapshot.reinitializationPredicates
+			this.#roots = snapshot.roots
+			this.symbols = snapshot.symbols
+			this.#symbolUpToDateUris.clear()
+			snapshot.symbolUpToDateUris.forEach(uri => this.#symbolUpToDateUris.add(uri))
+			throw e
+		}
+	}
+
+	private shouldReinitializeFor(uri: string): boolean {
+		for (const predicate of this.#reinitializationPredicates) {
+			try {
+				if (predicate(uri)) {
+					return true
+				}
+			} catch (e) {
+				this.logger.error('[Project#shouldReinitializeFor]', e)
+			}
+		}
+		return false
+	}
+
+	private enqueueLifecycle<T>(operation: () => Promise<T> | T): Promise<T> {
+		const result = this.#lifecyclePromise.then(operation)
+		this.#lifecyclePromise = result.then(() => undefined, () => undefined)
+		return result
+	}
+
+	private requestLifecycle(operation: () => Promise<void> | void, label: string): void {
+		this.enqueueLifecycle(operation).catch(e => this.logger.error(label, e))
+	}
+
+	private requestReinitialization(
+		uri: string,
+		processFileEvent: () => Promise<void> | void,
+	): void {
+		this.scheduleReinitialization()
+			.then((contextChanged) => {
+				if (!contextChanged) {
+					return this.enqueueLifecycle(processFileEvent)
+				}
+				return undefined
+			}, (e) => {
+				this.logger.error(`[Project#reinitialize] Failed after change to ${uri}`, e)
+				return this.enqueueLifecycle(processFileEvent)
+			})
+			.catch(e => this.logger.error(`[Project#fileEvent] Failed processing ${uri}`, e))
 	}
 
 	/**
@@ -513,9 +705,8 @@ export class Project extends EventDispatcher<{
 						this.logger.error('[Project#watcher]', e)
 					})
 				this.#registeredWatcher = this.#watcher
+				await this.#watcher.ready()
 			}
-
-			await this.#watcher.ready()
 		}
 
 		const __profiler = this.profilers.get('project#ready')
@@ -604,14 +795,10 @@ export class Project extends EventDispatcher<{
 	}
 
 	async restart(): Promise<void> {
-		try {
-			this.#bindingInProgressUris.clear()
-			this.#symbolUpToDateUris.clear()
-			this.#readyPromise = undefined
-			await this.ready({ projectRootsWatcher: this.#watcher })
-		} catch (e) {
-			this.logger.error('[Project#reset]', e)
-		}
+		this.#bindingInProgressUris.clear()
+		this.#symbolUpToDateUris.clear()
+		this.#readyPromise = undefined
+		await this.ready({ projectRootsWatcher: this.#watcher })
 	}
 
 	async resetCache(): Promise<void> {
@@ -659,6 +846,12 @@ export class Project extends EventDispatcher<{
 			[...this.#clientManagedDocAndNodes.values()]
 				.map(({ doc, node }) => this.bind(doc, node).then(() => this.check(doc, node))),
 		)
+	}
+
+	private reparseClientManaged(): void {
+		for (const [uri, { doc }] of this.#clientManagedDocAndNodes) {
+			this.#clientManagedDocAndNodes.set(uri, { doc, node: this.parse(doc) })
+		}
 	}
 
 	normalizeUri(uri: string): string {

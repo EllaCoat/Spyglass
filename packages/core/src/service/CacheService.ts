@@ -46,6 +46,16 @@ export interface CacheContext {
 	lint: LinterConfig
 }
 
+export interface PreparedCacheContext {
+	readonly changed: boolean
+	readonly hash: string
+}
+
+export interface CacheTransaction {
+	commit(): void
+	rollback(): void
+}
+
 /**
  * Checksums of cached files or roots.
  */
@@ -100,6 +110,7 @@ export class CacheService {
 	#hasValidatedFiles = false
 	#pendingCache: CacheFile | undefined
 	#activeContextHash: string | undefined
+	#saveSuspensions = 0
 
 	/**
 	 * @param cacheRoot File path to the directory where cache files by Spyglass should be stored.
@@ -235,11 +246,61 @@ export class CacheService {
 	 * @returns Whether an already-active context changed.
 	 */
 	async updateContext(context: CacheContext): Promise<boolean> {
-		const next = await getSha1(stableStringify(context))
-		const changed = this.#activeContextHash !== undefined
-			&& this.#activeContextHash !== next
-		this.#activeContextHash = next
-		return changed
+		const prepared = await this.prepareContext(context)
+		this.commitContext(prepared)
+		return prepared.changed
+	}
+
+	/** Calculate a context fingerprint without making it active. */
+	async prepareContext(context: CacheContext): Promise<PreparedCacheContext> {
+		const hash = await getSha1(stableStringify(context))
+		return {
+			changed: this.#activeContextHash !== undefined && this.#activeContextHash !== hash,
+			hash,
+		}
+	}
+
+	/** Make a previously prepared context fingerprint active. */
+	commitContext(context: PreparedCacheContext): void {
+		this.#activeContextHash = context.hash
+	}
+
+	/**
+	 * Snapshot mutable cache state and suspend saves while a project rebuild is in progress.
+	 * The snapshot can be restored without exposing a partially rebuilt symbol table on disk.
+	 */
+	beginTransaction(): CacheTransaction {
+		const snapshot = {
+			activeContextHash: this.#activeContextHash,
+			checksums: {
+				files: { ...this.checksums.files },
+				roots: { ...this.checksums.roots },
+				symbolRegistrars: { ...this.checksums.symbolRegistrars },
+			},
+			errors: { ...this.errors },
+			hasValidatedFiles: this.#hasValidatedFiles,
+			pendingCache: this.#pendingCache,
+		}
+		this.#saveSuspensions += 1
+		let settled = false
+		const settle = () => {
+			if (settled) {
+				throw new Error('Cache transaction has already settled')
+			}
+			settled = true
+			this.#saveSuspensions -= 1
+		}
+		return {
+			commit: () => settle(),
+			rollback: () => {
+				this.#activeContextHash = snapshot.activeContextHash
+				this.checksums = snapshot.checksums
+				this.errors = snapshot.errors
+				this.#hasValidatedFiles = snapshot.hasValidatedFiles
+				this.#pendingCache = snapshot.pendingCache
+				settle()
+			},
+		}
 	}
 
 	async validate(): Promise<ValidateResult> {
@@ -311,7 +372,7 @@ export class CacheService {
 	 * @returns If the cache file was saved successfully.
 	 */
 	async save(): Promise<boolean> {
-		if (this.project.projectRoots.length === 0) {
+		if (this.project.projectRoots.length === 0 || this.#saveSuspensions > 0) {
 			return false
 		}
 		const __profiler = this.project.profilers.get('cache#save')

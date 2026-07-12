@@ -3,80 +3,44 @@ import * as json from '@spyglassmc/json'
 import * as mcdoc from '@spyglassmc/mcdoc'
 import * as nbt from '@spyglassmc/nbt'
 import { jeFileUriPredicate, registerUriBuilders, uriBinder } from './binder/index.js'
-import type { McmetaSummary, PackInfo } from './dependency/index.js'
+import type { McmetaSummary } from './dependency/index.js'
 import {
 	getMcmetaSummary,
 	getVanillaDatapack,
 	getVanillaMcdoc,
 	getVanillaResourcepack,
 	getVersions,
-	PackMcmeta,
 	resolveConfiguredVersion,
 	symbolRegistrar,
 } from './dependency/index.js'
 import * as jeJson from './json/index.js'
 import { registerMcdocAttributes, registerPackFormatAttribute } from './mcdocAttributes.js'
 import * as jeMcf from './mcfunction/index.js'
+import { getPackFormatContext, getProjectPacks } from './packFormat.js'
 
 export * as binder from './binder/index.js'
 export * as dependency from './dependency/index.js'
 export * as json from './json/index.js'
 export * from './mcdocAttributes.js'
 export * as mcf from './mcfunction/index.js'
+export * from './packFormat.js'
 
 export const initialize: core.ProjectInitializer = async (ctx) => {
-	const { config, externals, logger, meta, projectRoots } = ctx
-
-	async function readPackFormat(uri: string): Promise<number | undefined> {
-		try {
-			const data = await core.fileUtil.readJson(externals, uri)
-			return PackMcmeta.readPackFormat(data)
-		} catch (e) {
-			if (!externals.error.isKind(e, 'ENOENT')) {
-				// `pack.mcmeta` exists but broken. Log an error.
-				logger.error(`[je.initialize] Failed loading pack.mcmeta ${uri}`, e)
-			}
-		}
-		return undefined
-	}
-
-	async function findPackMcmetas(): Promise<PackInfo[]> {
-		const searchedUris = new Set<string>()
-		const packs: PackInfo[] = []
-		for (let depth = 0; depth <= 2; depth += 1) {
-			for (const projectRoot of projectRoots) {
-				const files = await core.fileUtil.getAllFiles(externals, projectRoot, depth + 1)
-				for (const uri of files.filter(uri => uri.endsWith('/pack.mcmeta'))) {
-					if (searchedUris.has(uri)) {
-						continue
-					}
-					searchedUris.add(uri)
-					const packRoot = core.fileUtil.dirname(uri)
-					const [format, type] = await Promise.all([
-						readPackFormat(uri),
-						PackMcmeta.getType(packRoot, externals),
-					])
-					if (format !== undefined) {
-						packs.push({ type, packRoot, format })
-					}
-				}
-			}
-		}
-		return packs
-	}
+	const { config, externals, logger, meta } = ctx
 
 	meta.registerUriBinder(uriBinder)
 	registerUriBuilders(meta)
 
 	const [versions, packs] = await Promise.all([
 		getVersions(externals, logger),
-		findPackMcmetas(),
+		getProjectPacks(ctx),
 	])
+	const packFormatContext = getPackFormatContext(packs)
 	if (!versions) {
 		ctx.logger.error(
 			'[je-initialize] Failed loading game version list. Expect everything to be broken.',
 		)
-		return
+		return packFormatContext
 	}
 
 	const version = resolveConfiguredVersion(config.env.gameVersion, versions, packs, logger)
@@ -104,7 +68,7 @@ export const initialize: core.ProjectInitializer = async (ctx) => {
 		ctx.logger.error(
 			'[je-initialize] Failed loading mcmeta summaries. Expect everything to be broken.',
 		)
-		return
+		return packFormatContext
 	}
 
 	meta.registerSymbolRegistrar('mcmeta-summary', {
@@ -144,5 +108,5 @@ export const initialize: core.ProjectInitializer = async (ctx) => {
 	jeMcf.initialize(ctx, summary.commands, release)
 	nbt.initialize(ctx)
 
-	return { loadedVersion: release, errorSource: release }
+	return { loadedVersion: release, errorSource: release, ...packFormatContext }
 }
