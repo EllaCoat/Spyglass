@@ -39,6 +39,7 @@ export interface RunnerOptions {
 	skipUnresolved?: boolean
 	cachePath?: string
 	config?: Record<string, unknown>
+	profilers?: core.ProfilerFactory
 }
 
 export interface RunResult {
@@ -613,7 +614,7 @@ export async function runImpDocLint(
 		isDebugging: false,
 		logger,
 		meta,
-		profilers: core.ProfilerFactory.noop(),
+		profilers: options.profilers ?? core.ProfilerFactory.noop(),
 		projectRoots: [rootUri],
 		roots: [rootUri],
 		symbols,
@@ -632,6 +633,7 @@ export async function runImpDocLint(
 		: []
 	diagnostics.push(...readDiagnostics)
 
+	const parseProfiler = projectData.profilers.get('project#ready#parse', 'top-n', 50)
 	const processInputs = [...affectedFiles]
 		.map(file => inputs.get(file))
 		.filter((input): input is FileInput => input !== undefined)
@@ -643,8 +645,11 @@ export async function runImpDocLint(
 				diagnostics.push(runnerError(input.file, error))
 			}
 			return undefined
+		} finally {
+			parseProfiler.task(uri)
 		}
 	})
+	parseProfiler.finalize()
 	const states = parsed.filter((state): state is FileState => state !== undefined)
 
 	// Enter declarations, rather than definitions, so the checker only assigns function visibility
@@ -665,6 +670,7 @@ export async function runImpDocLint(
 		}
 	})
 
+	const bindProfiler = projectData.profilers.get('project#ready#bind', 'top-n', 50)
 	for (const state of states) {
 		try {
 			const ctx = core.BinderContext.create(projectData, { doc: state.doc })
@@ -677,9 +683,13 @@ export async function runImpDocLint(
 			if (!options.skipUnresolved) {
 				diagnostics.push(runnerError(state.file, error))
 			}
+		} finally {
+			bindProfiler.task(state.uri)
 		}
 	}
+	bindProfiler.finalize()
 
+	const checkProfiler = projectData.profilers.get('project#check', 'top-n', 50)
 	const check = async (state: FileState): Promise<void> => {
 		try {
 			const ctx = core.CheckerContext.create(projectData, { doc: state.doc })
@@ -689,12 +699,15 @@ export async function runImpDocLint(
 			if (!options.skipUnresolved) {
 				diagnostics.push(runnerError(state.file, error))
 			}
+		} finally {
+			checkProfiler.task(state.uri)
 		}
 	}
 	const indexStates = states.filter(state => basename(state.file) === '_index.d.mcfunction')
 	const regularStates = states.filter(state => basename(state.file) !== '_index.d.mcfunction')
 	await mapLimit(indexStates, options.parallel, check)
 	await mapLimit(regularStates, options.parallel, check)
+	checkProfiler.finalize()
 
 	const lintConfig = config.lint as unknown as Record<string, unknown>
 	const lintValue = core.LinterConfigValue.destruct(
@@ -703,26 +716,32 @@ export async function runImpDocLint(
 	if (lintValue) {
 		const registration = meta.getLinter(ImpDocPrivateRule)
 		if (registration.configValidator(ImpDocPrivateRule, lintValue.ruleValue, logger)) {
+			const lintProfiler = projectData.profilers.get('project#lint', 'top-n', 50)
 			await mapLimit(states, options.parallel, async (state) => {
-				const err = new core.LinterErrorReporter(
-					ImpDocPrivateRule,
-					lintValue.ruleSeverity,
-					projectData.ctx.errorSource,
-				)
-				const ctx = core.LinterContext.create(projectData, {
-					doc: state.doc,
-					err,
-					ruleName: ImpDocPrivateRule,
-					ruleValue: lintValue.ruleValue,
-				})
-				core.traversePreOrder(
-					state.node,
-					() => true,
-					registration.nodePredicate,
-					(node) => registration.linter(core.StateProxy.create(node), ctx),
-				)
-				state.node.linterErrors = err.dump()
+				try {
+					const err = new core.LinterErrorReporter(
+						ImpDocPrivateRule,
+						lintValue.ruleSeverity,
+						projectData.ctx.errorSource,
+					)
+					const ctx = core.LinterContext.create(projectData, {
+						doc: state.doc,
+						err,
+						ruleName: ImpDocPrivateRule,
+						ruleValue: lintValue.ruleValue,
+					})
+					core.traversePreOrder(
+						state.node,
+						() => true,
+						registration.nodePredicate,
+						(node) => registration.linter(core.StateProxy.create(node), ctx),
+					)
+					state.node.linterErrors = err.dump()
+				} finally {
+					lintProfiler.task(state.uri)
+				}
 			})
+			lintProfiler.finalize()
 		}
 	}
 
