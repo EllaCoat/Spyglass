@@ -368,7 +368,7 @@ export async function runImpDocLint(
 		extensions: ['.mcfunction'],
 		parser: cliMcfunction,
 	})
-	await impDoc.initialize(projectData)
+	await impDoc.initialize({ ...projectData, reinitializeOnChange: () => {} })
 
 	const diagnostics: LintDiagnostic[] = []
 	const parsed = await mapLimit(files, options.parallel, async (file) => {
