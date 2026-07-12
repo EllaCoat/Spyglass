@@ -62,6 +62,9 @@ export function getNodeJsExternals(
 				readFile(location) {
 					return nodeFsp.readFile(toFsPathLike(location))
 				},
+				rename(oldLocation, newLocation) {
+					return nodeFsp.rename(toFsPathLike(oldLocation), toFsPathLike(newLocation))
+				},
 				rm(location, options): Promise<void> {
 					return nodeFsp.rm(toFsPathLike(location), options)
 				},
