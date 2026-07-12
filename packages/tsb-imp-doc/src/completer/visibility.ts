@@ -10,6 +10,7 @@ import { matchesVisibility } from '../util/withinPattern.js'
 interface ScoreHolderCompletionNode extends core.AstNode {
 	readonly type: 'mcfunction:score_holder'
 	readonly fakeName?: core.SymbolNode
+	readonly selector?: core.AstNode
 }
 
 /**
@@ -140,16 +141,19 @@ function completeResourceLocation(
 		return []
 	}
 
-	const category = node.isTag
-		? `tag/${node.options.category}`
-		: node.options.category
+	// IMP-Doc は `tag/<category>` を stamp しないため tag 参照は候補外。 label に `#`
+	// prefix が付かず node range が typed `#` を含む broken insert になるのを避ける。
+	if (node.isTag) {
+		return []
+	}
 
-	return getAllowedImpDocIdentifiers(category, ctx).flatMap(identifier =>
-		getResourceLabels(identifier, node, ctx).map(label =>
-			core.CompletionItem.create(label, node, {
-				kind: core.CompletionKind.Function,
-			})
-		)
+	return getAllowedImpDocIdentifiers(node.options.category, ctx).flatMap(
+		identifier =>
+			getResourceLabels(identifier, node, ctx).map(label =>
+				core.CompletionItem.create(label, node, {
+					kind: core.CompletionKind.Function,
+				})
+			),
 	)
 }
 
@@ -231,6 +235,18 @@ export function registerVisibilityCompleters(meta: core.MetaRegistry): void {
 		'mcfunction:score_holder',
 		(node, ctx) => {
 			const baseItems = baseScoreHolder(node, ctx)
+			// cursor が selector 引数内 (= `@a[scores={...` 等) の時は IMP-Doc score
+			// holder 名を追加しない。 base completer の分岐 (java-edition の
+			// `argument.ts:scoreHolder`) と揃え、 selector 先頭記号内でのみ追加する。
+			if (node.selector) {
+				const selectorHead = node.selector.children?.[0]
+				if (
+					!selectorHead
+					|| !core.Range.contains(selectorHead, ctx.offset, true)
+				) {
+					return baseItems
+				}
+			}
 			const scoreRange = node.fakeName ?? node
 			const additions = getAllowedImpDocIdentifiers('score_holder', ctx).map(
 				identifier =>
