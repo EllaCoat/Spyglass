@@ -189,41 +189,80 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 		await close()
 	})
 
-	it('drops cache and re-lints open documents with the new severity when lint config changes', async () => {
-		await runFull({
+	it('drops cache errors and re-lints open documents with the new severity when lint config changes', async () => {
+		// 初回 project = Error severity で lint、 cacheService.errors に診断を確実に入れる。
+		const first = createProject({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'error',
 		})
-		const project = createProject({
+		try {
+			await first.init()
+			const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
+			await first.ready({ projectRootsWatcher: watcher })
+
+			const callerUri = RuntimeFileUris[3]
+			assert.ok(callerUri)
+			const firstContent = await first.externals.fs.readFile(callerUri)
+			await first.onDidOpen(
+				callerUri,
+				'mcfunction',
+				1,
+				new TextDecoder().decode(firstContent),
+			)
+			const firstState = first.getClientManaged(callerUri)
+			assert.ok(firstState)
+			assert.equal(firstState.node.linterErrors?.length, 1)
+			assert.equal(
+				firstState.node.linterErrors?.[0]?.severity,
+				core.ErrorSeverity.Error,
+			)
+			// stale errors 検出 regression の precondition = errors が確実に保存されている。
+			assert.ok(
+				Object.keys(first.cacheService.errors).length > 0,
+				'Expected initial run to populate cacheService.errors',
+			)
+		} finally {
+			await first.close()
+		}
+
+		// 2 回目 project = lint level を warning に変えて init、 cache 破棄と再 lint を verify。
+		const second = createProject({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'warning',
 		})
 		try {
-			await project.init()
+			await second.init()
 			const restoredFileCount = Object.keys(
-				project.cacheService.checksums.files,
+				second.cacheService.checksums.files,
 			).length
 			assert.equal(
 				restoredFileCount,
 				0,
 				`Expected cache to be dropped on lint config change; got ${restoredFileCount}`,
 			)
+			// checksums だけでなく stale errors も破棄されないと、 「drop 忘れ」 regression を
+			// 後段の onDidOpen で新 lint が上書きしてしまい検出できない。
+			assert.equal(
+				Object.keys(second.cacheService.errors).length,
+				0,
+				'Expected cacheService.errors to be dropped on lint config change',
+			)
 
 			const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
-			await project.ready({ projectRootsWatcher: watcher })
+			await second.ready({ projectRootsWatcher: watcher })
 
 			const callerUri = RuntimeFileUris[3]
 			assert.ok(callerUri)
-			const content = await project.externals.fs.readFile(callerUri)
-			await project.onDidOpen(
+			const content = await second.externals.fs.readFile(callerUri)
+			await second.onDidOpen(
 				callerUri,
 				'mcfunction',
 				1,
 				new TextDecoder().decode(content),
 			)
-			const state = project.getClientManaged(callerUri)
+			const state = second.getClientManaged(callerUri)
 			assert.ok(state)
 			assert.equal(state.node.linterErrors?.length, 1)
 			assert.equal(
@@ -231,7 +270,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 				core.ErrorSeverity.Warning,
 			)
 		} finally {
-			await project.close()
+			await second.close()
 		}
 	})
 
