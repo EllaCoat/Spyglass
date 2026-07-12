@@ -312,8 +312,10 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			assert.equal(state.node.linterErrors?.length, 1)
 			assert.equal(state.node.linterErrors?.[0]?.severity, core.ErrorSeverity.Error)
 
+			// impDocPrivate は tsb-imp-doc が dynamic 登録する custom lint rule で、
+			// core.LinterConfig の静的 shape には現れないため型を明示 escape する。
 			await project.onEditorConfigurationUpdate({
-				lint: { impDocPrivate: 'warning' },
+				lint: { impDocPrivate: 'warning' } as unknown as core.LinterConfig,
 			})
 			state = project.getClientManaged(callerUri)
 			assert.ok(state)

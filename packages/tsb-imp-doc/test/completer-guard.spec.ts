@@ -19,7 +19,7 @@ function setupWrappedCompleter() {
 
 function mockCtx(offset: number): core.CompleterContext {
 	return {
-		doc: { uri: 'test://caller.mcfunction' } as core.TextDocument,
+		doc: { uri: 'test://caller.mcfunction' },
 		offset,
 		symbols: {
 			lookup: (category: string) => ({
@@ -135,7 +135,7 @@ describe('IMP-Doc resource_location tag guard (P5c0 review)', () => {
 		)
 
 		const ctx = {
-			doc: { uri: 'test://caller.mcfunction' } as core.TextDocument,
+			doc: { uri: 'test://caller.mcfunction' },
 			offset: 0,
 			symbols: {
 				lookup: (category: string) => ({
