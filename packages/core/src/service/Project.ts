@@ -9,6 +9,7 @@ import {
 	normalizeUri,
 	SingletonPromise,
 	StateProxy,
+	TwoWayMap,
 	UriStore,
 } from '../common/index.js'
 import type { AstNode } from '../node/index.js'
@@ -199,6 +200,8 @@ export class Project extends EventDispatcher<{
 	/** URI of files that are currently managed by the language client. */
 	readonly #clientManagedUris = new Set<string>()
 	readonly #clientManagedDocAndNodes = new Map<string, DocAndNode>()
+	/** Logical project URI to the URI used by the language client, and vice versa. */
+	readonly #clientManagedUriMap = new TwoWayMap<string, string>()
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
 	readonly #initializers: readonly ProjectInitializer[]
@@ -993,6 +996,10 @@ export class Project extends EventDispatcher<{
 		return this.fs.mapFromDisk(normalizeUri(uri))
 	}
 
+	private isCacheUri(uri: string): boolean {
+		return normalizeUri(uri).startsWith(normalizeUri(this.#cacheRoot))
+	}
+
 	private static readonly TextDocumentCacheMaxLength = 268435456
 	readonly #textDocumentCache = new Map<string, Promise<TextDocument | undefined> | TextDocument>()
 	#textDocumentCacheLength = 0
@@ -1266,9 +1273,11 @@ export class Project extends EventDispatcher<{
 		version: number,
 		content: string,
 	): Promise<void> {
-		uri = this.normalizeUri(uri)
-		if (uri.startsWith(ArchiveUriSupporter.Protocol)) {
-			return // We do not accept `archive:` scheme for client-managed URIs.
+		const clientUri = normalizeUri(uri)
+		const isCacheUri = this.isCacheUri(clientUri)
+		uri = this.normalizeUri(clientUri)
+		if (!isCacheUri && uri.startsWith(ArchiveUriSupporter.Protocol)) {
+			return // Direct `archive:` URIs cannot be client-managed.
 		}
 		if (this.shouldExclude(uri, languageID)) {
 			return
@@ -1277,9 +1286,12 @@ export class Project extends EventDispatcher<{
 		const node = this.parse(doc)
 		this.#clientManagedUris.add(uri)
 		this.#clientManagedDocAndNodes.set(uri, { doc, node })
+		this.#clientManagedUriMap.delete(uri)
+		this.#clientManagedUriMap.set(uri, clientUri)
 		if (this.#isReady) {
 			await this.bind(doc, node)
 			await this.check(doc, node)
+			this.emit('documentUpdated', { doc, node })
 		}
 	}
 
@@ -1292,10 +1304,12 @@ export class Project extends EventDispatcher<{
 		changes: TextDocumentContentChangeEvent[],
 		version: number,
 	): Promise<void> {
-		uri = this.normalizeUri(uri)
+		const clientUri = normalizeUri(uri)
+		const isCacheUri = this.isCacheUri(clientUri)
+		uri = this.normalizeUri(clientUri)
 		this.#symbolUpToDateUris.delete(uri)
-		if (uri.startsWith(ArchiveUriSupporter.Protocol)) {
-			return // We do not accept `archive:` scheme for client-managed URIs.
+		if (!isCacheUri && uri.startsWith(ArchiveUriSupporter.Protocol)) {
+			return // Direct `archive:` URIs cannot be client-managed.
 		}
 		const doc = this.#clientManagedDocAndNodes.get(uri)?.doc
 		if (!doc || this.shouldExclude(uri, doc.languageId)) {
@@ -1311,19 +1325,44 @@ export class Project extends EventDispatcher<{
 		if (this.#isReady) {
 			await this.bind(doc, node)
 			await this.check(doc, node)
+			this.emit('documentUpdated', { doc, node })
 		}
 	}
 
 	/**
 	 * Notify that an existing document was closed in the editor.
 	 */
-	onDidClose(uri: string): void {
-		uri = this.normalizeUri(uri)
-		if (uri.startsWith(ArchiveUriSupporter.Protocol)) {
-			return // We do not accept `archive:` scheme for client-managed URIs.
+	async onDidClose(uri: string): Promise<void> {
+		const clientUri = normalizeUri(uri)
+		const isCacheUri = this.isCacheUri(clientUri)
+		uri = this.normalizeUri(clientUri)
+		if (!isCacheUri && uri.startsWith(ArchiveUriSupporter.Protocol)) {
+			return // Direct `archive:` URIs cannot be client-managed.
 		}
+		const wasClientManaged = this.#clientManagedUris.has(uri)
 		this.#clientManagedUris.delete(uri)
 		this.#clientManagedDocAndNodes.delete(uri)
+
+		let restored: DocAndNode | undefined
+		if (isCacheUri && wasClientManaged && this.#isReady) {
+			this.#symbolUpToDateUris.delete(uri)
+			this.removeCachedTextDocument(uri)
+			const doc = await this.read(uri)
+			if (doc) {
+				const node = this.parse(doc)
+				await this.bind(doc, node)
+				await this.check(doc, node)
+				restored = { doc, node }
+			} else {
+				// Reading the archive source failed; stale client contributions must not survive.
+				this.symbols.clear({ uri })
+			}
+		}
+
+		this.#clientManagedUriMap.delete(uri)
+		if (restored) {
+			this.emit('documentUpdated', restored)
+		}
 		this.tryClearingCache(uri)
 	}
 
@@ -1346,6 +1385,13 @@ export class Project extends EventDispatcher<{
 	getClientManaged(uri: string): DocAndNode | undefined {
 		uri = this.normalizeUri(uri)
 		return this.#clientManagedDocAndNodes.get(uri)
+	}
+
+	/**
+	 * Return the URI by which the language client manages a logical project URI.
+	 */
+	getClientManagedUri(uri: string): string | undefined {
+		return this.#clientManagedUriMap.get(this.normalizeUri(uri))
 	}
 
 	async showCacheRoot(): Promise<void> {

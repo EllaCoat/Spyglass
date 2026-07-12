@@ -1,0 +1,9 @@
+dispatch minecraft:resource[worldgen/placed_feature] to struct {
+	feature: #[id="worldgen/configured_feature"] string,
+	placement: [any],
+}
+
+dispatch minecraft:resource[worldgen/configured_feature] to struct {
+	type: string,
+	config: any,
+}

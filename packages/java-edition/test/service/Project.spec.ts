@@ -1,6 +1,7 @@
 import * as core from '@spyglassmc/core'
 import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import * as json from '@spyglassmc/json'
+import * as mcdoc from '@spyglassmc/mcdoc'
 import assert from 'node:assert/strict'
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -20,9 +21,11 @@ class FixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
 {
 	readonly watchedFiles = new core.UriStore()
 
-	constructor(uri: string) {
+	constructor(...uris: string[]) {
 		super()
-		this.watchedFiles.add(uri)
+		for (const uri of uris) {
+			this.watchedFiles.add(uri)
+		}
 	}
 
 	async ready(): Promise<void> {}
@@ -666,5 +669,162 @@ describe('Project cache reset (#1975)', () => {
 			await project.close()
 			await rm(cacheDir, { recursive: true, force: true })
 		}
+	})
+})
+
+describe('Project cache-backed documents (#1483)', () => {
+	const VanillaRootUri = 'archive://vanilla-open/' as core.RootUriString
+	const PlacedFeatureUri =
+		'archive://vanilla-open/data/minecraft/worldgen/placed_feature/cache_open.json'
+	const OriginalConfiguredFeatureUri =
+		'archive://vanilla-open/data/minecraft/worldgen/configured_feature/cache_open_configured.json'
+	const ChangedConfiguredFeatureUri =
+		'archive://vanilla-open/data/minecraft/worldgen/configured_feature/cache_open_changed.json'
+	const VanillaFixtureRoot = new URL('./fixture/vanilla-open/', import.meta.url)
+	const PlacedFeatureFixture = new URL(
+		'./fixture/vanilla-open/data/minecraft/worldgen/placed_feature/cache_open.json',
+		import.meta.url,
+	)
+	const OriginalConfiguredFeatureFixture = new URL(
+		'./fixture/vanilla-open/data/minecraft/worldgen/configured_feature/cache_open_configured.json',
+		import.meta.url,
+	)
+	const ChangedConfiguredFeatureFixture = new URL(
+		'./fixture/vanilla-open/data/minecraft/worldgen/configured_feature/cache_open_changed.json',
+		import.meta.url,
+	)
+	const ArchiveFiles = new Map([
+		[PlacedFeatureUri, PlacedFeatureFixture],
+		[OriginalConfiguredFeatureUri, OriginalConfiguredFeatureFixture],
+		[ChangedConfiguredFeatureUri, ChangedConfiguredFeatureFixture],
+	])
+
+	const initializeJavaEditionFixture: core.ProjectInitializer = (ctx) => {
+		mcdoc.initialize(ctx)
+		ctx.meta.registerUriBinder(je.binder.uriBinder)
+		je.binder.registerUriBuilders(ctx.meta)
+		json.getInitializer(je.binder.jeFileUriPredicate)(ctx)
+		je.json.initialize(ctx)
+		return { errorSource: '1.20.4', loadedVersion: '1.20.4' }
+	}
+
+	let cacheDir: string
+	let cachedUri: string
+	let placedFeatureContent: string
+	let project: core.Project
+	let projectDir: string
+
+	beforeEach(async () => {
+		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-cache-'))
+		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-project-'))
+		placedFeatureContent = await readFile(PlacedFeatureFixture, 'utf8')
+		project = new core.Project({
+			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
+				env: {
+					dependencies: [core.fileUtil.ensureEndingSlash(VanillaFixtureRoot.toString())],
+					exclude: [],
+				},
+			}),
+			externals: NodeJsExternals,
+			initializers: [initializeJavaEditionFixture],
+			logger: core.Logger.noop(),
+			projectRoots: [
+				core.fileUtil.ensureEndingSlash(pathToFileURL(projectDir).toString()),
+				VanillaRootUri,
+			],
+		})
+		await project.init()
+		await project.ready({ projectRootsWatcher: new FixtureWatcher(...ArchiveFiles.keys()) })
+
+		project.fs.register(
+			'archive:',
+			{
+				async hash(uri) {
+					const fixture = ArchiveFiles.get(uri)
+					assert.ok(fixture)
+					return fixture.toString()
+				},
+				async readFile(uri) {
+					const fixture = ArchiveFiles.get(uri)
+					assert.ok(fixture)
+					return readFile(fixture)
+				},
+				*listFiles() {
+					yield* ArchiveFiles.keys()
+				},
+				*listRoots() {
+					yield VanillaRootUri
+				},
+			},
+			true,
+		)
+
+		const mapped = await project.fs.mapToDisk(PlacedFeatureUri)
+		assert.ok(mapped?.startsWith(project.cacheRoot))
+		cachedUri = mapped
+	})
+
+	afterEach(async () => {
+		await project.close()
+		await Promise.all([
+			rm(cacheDir, { recursive: true, force: true }),
+			rm(projectDir, { recursive: true, force: true }),
+		])
+	})
+
+	it('rejects a direct archive URI as a client-managed document', async () => {
+		await project.onDidOpen(PlacedFeatureUri, 'json', 1, placedFeatureContent)
+
+		assert.equal(project.getClientManaged(PlacedFeatureUri), undefined)
+		assert.equal(project.getClientManagedUri(PlacedFeatureUri), undefined)
+	})
+
+	it('reports cache-backed diagnostics through the physical client URI mapping', async () => {
+		const diagnostics = new Promise<core.PosRangeLanguageError[]>((resolve) => {
+			project.on('documentErrored', ({ errors, uri }) => {
+				if (uri === PlacedFeatureUri) {
+					resolve([...errors])
+				}
+			}, { once: true })
+		})
+
+		await project.onDidOpen(cachedUri, 'json', 1, '{')
+
+		assert.ok((await diagnostics).length > 0)
+		assert.equal(project.getClientManagedUri(PlacedFeatureUri), cachedUri)
+		await project.onDidClose(cachedUri)
+	})
+
+	it('updates references on change and restores archive references on close', async () => {
+		await project.onDidOpen(cachedUri, 'json', 1, placedFeatureContent)
+
+		const original = project.symbols.lookup(
+			'worldgen/configured_feature',
+			['minecraft:cache_open_configured'],
+		).symbol
+		const changed = project.symbols.lookup(
+			'worldgen/configured_feature',
+			['minecraft:cache_open_changed'],
+		).symbol
+		assert.ok(original?.definition?.some(({ uri }) => uri === OriginalConfiguredFeatureUri))
+		assert.ok(changed?.definition?.some(({ uri }) => uri === ChangedConfiguredFeatureUri))
+		assert.ok(original.reference?.some(({ uri }) => uri === PlacedFeatureUri))
+
+		const changedContent = placedFeatureContent.replace(
+			'minecraft:cache_open_configured',
+			'minecraft:cache_open_changed',
+		)
+		await project.onDidChange(cachedUri, [{ text: changedContent }], 2)
+
+		assert.equal(original.reference?.some(({ uri }) => uri === PlacedFeatureUri), false)
+		assert.ok(changed.reference?.some(({ uri }) => uri === PlacedFeatureUri))
+
+		await project.onDidClose(cachedUri)
+
+		assert.equal(project.getClientManaged(PlacedFeatureUri), undefined)
+		assert.equal(project.getClientManagedUri(PlacedFeatureUri), undefined)
+		assert.ok(original.reference?.some(({ uri }) => uri === PlacedFeatureUri))
+		assert.equal(changed.reference?.some(({ uri }) => uri === PlacedFeatureUri), false)
 	})
 })
