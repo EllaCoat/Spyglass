@@ -1,6 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import { readPackagesInfo } from './common.ts'
+import { verifyPnpmOverrides } from './verify-pnpm-overrides.ts'
 
 type PackageManifest = {
 	[key: string]: any
@@ -62,6 +63,8 @@ for (const key of referencedWorkspaces) {
 	}
 }
 
+verifyPnpmOverrides(referencedWorkspaces)
+
 for (const key of packageNames) {
 	const { dependencies, devDependencies } = packages[key]
 	const allDependencies = dependencies || devDependencies
@@ -95,13 +98,8 @@ for (const key of packageNames) {
 	}
 	const workspaceDeps: Record<string, string> = {}
 	if (dependencies?.length) {
-		// 全 workspace package で `workspace:*` protocol を使う (fork ローカル
-		// 前提)。 registry には同名で古い version があるため、 npm workspaces
-		// の hoisting が効かない pnpm では `"*"` が registry lookup に落ち、
-		// 一部 package だけ workspace 版に切り替えると型が 2 種類に分裂する
-		// (例: fork の tsb-imp-doc が使う java-edition の core が registry 版)。
 		for (const dep of dependencies) {
-			workspaceDeps[`@spyglassmc/${dep}`] = 'workspace:*'
+			workspaceDeps[`@spyglassmc/${dep}`] = '*'
 		}
 	}
 	const merged = { ...workspaceDeps, ...externalDeps }

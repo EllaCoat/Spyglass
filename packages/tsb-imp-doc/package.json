@@ -12,10 +12,10 @@
   },
   "scripts": {},
   "dependencies": {
-    "@spyglassmc/core": "workspace:*"
+    "@spyglassmc/core": "*"
   },
   "devDependencies": {
-    "@spyglassmc/java-edition": "workspace:*"
+    "@spyglassmc/java-edition": "*"
   },
   "publishConfig": {
     "access": "restricted"

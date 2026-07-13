@@ -7,6 +7,14 @@ settings:
 overrides:
   eslint-config-prettier: ^10.0.0
   pino: ^10.0.0
+  '@spyglassmc/core': workspace:*
+  '@spyglassmc/java-edition': workspace:*
+  '@spyglassmc/json': workspace:*
+  '@spyglassmc/locales': workspace:*
+  '@spyglassmc/mcdoc': workspace:*
+  '@spyglassmc/mcfunction': workspace:*
+  '@spyglassmc/nbt': workspace:*
+  '@spyglassmc/tsb-imp-doc': workspace:*
 
 importers:
 
