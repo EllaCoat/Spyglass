@@ -62,6 +62,39 @@ for (const key of referencedWorkspaces) {
 	}
 }
 
+{
+	const workspaceYamlPath = path.join(import.meta.dirname, '../pnpm-workspace.yaml')
+	const workspaceYaml = fs.readFileSync(workspaceYamlPath, 'utf-8')
+	const managedOverridePattern = /^\s*"@spyglassmc\/([^"]+)"\s*:\s*"([^"]+)"\s*$/gm
+	const yamlManagedOverrides = new Map<string, string>()
+	for (const match of workspaceYaml.matchAll(managedOverridePattern)) {
+		yamlManagedOverrides.set(match[1], match[2])
+	}
+	for (const dep of referencedWorkspaces) {
+		const spec = yamlManagedOverrides.get(dep)
+		if (spec === undefined) {
+			throw new Error(
+				`pnpm-workspace.yaml overrides is missing "@spyglassmc/${dep}". `
+					+ `Add \`"@spyglassmc/${dep}": "workspace:*"\` to the overrides block.`,
+			)
+		}
+		if (spec !== 'workspace:*') {
+			throw new Error(
+				`pnpm-workspace.yaml overrides for "@spyglassmc/${dep}" is "${spec}", `
+					+ `expected "workspace:*".`,
+			)
+		}
+	}
+	for (const dep of yamlManagedOverrides.keys()) {
+		if (!referencedWorkspaces.has(dep)) {
+			throw new Error(
+				`pnpm-workspace.yaml overrides declares "@spyglassmc/${dep}", `
+					+ `but no workspace package references it. Remove the stale override.`,
+			)
+		}
+	}
+}
+
 for (const key of packageNames) {
 	const { dependencies, devDependencies } = packages[key]
 	const allDependencies = dependencies || devDependencies
@@ -95,13 +128,8 @@ for (const key of packageNames) {
 	}
 	const workspaceDeps: Record<string, string> = {}
 	if (dependencies?.length) {
-		// 全 workspace package で `workspace:*` protocol を使う (fork ローカル
-		// 前提)。 registry には同名で古い version があるため、 npm workspaces
-		// の hoisting が効かない pnpm では `"*"` が registry lookup に落ち、
-		// 一部 package だけ workspace 版に切り替えると型が 2 種類に分裂する
-		// (例: fork の tsb-imp-doc が使う java-edition の core が registry 版)。
 		for (const dep of dependencies) {
-			workspaceDeps[`@spyglassmc/${dep}`] = 'workspace:*'
+			workspaceDeps[`@spyglassmc/${dep}`] = '*'
 		}
 	}
 	const merged = { ...workspaceDeps, ...externalDeps }
