@@ -31,7 +31,7 @@ export function rawCacheToken(raw: Uint8Array): string {
 
 function errorCode(error: unknown): string | undefined {
 	if (
-		error !== null
+		error
 		&& typeof error === 'object'
 		&& 'code' in error
 		&& typeof error.code === 'string'
