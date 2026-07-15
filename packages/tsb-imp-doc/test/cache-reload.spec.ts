@@ -96,7 +96,7 @@ function createConfig(
 	for (const rule of Object.keys(lint)) {
 		delete lint[rule]
 	}
-	lint.impDocPrivate = lintLevel
+	lint['impDocPrivate'] = lintLevel
 	return config
 }
 
@@ -202,7 +202,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			const lint = structuredClone(project.config.lint) as
 				& core.LinterConfig
 				& Record<string, unknown>
-			lint.impDocPrivate = 'warning'
+			lint['impDocPrivate'] = 'warning'
 			const lintChanged = await project.cacheService.prepareContext({
 				initializerContext: project.ctx,
 				lint,

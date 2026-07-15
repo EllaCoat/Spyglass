@@ -68,7 +68,7 @@ function createConfig(): core.Config {
 	for (const rule of Object.keys(lint)) {
 		delete lint[rule]
 	}
-	lint.impDocContractCheck = 'off'
+	lint['impDocContractCheck'] = 'off'
 	return config
 }
 

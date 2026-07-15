@@ -105,7 +105,7 @@ function createConfig(): core.Config {
 	for (const rule of Object.keys(lint)) {
 		delete lint[rule]
 	}
-	lint.impDocPrivate = 'error'
+	lint['impDocPrivate'] = 'error'
 	return config
 }
 

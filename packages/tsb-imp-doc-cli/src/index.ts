@@ -57,11 +57,11 @@ async function loadConfig(path: string | undefined): Promise<Record<string, unkn
 }
 
 function configExcludes(config: Record<string, unknown> | undefined): string[] {
-	const env = config?.env
+	const env = config?.['env']
 	if (!env || typeof env !== 'object' || Array.isArray(env)) {
 		return []
 	}
-	const exclude = (env as Record<string, unknown>).exclude
+	const exclude = (env as Record<string, unknown>)['exclude']
 	return Array.isArray(exclude)
 		? exclude.filter((value): value is string => typeof value === 'string')
 		: []
