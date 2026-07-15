@@ -683,14 +683,20 @@ describe('Project cache reset (#1975)', () => {
 			})
 
 			hooks.failBindUri = fixtureFiles.caller
-			await project.onEditorConfigurationUpdate({ lint: { undeclaredSymbol: 'error' } })
+			// A bare severity is tolerated at runtime for `undeclaredSymbol` but is not part
+			// of LinterConfigValue<SymbolLinterConfig>; cast to keep the original runtime value.
+			await project.onEditorConfigurationUpdate(
+				{ lint: { undeclaredSymbol: 'error' } } as unknown as core.PartialConfig,
+			)
 			assert.equal(readyCount, 0)
 			assert.equal(project.symbols, previousSymbols)
 			assert.equal(project.isReady, true)
 			assert.equal(project.bindingInProgressCount, 0)
 
 			hooks.failBindUri = undefined
-			await project.onEditorConfigurationUpdate({ lint: { undeclaredSymbol: 'error' } })
+			await project.onEditorConfigurationUpdate(
+				{ lint: { undeclaredSymbol: 'error' } } as unknown as core.PartialConfig,
+			)
 			assert.equal(readyCount, 1)
 			assert.notEqual(project.symbols, previousSymbols)
 			assert.equal(project.isReady, true)
@@ -790,7 +796,8 @@ describe('Project cache-backed documents (#1483)', () => {
 		)
 
 		const mapped = await project.fs.mapToDisk(PlacedFeatureUri)
-		assert.ok(mapped?.startsWith(project.cacheRoot))
+		assert.ok(mapped)
+		assert.ok(mapped.startsWith(project.cacheRoot))
 		cachedUri = mapped
 	})
 
@@ -836,8 +843,10 @@ describe('Project cache-backed documents (#1483)', () => {
 			'worldgen/configured_feature',
 			['minecraft:cache_open_changed'],
 		).symbol
-		assert.ok(original?.definition?.some(({ uri }) => uri === OriginalConfiguredFeatureUri))
-		assert.ok(changed?.definition?.some(({ uri }) => uri === ChangedConfiguredFeatureUri))
+		assert.ok(original)
+		assert.ok(changed)
+		assert.ok(original.definition?.some(({ uri }) => uri === OriginalConfiguredFeatureUri))
+		assert.ok(changed.definition?.some(({ uri }) => uri === ChangedConfiguredFeatureUri))
 		assert.ok(original.reference?.some(({ uri }) => uri === PlacedFeatureUri))
 
 		const changedContent = placedFeatureContent.replace(

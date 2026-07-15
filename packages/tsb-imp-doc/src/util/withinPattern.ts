@@ -234,9 +234,9 @@ export function clearVisibility(symbol: Symbol): void {
 	delete impDoc.privateOwner
 
 	if (Object.keys(impDoc).length === 0) {
-		delete root.impDoc
+		delete root['impDoc']
 	} else {
-		root.impDoc = impDoc
+		root['impDoc'] = impDoc
 	}
 
 	symbol.data = root

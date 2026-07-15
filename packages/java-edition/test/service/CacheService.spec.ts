@@ -166,7 +166,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		assert.equal(cache.version, 9)
 		for (const key of ['contextHash', 'initializerHash', 'lintHash'] as const) {
 			const hash = cache[key]
-			assert.equal(typeof hash, 'string')
+			assert.ok(typeof hash === 'string')
 			assert.match(hash, /^[0-9a-f]{40}$/)
 		}
 		const rawHash = createHash('sha1').update(BinaryPngBytes).digest('hex')
@@ -372,7 +372,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 				usage: { type: 'declaration' },
 			})
 			project.cacheService.checksums.roots[project.projectRoots[0]] = 'stale-root'
-			project.cacheService.checksums.symbolRegistrars.stale = 'stale-registrar'
+			project.cacheService.checksums.symbolRegistrars['stale'] = 'stale-registrar'
 			assert.ok(project.symbols.lookup('fixture', ['stale-initializer-symbol']).symbol)
 
 			project.cacheService.invalidatePartial('initializer', [])

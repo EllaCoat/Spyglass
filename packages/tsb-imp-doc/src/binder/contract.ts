@@ -139,9 +139,9 @@ export function clearContract(symbol: Symbol): void {
 	const impDoc: ImpDocSymbolData = { ...previous }
 	delete impDoc.contract
 	if (Object.keys(impDoc).length === 0) {
-		delete root.impDoc
+		delete root['impDoc']
 	} else {
-		root.impDoc = impDoc
+		root['impDoc'] = impDoc
 	}
 	symbol.data = root
 }

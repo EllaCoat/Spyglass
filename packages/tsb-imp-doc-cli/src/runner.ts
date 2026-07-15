@@ -238,8 +238,8 @@ function createConfig(overrides: Record<string, unknown> | undefined): core.Conf
 		delete lint[rule]
 	}
 	if (
-		!(overrides?.lint && typeof overrides.lint === 'object'
-			&& ImpDocPrivateRule in overrides.lint)
+		!(overrides?.['lint'] && typeof overrides['lint'] === 'object'
+			&& ImpDocPrivateRule in overrides['lint'])
 	) {
 		lint[ImpDocPrivateRule] = 'error'
 	}
@@ -305,16 +305,16 @@ function isResultCache(value: unknown, expectedContextHash: string): value is Re
 	if (!isRecord(value)) {
 		return false
 	}
-	const generation = value.generation
-	return value.version === CacheVersion
-		&& value.contextHash === expectedContextHash
+	const generation = value['generation']
+	return value['version'] === CacheVersion
+		&& value['contextHash'] === expectedContextHash
 		&& Number.isSafeInteger(generation)
 		&& (generation as number) > 0
-		&& typeof value.filesScanned === 'number'
-		&& isRecord(value.symbols)
-		&& isPerFileManifest(value.manifest, generation as number)
-		&& isDependencyGraph(value.graph, generation as number)
-		&& isDependencyGraphConsistent(value.graph, value.manifest)
+		&& typeof value['filesScanned'] === 'number'
+		&& isRecord(value['symbols'])
+		&& isPerFileManifest(value['manifest'], generation as number)
+		&& isDependencyGraph(value['graph'], generation as number)
+		&& isDependencyGraphConsistent(value['graph'], value['manifest'])
 }
 
 async function readCacheSnapshot(
@@ -707,7 +707,7 @@ export async function runImpDocLint(
 					const err = new core.LinterErrorReporter(
 						ImpDocPrivateRule,
 						lintValue.ruleSeverity,
-						projectData.ctx.errorSource,
+						projectData.ctx['errorSource'],
 					)
 					const ctx = core.LinterContext.create(projectData, {
 						doc: state.doc,
