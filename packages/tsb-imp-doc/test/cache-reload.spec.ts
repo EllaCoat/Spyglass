@@ -171,7 +171,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 	})
 
 	afterEach(async () => {
-		await rm(cacheDir, { recursive: true, force: true })
+		await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 	})
 
 	it('reuses cache when initializer context matches', async () => {

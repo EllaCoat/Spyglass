@@ -128,7 +128,7 @@ describe('incremental runner cache', () => {
 	})
 
 	afterEach(async () => {
-		await rm(projectDir, { recursive: true, force: true })
+		await rm(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 	})
 
 	async function run() {
@@ -225,31 +225,37 @@ describe('incremental runner cache', () => {
 		assert.equal(result.filesProcessed, 3)
 	})
 
-	it('uses raw-byte cache tokens and permits only one writer for a shared token', async () => {
-		const first = Buffer.from([0x80])
-		const second = Buffer.from([0x81])
-		assert.equal(first.toString('utf8'), second.toString('utf8'))
-		assert.notEqual(rawCacheToken(first), rawCacheToken(second))
+	it(
+		'uses raw-byte tokens and permits only one process-local writer for a shared token',
+		{ timeout: 2_000 },
+		async () => {
+			const first = Buffer.from([0x80])
+			const second = Buffer.from([0x81])
+			assert.equal(first.toString('utf8'), second.toString('utf8'))
+			assert.notEqual(rawCacheToken(first), rawCacheToken(second))
 
-		await writeFile(cachePath, first)
-		const expectedToken = rawCacheToken(first)
-		await writeFile(cachePath, second)
-		assert.equal(
-			await writeCacheAtomically(cachePath, expectedToken, '{"replacement":true}'),
-			false,
-		)
-		assert.deepEqual(await readFile(cachePath), second)
+			await writeFile(cachePath, first)
+			const expectedToken = rawCacheToken(first)
+			await writeFile(cachePath, second)
+			assert.equal(
+				await writeCacheAtomically(cachePath, expectedToken, '{"replacement":true}'),
+				false,
+			)
+			assert.deepEqual(await readFile(cachePath), second)
 
-		const sharedToken = rawCacheToken(second)
-		const replacements = ['{"writer":1}', '{"writer":2}']
-		const results = await Promise.all(
-			replacements.map(content => writeCacheAtomically(cachePath, sharedToken, content)),
-		)
-		assert.deepEqual([...results].sort(), [false, true])
-		assert.ok(replacements.includes(await readFile(cachePath, 'utf8')))
-		assert.equal(
-			(await readdir(projectDir)).some(name => name.endsWith('.tmp') || name.endsWith('.lock')),
-			false,
-		)
-	})
+			const sharedToken = rawCacheToken(second)
+			const replacements = ['{"writer":1}', '{"writer":2}']
+			const results = await Promise.all(
+				replacements.map(content => writeCacheAtomically(cachePath, sharedToken, content)),
+			)
+			assert.deepEqual([...results].sort(), [false, true])
+			assert.ok(replacements.includes(await readFile(cachePath, 'utf8')))
+			assert.equal(
+				(await readdir(projectDir)).some(name =>
+					name.endsWith('.tmp') || name.endsWith('.lock')
+				),
+				false,
+			)
+		},
+	)
 })

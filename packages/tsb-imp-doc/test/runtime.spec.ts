@@ -249,7 +249,7 @@ describe('IMP-Doc private visibility runtime', () => {
 	after(async () => {
 		await project?.close()
 		if (cacheDir) {
-			await rm(cacheDir, { recursive: true, force: true })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 		}
 	})
 
@@ -568,7 +568,7 @@ describe('IMP-Doc private visibility runtime — open-order independence (P1b bi
 	after(async () => {
 		await project?.close()
 		if (cacheDir) {
-			await rm(cacheDir, { recursive: true, force: true })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 		}
 	})
 
