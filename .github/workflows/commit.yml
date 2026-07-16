@@ -40,6 +40,8 @@ jobs:
   test-windows:
     name: Test (Windows)
     runs-on: windows-latest
+    # 万一 exit-phase hang が再発しても runner を燃やし続けない防波堤。
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
@@ -55,10 +57,9 @@ jobs:
 
       - run: npm run build
 
-      # Windows で fork 独自 spec (packages/tsb-imp-doc / tsb-imp-doc-cli) が
-      # native binding 系 hang を起こす。 別 issue で追跡、 修正まで一時 skip。
+      # 過去の Windows hang の真因 = Project autosave interval の leak (close 未到達) +
+      # Windows drive letter casing による fixture URI 不一致の 2 段連鎖。 修正済み。
       - run: npm test
-        if: runner.os != 'Windows'
 
   deploy:
     name: Deploy

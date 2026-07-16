@@ -69,7 +69,8 @@ describe('IMP-Doc contract signature help', () => {
 	before(async () => {
 		runtime = await createContractRuntime()
 	})
-	after(async () => await runtime.close())
+	// `runtime` stays unassigned when `before` fails; guard so teardown stays idempotent.
+	after(async () => await runtime?.close())
 
 	it('returns @input args at the ID end, after a space, and at an opening parenthesis', () => {
 		const lines = runtime.caller.content.split('\n')

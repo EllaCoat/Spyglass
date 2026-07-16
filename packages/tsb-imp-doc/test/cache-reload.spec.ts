@@ -9,45 +9,26 @@ import { afterEach, beforeEach, describe, it } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import { getImpDocSymbolData, initialize as initializeImpDoc } from '../lib/index.js'
 
+// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
+// like UriStore does for watched files) so that projectRoots, watcher entries, and
+// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
 const FixtureRoot = core.fileUtil.ensureEndingSlash(
-	new URL('./runtime/private-project/', import.meta.url).toString(),
+	core.normalizeUri(new URL('./runtime/private-project/', import.meta.url).toString()),
 )
 
 const RuntimeFileUris = [
-	new URL(
-		'./runtime/private-project/data/owner/functions/_index.d.mcfunction',
-		import.meta.url,
-	).toString(),
-	new URL(
-		'./runtime/private-project/data/owner/functions/helper.mcfunction',
-		import.meta.url,
-	).toString(),
-	new URL(
-		'./runtime/private-project/data/owner/functions/main.mcfunction',
-		import.meta.url,
-	).toString(),
-	new URL(
-		'./runtime/private-project/data/external/functions/caller.mcfunction',
-		import.meta.url,
-	).toString(),
-	new URL(
-		'./runtime/private-project/data/other/functions/denied.mcfunction',
-		import.meta.url,
-	).toString(),
-	new URL(
-		'./runtime/private-project/data/contract/functions/target.mcfunction',
-		import.meta.url,
-	).toString(),
-	new URL(
-		'./runtime/private-project/data/contract/functions/caller.mcfunction',
-		import.meta.url,
-	).toString(),
-]
+	'./runtime/private-project/data/owner/functions/_index.d.mcfunction',
+	'./runtime/private-project/data/owner/functions/helper.mcfunction',
+	'./runtime/private-project/data/owner/functions/main.mcfunction',
+	'./runtime/private-project/data/external/functions/caller.mcfunction',
+	'./runtime/private-project/data/other/functions/denied.mcfunction',
+	'./runtime/private-project/data/contract/functions/target.mcfunction',
+	'./runtime/private-project/data/contract/functions/caller.mcfunction',
+].map(path => core.normalizeUri(new URL(path, import.meta.url).toString()))
 
-const PackMcmetaUri = new URL(
-	'./runtime/private-project/pack.mcmeta',
-	import.meta.url,
-).toString()
+const PackMcmetaUri = core.normalizeUri(
+	new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
+)
 
 const Commands: je.dependency.McmetaCommands = {
 	type: 'root',
@@ -141,26 +122,35 @@ function createProject(options: RunOptions): core.Project {
 
 async function runFull(options: RunOptions): Promise<void> {
 	const project = createProject(options)
-	await project.init()
-	const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
-	await project.ready({ projectRootsWatcher: watcher })
-	await project.close()
+	try {
+		await project.init()
+		const watcher = new FixtureWatcher([PackMcmetaUri, ...RuntimeFileUris])
+		await project.ready({ projectRootsWatcher: watcher })
+	} finally {
+		await project.close()
+	}
 }
 
+// Captures the restored state and closes the Project before returning, so that a
+// failing assertion in the caller can never skip `close()` and leak the autosave
+// interval (which would keep the single-process test runner alive forever).
 async function runInit(options: RunOptions): Promise<{
 	restoredFileCount: number
 	restoredContractInputCount: number
-	close: () => Promise<void>
 }> {
 	const project = createProject(options)
-	await project.init()
-	const restoredFileCount = Object.keys(
-		project.cacheService.checksums.files,
-	).length
-	const restoredContractInputCount = getImpDocSymbolData(
-		project.symbols.lookup('function', ['contract:target']).symbol?.data,
-	)?.contract?.inputs.length ?? 0
-	return { restoredFileCount, restoredContractInputCount, close: () => project.close() }
+	try {
+		await project.init()
+		const restoredFileCount = Object.keys(
+			project.cacheService.checksums.files,
+		).length
+		const restoredContractInputCount = getImpDocSymbolData(
+			project.symbols.lookup('function', ['contract:target']).symbol?.data,
+		)?.contract?.inputs.length ?? 0
+		return { restoredFileCount, restoredContractInputCount }
+	} finally {
+		await project.close()
+	}
 }
 
 describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
@@ -176,7 +166,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 
 	it('reuses cache when initializer context matches', async () => {
 		await runFull({ cacheDir, pluginVersion: 'v-fixture-1' })
-		const { restoredContractInputCount, restoredFileCount, close } = await runInit({
+		const { restoredContractInputCount, restoredFileCount } = await runInit({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 		})
@@ -185,7 +175,6 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			`Expected cache to restore checksums; got ${restoredFileCount}`,
 		)
 		assert.ok(restoredContractInputCount > 0, 'Expected cached IMP-Doc contract data')
-		await close()
 	})
 
 	it('fingerprints initializer and lint cache context independently', async () => {
@@ -225,7 +214,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 
 	it('drops cache when initializer version changes', async () => {
 		await runFull({ cacheDir, pluginVersion: 'v-fixture-1' })
-		const { restoredFileCount, close } = await runInit({
+		const { restoredFileCount } = await runInit({
 			cacheDir,
 			pluginVersion: 'v-fixture-2',
 		})
@@ -234,7 +223,6 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			0,
 			`Expected cache to be dropped on plugin version change; got ${restoredFileCount}`,
 		)
-		await close()
 	})
 
 	it('drops cache errors and re-lints open documents with the new severity when lint config changes', async () => {
@@ -373,12 +361,11 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			await project.close()
 		}
 
-		const { restoredFileCount, close } = await runInit({
+		const { restoredFileCount } = await runInit({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 			lintLevel: 'warning',
 		})
 		assert.ok(restoredFileCount > 0)
-		await close()
 	})
 })

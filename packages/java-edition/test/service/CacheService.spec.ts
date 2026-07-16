@@ -2,7 +2,7 @@ import * as core from '@spyglassmc/core'
 import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -56,9 +56,15 @@ describe('CacheService binary file hashing (#1706)', () => {
 	let binaryUri: string
 
 	beforeEach(async () => {
-		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-binary-cache-'))
-		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-binary-project-'))
-		binaryUri = pathToFileURL(join(projectDir, 'fixture.png')).toString()
+		// realpath resolves Windows 8.3 short names (e.g. `RUNNER~1` on GitHub Actions runners)
+		// so that fixture URIs match the long form used by Node internally, avoiding
+		// `%7E` vs `~` URL encoding mismatches when cache keys are compared.
+		cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-binary-cache-')))
+		projectDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-binary-project-')))
+		// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
+		// like UriStore does for watched files) so that projectRoots, watcher entries, and
+		// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
+		binaryUri = core.normalizeUri(pathToFileURL(join(projectDir, 'fixture.png')).toString())
 		await writeFile(new URL(binaryUri), BinaryPngBytes)
 	})
 
@@ -75,7 +81,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 			return { binaryFixture: 'v1' }
 		}
 		return new core.Project({
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: { dependencies: [], exclude: [] },
 			}),
@@ -83,7 +91,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 			initializers: [initializer],
 			logger: core.Logger.noop(),
 			projectRoots: [
-				core.fileUtil.ensureEndingSlash(pathToFileURL(projectDir).toString()),
+				core.fileUtil.ensureEndingSlash(
+					core.normalizeUri(pathToFileURL(projectDir).toString()),
+				),
 			],
 		})
 	}
@@ -133,7 +143,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 			assert.equal(
 				second.cacheService.checksums.files[binaryUri],
 				expectedHash,
-				'Persisted checksum must hash the raw bytes',
+				`Persisted checksum must hash the raw bytes. binaryUri=${binaryUri} keys=${
+					JSON.stringify(Object.keys(second.cacheService.checksums.files))
+				}`,
 			)
 
 			let changedFiles: string[] | undefined

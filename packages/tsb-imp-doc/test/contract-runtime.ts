@@ -8,20 +8,29 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { initialize as initializeImpDoc } from '../lib/index.js'
 
+// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
+// like UriStore does for watched files) so that projectRoots, watcher entries, and
+// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
 const FixtureRoot = core.fileUtil.ensureEndingSlash(
-	new URL('./runtime/private-project/', import.meta.url).toString(),
+	core.normalizeUri(new URL('./runtime/private-project/', import.meta.url).toString()),
 )
-const PackMcmeta = new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString()
+const PackMcmeta = core.normalizeUri(
+	new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
+)
 
 export const ContractRuntimeFiles = {
-	target: new URL(
-		'./runtime/private-project/data/contract/functions/target.mcfunction',
-		import.meta.url,
-	).toString(),
-	caller: new URL(
-		'./runtime/private-project/data/contract/functions/caller.mcfunction',
-		import.meta.url,
-	).toString(),
+	target: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/contract/functions/target.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	caller: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/contract/functions/caller.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
 } as const
 
 const Commands: je.dependency.McmetaCommands = {
@@ -87,46 +96,57 @@ export async function createContractRuntime(): Promise<ContractRuntime> {
 		const impDoc = (await initializeImpDoc(ctx)) ?? {}
 		return { ...impDoc, loadedVersion: '1.20.4', errorSource: '1.20.4' }
 	}
-	const service = new core.Service({
-		logger: {
-			error: () => {},
-			info: () => {},
-			log: () => {},
-			warn: () => {},
-		},
-		project: {
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
-			defaultConfig: createConfig(),
-			externals: NodeJsExternals,
-			initializers: [initialize],
-			projectRoots: [FixtureRoot],
-		},
-	})
+	let service: core.Service | undefined
+	try {
+		service = new core.Service({
+			logger: {
+				error: () => {},
+				info: () => {},
+				log: () => {},
+				warn: () => {},
+			},
+			project: {
+				cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+				defaultConfig: createConfig(),
+				externals: NodeJsExternals,
+				initializers: [initialize],
+				projectRoots: [FixtureRoot],
+			},
+		})
 
-	await service.project.init()
-	await service.project.ready({
-		projectRootsWatcher: new ContractFixtureWatcher([
-			PackMcmeta,
-			...Object.values(ContractRuntimeFiles),
-		]),
-	})
+		await service.project.init()
+		await service.project.ready({
+			projectRootsWatcher: new ContractFixtureWatcher([
+				PackMcmeta,
+				...Object.values(ContractRuntimeFiles),
+			]),
+		})
 
-	const states = {} as Record<'target' | 'caller', core.DocAndNode & { content: string }>
-	for (const name of ['target', 'caller'] as const) {
-		const uri = ContractRuntimeFiles[name]
-		const content = await readFile(new URL(uri), 'utf8')
-		await service.project.onDidOpen(uri, 'mcfunction', 1, content)
-		const result = service.project.getClientManaged(uri)
-		assert.ok(result)
-		states[name] = { ...result, content }
-	}
+		const states = {} as Record<'target' | 'caller', core.DocAndNode & { content: string }>
+		for (const name of ['target', 'caller'] as const) {
+			const uri = ContractRuntimeFiles[name]
+			const content = await readFile(new URL(uri), 'utf8')
+			await service.project.onDidOpen(uri, 'mcfunction', 1, content)
+			const result = service.project.getClientManaged(uri)
+			assert.ok(result)
+			states[name] = { ...result, content }
+		}
 
-	return {
-		service,
-		...states,
-		close: async () => {
-			await service.project.close()
-			await rm(cacheDir, { recursive: true, force: true })
-		},
+		const createdService = service
+		return {
+			service: createdService,
+			...states,
+			close: async () => {
+				await createdService.project.close()
+				await rm(cacheDir, { recursive: true, force: true })
+			},
+		}
+	} catch (e) {
+		// The factory must reclaim the partially initialized Project and the temp dir
+		// itself: a failure here means the caller never receives the close callback,
+		// and a leaked Project would otherwise keep the test process alive.
+		await service?.project.close().catch(() => {})
+		await rm(cacheDir, { recursive: true, force: true }).catch(() => {})
+		throw e
 	}
 }

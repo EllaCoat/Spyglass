@@ -1,7 +1,7 @@
 /* istanbul ignore file */
 
 import type { DecompressedFile, Externals, Logger } from '../common/index.js'
-import { getSha1, Uri } from '../common/index.js'
+import { getSha1, normalizeUri, Uri } from '../common/index.js'
 import { TwoWayMap } from '../common/TwoWayMap.js'
 import type { Dependency } from './Dependency.js'
 import type { RootUriString } from './fileUtil.js'
@@ -61,8 +61,11 @@ export interface FileService extends UriProtocolSupporter {
 
 export namespace FileService {
 	export function create(externals: Externals, cacheRoot: RootUriString): FileService {
+		// Normalize the root (lowercasing Windows drive letters) so that physical URIs derived
+		// from it stay in the same canonical form as the normalized URIs used for lookups.
+		// See #1483.
 		const virtualUrisRoot = fileUtil.ensureEndingSlash(
-			new Uri('virtual-uris/', cacheRoot).toString(),
+			normalizeUri(new Uri('virtual-uris/', cacheRoot).toString()),
 		)
 		return new FileServiceImpl(externals, virtualUrisRoot)
 	}
@@ -74,11 +77,18 @@ export class FileServiceImpl implements FileService {
 	 * A two-way map from mapped physical URIs to virtual URIs.
 	 */
 	private readonly map = new TwoWayMap<string, string>()
+	private readonly virtualUrisRoot?: RootUriString
 
 	constructor(
 		private readonly externals: Externals,
-		private readonly virtualUrisRoot?: RootUriString,
-	) {}
+		virtualUrisRoot?: RootUriString,
+	) {
+		// Keep the root in canonical form even when constructed directly, so that map keys
+		// stored by mapToDisk() match the normalized URIs looked up by mapFromDisk(). See #1483.
+		this.virtualUrisRoot = virtualUrisRoot === undefined
+			? undefined
+			: fileUtil.ensureEndingSlash(normalizeUri(virtualUrisRoot))
+	}
 
 	register(protocol: Protocol, supporter: UriProtocolSupporter, force = false): void {
 		if (!force && this.supporters.has(protocol)) {
@@ -142,9 +152,13 @@ export class FileServiceImpl implements FileService {
 		try {
 			let mappedUri = this.map.getKey(virtualUri)
 			if (mappedUri === undefined) {
-				mappedUri = `${this.virtualUrisRoot}${await getSha1(virtualUri)}/${
-					fileUtil.basename(virtualUri)
-				}`
+				// Normalize so the stored and returned physical URI matches the canonical form
+				// used for mapFromDisk() lookups. See #1483.
+				mappedUri = normalizeUri(
+					`${this.virtualUrisRoot}${await getSha1(virtualUri)}/${
+						fileUtil.basename(virtualUri)
+					}`,
+				)
 
 				// Delete old mapped file if it exists. This makes sure the
 				// readonly permission on the file is not removed by it being
@@ -172,7 +186,7 @@ export class FileServiceImpl implements FileService {
 		if (!this.virtualUrisRoot) {
 			return mappedUri
 		}
-		return this.map.get(mappedUri) ?? mappedUri
+		return this.map.get(normalizeUri(mappedUri)) ?? mappedUri
 	}
 }
 
