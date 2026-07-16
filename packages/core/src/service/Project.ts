@@ -336,6 +336,10 @@ export class Project extends EventDispatcher<{
 		this.logger.info(`[Project] [init] cacheRoot = ${this.#cacheRoot}`)
 		this.logger.info(`[Project] [init] projectRoots = ${projectRoots.join(' ')}`)
 
+		// Config updates do not go through the `#resetGeneration` barrier: `applyConfigUpdate`
+		// calls `resetOnce` directly and never coalesces with manual `reset()` calls. Both
+		// still run serially in `enqueueLifecycle` (FIFO) order, so a config update and a
+		// manual reset cannot interleave.
 		this.#configService.on('changed', ({ config }) => {
 			this.#configUpdatePromise = this.enqueueLifecycle(() => this.applyConfigUpdate(config))
 				.catch(e => this.logger.error('[Project] [Config] Failed applying update', e))
@@ -559,6 +563,13 @@ export class Project extends EventDispatcher<{
 		return this.#reinitializationPromise
 	}
 
+	/**
+	 * Coalescing loop behind {@link scheduleReinitialization}, mirroring {@link drainResets} but
+	 * on the independent `#reinitializationGeneration` barrier: reinitializations only coalesce
+	 * with each other, never with resets, and the two kinds serialize solely via
+	 * `enqueueLifecycle` (FIFO) order. Unlike `drainResets` it returns whether the last pass
+	 * changed the cache context, which is why the two drains stay separate implementations.
+	 */
 	private async drainReinitializations(): Promise<boolean> {
 		let lastError: unknown
 		let contextChanged = false
@@ -882,7 +893,14 @@ export class Project extends EventDispatcher<{
 		await readyPromise
 	}
 
-	/** Schedule a complete project cache reset behind other project lifecycle operations. */
+	/**
+	 * Schedule a complete project cache reset behind other project lifecycle operations.
+	 *
+	 * Concurrent calls coalesce through the `#resetGeneration` counter: each call bumps the
+	 * generation and awaits the single in-flight {@link drainResets} pass instead of enqueueing
+	 * another lifecycle operation. Resets requested while a drain is already rebuilding are
+	 * absorbed by the next loop iteration, which jumps straight to the latest generation.
+	 */
 	async reset(): Promise<void> {
 		this.#resetGeneration += 1
 		if (!this.#resetPromise) {
@@ -902,6 +920,13 @@ export class Project extends EventDispatcher<{
 		await this.reset()
 	}
 
+	/**
+	 * Coalescing loop behind {@link reset}: snapshot `#resetGeneration`, run one full rebuild,
+	 * then mark the snapshot as processed. Resets requested mid-rebuild raise the generation and
+	 * cost exactly one extra iteration against the latest state. This counter only serializes
+	 * reset barriers; it is unrelated to `CacheService`'s `#hashUpdateGeneration`, which guards
+	 * save atomicity.
+	 */
 	private async drainResets(): Promise<void> {
 		let lastError: unknown
 		while (this.#processedResetGeneration < this.#resetGeneration) {
@@ -955,6 +980,18 @@ export class Project extends EventDispatcher<{
 		return diagnostics
 	}
 
+	/**
+	 * Apply a changed config, rebuilding the project when the cache context fingerprint changed.
+	 *
+	 * The prepared context reports `changedHashKinds`, but it is intentionally unused here: a
+	 * config change always goes through a full {@link resetOnce} to keep initializer state
+	 * consistent and avoid partial-invalidation corner cases. Narrowing lint-only changes to
+	 * `CacheService#invalidatePartial` is tracked separately on the project board
+	 * ("[fork] cache transaction ..." item).
+	 *
+	 * This path does not bump `#resetGeneration`, so it never coalesces with manual
+	 * {@link reset} calls; the two are serialized only by `enqueueLifecycle` (FIFO) order.
+	 */
 	private async applyConfigUpdate(config: Config): Promise<void> {
 		const oldConfig = this.config
 		this.config = config
