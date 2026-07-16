@@ -320,7 +320,7 @@ export class Project extends EventDispatcher<{
 		this.isDebugging = isDebugging
 		this.logger = logger
 		this.profilers = profilers
-		this.projectRoots = projectRoots
+		this.projectRoots = projectRoots.map((r) => fileUtil.ensureEndingSlash(normalizeUri(r)))
 
 		this.cacheService = new CacheService(this.#cacheRoot, this)
 		this.#configService = new ConfigService(this, defaultConfig)

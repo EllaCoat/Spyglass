@@ -75,7 +75,10 @@ describe('CacheService binary file hashing (#1706)', () => {
 		])
 	})
 
-	function createProject(externals: core.Externals = NodeJsExternals): core.Project {
+	function createProject(
+		externals: core.Externals = NodeJsExternals,
+		extraProjectRoot?: core.RootUriString,
+	): core.Project {
 		const initializer: core.ProjectInitializer = ({ meta }) => {
 			meta.registerLanguage('png', { extensions: ['.png'] })
 			return { binaryFixture: 'v1' }
@@ -94,6 +97,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 				core.fileUtil.ensureEndingSlash(
 					core.normalizeUri(pathToFileURL(projectDir).toString()),
 				),
+				...extraProjectRoot ? [extraProjectRoot] : [],
 			],
 		})
 	}
@@ -161,6 +165,35 @@ describe('CacheService binary file hashing (#1706)', () => {
 
 			assert.deepEqual(changedFiles, [])
 			assert.deepEqual(unchangedFiles, [binaryUri])
+		} finally {
+			await second.close()
+		}
+	})
+
+	it('hits the cache across casing/encoding variants of the same projectRoot', async () => {
+		// The symbol cache file name is a hash over projectRoots. Both raw forms below
+		// canonicalize to file:///c:/variant-root/ in the Project constructor, so the second
+		// session finds the cache saved by the first one even though the client changed how
+		// it encodes the drive-letter colon. The synthetic extra root never has to exist on
+		// disk: it only participates in config lookup (ENOENT tolerated) and the name hash.
+		const first = createProject(NodeJsExternals, 'file:///C:/variant-root/')
+		try {
+			await readyProject(first)
+		} finally {
+			await first.close()
+		}
+
+		const second = createProject(NodeJsExternals, 'file:///c%3a/variant-root/')
+		try {
+			await second.init()
+			assert.deepEqual([...second.projectRoots], [...first.projectRoots])
+			const rawBytes = await second.externals.fs.readFile(binaryUri)
+			const expectedHash = createHash('sha1').update(rawBytes).digest('hex')
+			assert.equal(
+				second.cacheService.checksums.files[binaryUri],
+				expectedHash,
+				'Metadata saved under the canonical hash must be found by the other variant',
+			)
 		} finally {
 			await second.close()
 		}
