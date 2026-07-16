@@ -401,7 +401,7 @@ describe('IMP-Doc private visibility runtime', () => {
 			getImpDocSymbolData(storageSymbol.data)?.declaration?.owner,
 			owner,
 		)
-		project.onDidClose(uri)
+		await project.onDidClose(uri)
 	})
 
 	it('keeps the header @private when a following declaration doc is public', () => {

@@ -21,6 +21,7 @@ const initialContent = 'execute as @a run say hello world'
 const getLanguage = () => $language.selectedOptions[0]?.dataset?.['language'] ?? $language.value
 const getContent = (state: EditorState) => view.state.sliceDoc(0)
 let version = 0
+let langChangeChain: Promise<void> = Promise.resolve()
 
 const service = new core.Service({
 	logger: console,
@@ -208,9 +209,19 @@ const view = new EditorView({
 // 	service.project.onDidChange($uri.value, [{ text: $text.value }], ++version)
 // }
 
-$language.onchange = async () => {
-	service.project.onDidClose($uri.value)
-	$uri.value = `file:///root/foo.${$language.value}`
+$language.onchange = () => {
+	const oldUri = $uri.value
+	const nextUri = `file:///root/foo.${$language.value}`
+	const lang = getLanguage()
+	const content = getContent(view.state)
 	version = 0
-	await service.project.onDidOpen($uri.value, getLanguage(), version, getContent(view.state))
+	$uri.value = nextUri
+	langChangeChain = langChangeChain.then(async () => {
+		try {
+			await service.project.onDidClose(oldUri)
+			await service.project.onDidOpen(nextUri, lang, version, content)
+		} catch (err) {
+			console.error(err)
+		}
+	})
 }
