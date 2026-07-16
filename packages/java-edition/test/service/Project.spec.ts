@@ -902,6 +902,313 @@ describe('Project cache reset (#1975)', () => {
 	})
 })
 
+describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', () => {
+	// Helpers are deliberately duplicated from the describes above: fixture helpers stay local
+	// to their describe, and no new fixtures are introduced.
+	const fixtureRoot = core.fileUtil.ensureEndingSlash(
+		core.normalizeUri(new URL('./fixture/reset-project-cache/', import.meta.url).toString()),
+	)
+	const fixtureFiles = {
+		pack: core.normalizeUri(
+			new URL('./fixture/reset-project-cache/pack.mcmeta', import.meta.url).toString(),
+		),
+		caller: core.normalizeUri(
+			new URL(
+				'./fixture/reset-project-cache/data/example/functions/a.mcfunction',
+				import.meta.url,
+			).toString(),
+		),
+		callee: core.normalizeUri(
+			new URL(
+				'./fixture/reset-project-cache/data/example/functions/b.mcfunction',
+				import.meta.url,
+			).toString(),
+		),
+	} as const
+	const commands: je.dependency.McmetaCommands = {
+		type: 'root',
+		children: {
+			function: {
+				type: 'literal',
+				children: {
+					name: {
+						type: 'argument',
+						parser: 'minecraft:function',
+						executable: true,
+					},
+				},
+			},
+		},
+	}
+	type RaceHooks = {
+		beforeCacheWrite?: () => Promise<void>
+		beforeCheck?: (uri: string) => Promise<void>
+	}
+
+	async function createPackFormatRaceProject(
+		onInitialize: (format: number) => Promise<void> | void,
+	): Promise<{
+		cacheDir: string
+		packMcmetaUri: string
+		project: core.Project
+		projectDir: string
+	}> {
+		// realpath resolves Windows 8.3 short names and normalizeUri canonicalizes URI forms;
+		// see 'Project pack format reinitialization (#1212)' above.
+		const cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-race-cache-')))
+		const projectDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-race-project-')))
+		const packMcmetaUri = core.normalizeUri(
+			new URL('pack.mcmeta', pathToFileURL(`${projectDir}/`)).toString(),
+		)
+		await copyFile(new URL('./format-6/pack.mcmeta', FixtureRoot), new URL(packMcmetaUri))
+		const initializer: core.ProjectInitializer = async (ctx) => {
+			const packs = await getProjectPacks(ctx)
+			const format = packs.find(pack => pack.packRoot === core.fileUtil.dirname(packMcmetaUri))
+				?.format
+			assert.ok(format !== undefined)
+			await onInitialize(format)
+			json.getInitializer()(ctx)
+			ctx.meta.registerSymbolRegistrar('pack-format-fixture', {
+				checksum: `${format}`,
+				registrar: (symbols) => {
+					symbols.query(packMcmetaUri, 'pack_format', `${format}`).enter({
+						usage: { type: 'declaration' },
+					})
+				},
+			})
+			return getPackFormatContext(packs)
+		}
+		const project = new core.Project({
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
+			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
+				env: { dependencies: [], exclude: [] },
+			}),
+			externals: NodeJsExternals,
+			initializers: [initializer],
+			logger: core.Logger.noop(),
+			projectRoots: [
+				core.fileUtil.ensureEndingSlash(
+					core.normalizeUri(pathToFileURL(projectDir).toString()),
+				),
+			],
+		})
+		return { cacheDir, packMcmetaUri, project, projectDir }
+	}
+
+	async function createResetRaceProject(hooks: RaceHooks): Promise<{
+		cacheDir: string
+		project: core.Project
+	}> {
+		const cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-race-reset-cache-')))
+		const initializer: core.ProjectInitializer = (ctx) => {
+			ctx.meta.registerUriBinder(je.binder.uriBinder)
+			je.mcf.initialize(ctx, commands, '1.20.4')
+			ctx.meta.registerBinder(
+				'file',
+				core.AsyncBinder.create(async (node, binderCtx) => {
+					await Promise.all(
+						(node.children ?? []).map(child => core.binder.fallback(child, binderCtx)),
+					)
+				}),
+			)
+			ctx.meta.registerChecker('file', async (node, checkerCtx) => {
+				await hooks.beforeCheck?.(checkerCtx.doc.uri)
+				await Promise.all(
+					(node.children ?? []).map(child => core.checker.fallback(child, checkerCtx)),
+				)
+			})
+			return { loadedVersion: '1.20.4', errorSource: '1.20.4' }
+		}
+		// `CacheService#saveOnce` exposes no seam between taking its generation snapshot and the
+		// second `isSaveSnapshotCurrent` check, so the temporary cache file write is intercepted
+		// at the externals level to hold a save in-flight.
+		const externals: core.Externals = {
+			...NodeJsExternals,
+			fs: {
+				...NodeJsExternals.fs,
+				writeFile: async (location, data, options) => {
+					await hooks.beforeCacheWrite?.()
+					return NodeJsExternals.fs.writeFile(location, data, options)
+				},
+			},
+		}
+		const project = new core.Project({
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
+			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
+				env: { dependencies: [], exclude: [], gameVersion: '1.20.4' },
+			}),
+			externals,
+			initializers: [initializer],
+			logger: core.Logger.noop(),
+			projectRoots: [fixtureRoot],
+		})
+		return { cacheDir, project }
+	}
+
+	it('runs a reset scheduled during an active reinitialization after it, without interleaving', async () => {
+		let initializationCount = 0
+		const reinitializationStarted = Promise.withResolvers<void>()
+		const releaseReinitialization = Promise.withResolvers<void>()
+		const { cacheDir, packMcmetaUri, project, projectDir } = await createPackFormatRaceProject(
+			async () => {
+				initializationCount += 1
+				if (initializationCount === 2) {
+					reinitializationStarted.resolve()
+					await releaseReinitialization.promise
+				}
+			},
+		)
+		try {
+			await project.init()
+			await project.ready({ projectRootsWatcher: new FixtureWatcher(packMcmetaUri) })
+			await copyFile(new URL('./format-42/pack.mcmeta', FixtureRoot), new URL(packMcmetaUri))
+
+			const eventOrder: string[] = []
+			project.on('reinitialized', ({ contextChanged }) => {
+				eventOrder.push(`reinitialized:${contextChanged}`)
+			}).on('ready', () => {
+				eventOrder.push('ready')
+			})
+
+			const reinitialization = project.reinitialize()
+			await reinitializationStarted.promise
+			const reset = project.reset()
+			await new Promise<void>(resolve => setImmediate(resolve))
+			// `#resetGeneration` and `#reinitializationGeneration` are independent barriers, so
+			// the reset must stay queued in `enqueueLifecycle` FIFO order behind the gated
+			// reinitialization instead of interleaving with it (see `drainReinitializations`).
+			assert.deepEqual(eventOrder, [])
+			releaseReinitialization.resolve()
+			await Promise.all([reinitialization, reset])
+
+			// The reinitialization publishes its own rebuild ('ready', then 'reinitialized')
+			// before the queued reset runs its full rebuild.
+			assert.deepEqual(eventOrder, ['ready', 'reinitialized:true', 'ready'])
+			// Coalescing stays per-barrier: the queued reset must not re-run initializers.
+			assert.equal(initializationCount, 2)
+			assert.ok(project.symbols.lookup('pack_format', ['42']).symbol)
+			assert.equal(project.symbols.lookup('pack_format', ['6']).symbol, undefined)
+		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting for a lifecycle drain that never completes.
+			releaseReinitialization.resolve()
+			await project.close()
+			await Promise.all([
+				rm(cacheDir, { recursive: true, force: true }),
+				rm(projectDir, { recursive: true, force: true }),
+			])
+		}
+	})
+
+	it('skips a stale save when a reset advances the hash generation mid-flight', async () => {
+		const hooks: RaceHooks = {}
+		// Declared before `try` so the `finally` release below can reach it (see the finally
+		// note); the closure in `hooks.beforeCacheWrite` captures it either way.
+		const releaseSaveWrite = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+
+			const saveWriteStarted = Promise.withResolvers<void>()
+			let shouldBlockWrite = true
+			hooks.beforeCacheWrite = async () => {
+				if (shouldBlockWrite) {
+					shouldBlockWrite = false
+					saveWriteStarted.resolve()
+					await releaseSaveWrite.promise
+				}
+			}
+			const save = project.cacheService.save()
+			// The save now holds its `#hashUpdateGeneration` snapshot and is blocked between the
+			// two `isSaveSnapshotCurrent` checks of `CacheService#saveOnce`.
+			await saveWriteStarted.promise
+			// `CacheService#reset` bumps the generation, invalidating the in-flight snapshot.
+			await project.reset()
+			releaseSaveWrite.resolve()
+			assert.equal(await save, false)
+			// The next save takes a fresh snapshot of the post-reset state and persists it.
+			assert.equal(await project.cacheService.save(), true)
+		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked save write.
+			releaseSaveWrite.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('serializes a manual reset behind an in-flight config update, both completing without coalescing', async () => {
+		const hooks: RaceHooks = {}
+		// Declared before `try` so the `finally` release below can reach it (see the finally
+		// note); the closure in `hooks.beforeCheck` captures it either way.
+		const releaseRebuild = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+			// The checker gate only fires for client-managed documents, so open the caller
+			// before racing the rebuilds (see `rebindAndCheckClientManaged`).
+			await project.onDidOpen(
+				fixtureFiles.caller,
+				'mcfunction',
+				1,
+				await readFile(new URL(fixtureFiles.caller), 'utf8'),
+			)
+
+			const eventOrder: string[] = []
+			project.on('configChanged', () => {
+				eventOrder.push('configChanged')
+			}).on('ready', () => {
+				eventOrder.push('ready')
+			})
+
+			const rebuildStarted = Promise.withResolvers<void>()
+			let shouldBlockCheck = true
+			hooks.beforeCheck = async (uri) => {
+				if (shouldBlockCheck && uri === fixtureFiles.caller) {
+					shouldBlockCheck = false
+					rebuildStarted.resolve()
+					await releaseRebuild.promise
+				}
+			}
+			// A bare severity is tolerated at runtime for `undeclaredSymbol` but is not part
+			// of LinterConfigValue<SymbolLinterConfig>; cast to keep the original runtime value.
+			const configUpdate = project.onEditorConfigurationUpdate(
+				{ lint: { undeclaredSymbol: 'error' } } as unknown as core.PartialConfig,
+			)
+			await rebuildStarted.promise
+			const manualReset = project.reset()
+			await new Promise<void>(resolve => setImmediate(resolve))
+			// `applyConfigUpdate` calls `resetOnce` directly without bumping `#resetGeneration`,
+			// so the manual reset stays queued in `enqueueLifecycle` FIFO order behind the gated
+			// config rebuild (see the `applyConfigUpdate` JSDoc).
+			assert.deepEqual(eventOrder, ['configChanged'])
+			releaseRebuild.resolve()
+			await Promise.all([configUpdate, manualReset])
+
+			// Two separate 'ready' events prove the config rebuild did not absorb the manual
+			// reset: each barrier ran its own full rebuild.
+			assert.deepEqual(eventOrder, ['configChanged', 'ready', 'ready'])
+			assert.equal(project.config.lint.undeclaredSymbol, 'error')
+		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked config rebuild.
+			releaseRebuild.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+})
+
 describe('Project cache-backed documents (#1483)', () => {
 	const VanillaRootUri = 'archive://vanilla-open/' as core.RootUriString
 	const PlacedFeatureUri =

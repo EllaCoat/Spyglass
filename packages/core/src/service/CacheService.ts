@@ -172,6 +172,14 @@ export class CacheService {
 	#activeInitializerHash: string | undefined
 	#activeLintHash: string | undefined
 	readonly #fileContentUpdateTokens = new Map<string, number>()
+	// Monotonic counter bumped on every mutation of cached state (root updates, file tracking,
+	// context commits, partial invalidation, transactions, reset). `saveOnce` snapshots its
+	// value on start and skips publishing when it moved (see `isSaveSnapshotCurrent`), so a
+	// stale snapshot is never published to the final cache file: on mismatch the `.tmp`
+	// staging file is removed in the surrounding `finally` block, not left behind. Only the
+	// narrow TOCTOU window between the final `isSaveSnapshotCurrent` check and the `rename()`
+	// itself is unguarded. Distinct in meaning from `Project`'s `#resetGeneration` /
+	// `#reinitializationGeneration`, which serialize lifecycle barriers.
 	#hashUpdateGeneration = 0
 	#nextHashUpdateToken = 0
 	readonly #pendingHashUpdates = new Set<Promise<void>>()
@@ -532,6 +540,10 @@ export class CacheService {
 	 * Callers may target a subset of files; omitting `uris` invalidates every cached file.
 	 * Initializer invalidation always discards all linked symbols and file-derived state because a
 	 * removed initializer provider cannot identify its former contributions in a new registry.
+	 *
+	 * Boundary with {@link reset}: prefer this method when staleness is scoped to a single hash
+	 * kind (lint or file-derived state), and a full `reset()` when every cache must go. An
+	 * `initializer` change can never stay partial and always takes the clear-all branch below.
 	 */
 	invalidatePartial(
 		hashKind: CacheHashKind,
