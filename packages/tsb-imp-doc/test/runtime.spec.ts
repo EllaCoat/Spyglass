@@ -375,10 +375,12 @@ describe('IMP-Doc private visibility runtime', () => {
 
 	it('resolves a #declare owner registered as a CLI-style declaration', async () => {
 		assert.ok(project)
-		const uri = new URL(
-			'./runtime/private-project/data/cli/functions/owner.mcfunction',
-			import.meta.url,
-		).toString()
+		const uri = core.normalizeUri(
+			new URL(
+				'./runtime/private-project/data/cli/functions/owner.mcfunction',
+				import.meta.url,
+			).toString(),
+		)
 		const owner = 'cli:owner'
 		const content = '#> cli:owner\n# @public\n\n'
 			+ '#> CLI storage\n# @private\n#declare storage cli:data\n'
