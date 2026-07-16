@@ -347,6 +347,9 @@ export class Project extends EventDispatcher<{
 			},
 			CacheAutoSaveInterval,
 		)
+		// Unref the autosave interval on Node.js so that a `Project` never keeps the process
+		// alive on its own. `unref` does not exist on browser interval IDs (numbers).
+		this.#cacheSaverIntervalId.unref?.()
 
 		this.on('documentUpdated', async ({ doc, node }) => {
 			// if (!this.#isReady) {
