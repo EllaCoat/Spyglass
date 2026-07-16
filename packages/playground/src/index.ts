@@ -209,8 +209,10 @@ const view = new EditorView({
 // }
 
 $language.onchange = async () => {
-	service.project.onDidClose($uri.value)
-	$uri.value = `file:///root/foo.${$language.value}`
+	const oldUri = $uri.value
+	const nextUri = `file:///root/foo.${$language.value}`
 	version = 0
-	await service.project.onDidOpen($uri.value, getLanguage(), version, getContent(view.state))
+	$uri.value = nextUri
+	await service.project.onDidClose(oldUri)
+	await service.project.onDidOpen(nextUri, getLanguage(), version, getContent(view.state))
 }
