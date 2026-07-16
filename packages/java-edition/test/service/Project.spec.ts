@@ -443,6 +443,40 @@ describe('Project pack format reinitialization (#1212)', () => {
 	})
 })
 
+describe('Project.cacheRoot canonicalization', () => {
+	// Synthetic `file:` URIs keep these tests independent of the host filesystem: the
+	// constructor and the `cacheRoot` getter never touch the disk, so no Windows runner is
+	// needed to exercise drive-letter variants. Idempotency and the trailing-slash guarantee
+	// of the canonical form are already pinned by the normalizeUri characterization tests in
+	// core/test/common/util.spec.ts.
+	function createMinimalProject(cacheRoot: core.RootUriString): core.Project {
+		return new core.Project({
+			cacheRoot,
+			externals: NodeJsExternals,
+			logger: core.Logger.noop(),
+			projectRoots: [],
+		})
+	}
+
+	it('Should lowercase the Windows drive letter in cacheRoot', async () => {
+		const project = createMinimalProject('file:///C:/cache/')
+		try {
+			assert.equal(project.cacheRoot, 'file:///c:/cache/')
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should decode %3A in cacheRoot', async () => {
+		const project = createMinimalProject('file:///C%3A/cache/')
+		try {
+			assert.equal(project.cacheRoot, 'file:///c:/cache/')
+		} finally {
+			await project.close()
+		}
+	})
+})
+
 describe('Project cache reset (#1975)', () => {
 	const fixtureRoot = core.fileUtil.ensureEndingSlash(
 		core.normalizeUri(new URL('./fixture/reset-project-cache/', import.meta.url).toString()),

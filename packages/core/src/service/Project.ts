@@ -313,7 +313,7 @@ export class Project extends EventDispatcher<{
 		}: ProjectOptions,
 	) {
 		super()
-		this.#cacheRoot = cacheRoot
+		this.#cacheRoot = fileUtil.ensureEndingSlash(normalizeUri(cacheRoot))
 		this.externals = externals
 		this.fs = fs
 		this.#initializers = initializers
@@ -322,13 +322,13 @@ export class Project extends EventDispatcher<{
 		this.profilers = profilers
 		this.projectRoots = projectRoots
 
-		this.cacheService = new CacheService(cacheRoot, this)
+		this.cacheService = new CacheService(this.#cacheRoot, this)
 		this.#configService = new ConfigService(this, defaultConfig)
 		this.symbols = new SymbolUtil({})
 
 		this.#ctx = {}
 
-		this.logger.info(`[Project] [init] cacheRoot = ${cacheRoot}`)
+		this.logger.info(`[Project] [init] cacheRoot = ${this.#cacheRoot}`)
 		this.logger.info(`[Project] [init] projectRoots = ${projectRoots.join(' ')}`)
 
 		this.#configService.on('changed', ({ config }) => {
