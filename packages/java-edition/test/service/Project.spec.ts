@@ -787,7 +787,9 @@ describe('Project cache-backed documents (#1483)', () => {
 			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: {
-					dependencies: [core.fileUtil.ensureEndingSlash(VanillaFixtureRoot.toString())],
+					dependencies: [
+						core.fileUtil.ensureEndingSlash(core.normalizeUri(VanillaFixtureRoot.toString())),
+					],
 					exclude: [],
 				},
 			}),

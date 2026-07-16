@@ -140,7 +140,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 			assert.equal(
 				second.cacheService.checksums.files[binaryUri],
 				expectedHash,
-				'Persisted checksum must hash the raw bytes',
+				`Persisted checksum must hash the raw bytes. binaryUri=${binaryUri} keys=${
+					JSON.stringify(Object.keys(second.cacheService.checksums.files))
+				}`,
 			)
 
 			let changedFiles: string[] | undefined
