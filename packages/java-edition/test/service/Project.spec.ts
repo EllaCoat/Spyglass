@@ -41,7 +41,12 @@ describe('Project pack format reinitialization (#1212)', () => {
 	beforeEach(async () => {
 		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-pack-format-cache-'))
 		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-pack-format-project-'))
-		packMcmetaUri = new URL('pack.mcmeta', pathToFileURL(`${projectDir}/`)).toString()
+		// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
+		// like UriStore does for watched files) so that projectRoots, watcher entries, and
+		// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
+		packMcmetaUri = core.normalizeUri(
+			new URL('pack.mcmeta', pathToFileURL(`${projectDir}/`)).toString(),
+		)
 		await copyPackFormat(6)
 	})
 
@@ -105,7 +110,9 @@ describe('Project pack format reinitialization (#1212)', () => {
 		}
 
 		return new core.Project({
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: { dependencies: [], exclude: [] },
 			}),
@@ -113,7 +120,9 @@ describe('Project pack format reinitialization (#1212)', () => {
 			initializers: [initializer],
 			logger: core.Logger.noop(),
 			projectRoots: [
-				core.fileUtil.ensureEndingSlash(pathToFileURL(projectDir).toString()),
+				core.fileUtil.ensureEndingSlash(
+					core.normalizeUri(pathToFileURL(projectDir).toString()),
+				),
 			],
 		})
 	}
@@ -189,12 +198,15 @@ describe('Project pack format reinitialization (#1212)', () => {
 					{ once: true },
 				)
 			})
+			// No `{ once: true }` on filtered listeners: a first event for another URI would
+			// remove the listener before the matching event arrives, so the promise would
+			// never resolve.
 			const documentUpdated = new Promise<core.DocAndNode>((resolve) => {
 				project.on('documentUpdated', (event) => {
 					if (event.doc.uri === packMcmetaUri) {
 						resolve(event)
 					}
-				}, { once: true })
+				})
 			})
 			const diagnosticsUpdated = new Promise<readonly core.PosRangeLanguageError[]>(
 				(resolve) => {
@@ -202,7 +214,7 @@ describe('Project pack format reinitialization (#1212)', () => {
 						if (uri === packMcmetaUri) {
 							resolve(errors)
 						}
-					}, { once: true })
+					})
 				},
 			)
 			watcher.emit('change', packMcmetaUri)
@@ -370,7 +382,9 @@ describe('Project pack format reinitialization (#1212)', () => {
 	it('discovers and reinitializes packs nested more than three levels deep', async () => {
 		const deepDir = join(projectDir, 'one', 'two', 'three', 'four')
 		await mkdir(deepDir, { recursive: true })
-		const deepPackMcmetaUri = pathToFileURL(join(deepDir, 'pack.mcmeta')).toString()
+		const deepPackMcmetaUri = core.normalizeUri(
+			pathToFileURL(join(deepDir, 'pack.mcmeta')).toString(),
+		)
 		await copyFile(
 			new URL('./format-6/pack.mcmeta', FixtureRoot),
 			new URL(deepPackMcmetaUri),
@@ -385,14 +399,20 @@ describe('Project pack format reinitialization (#1212)', () => {
 			return getPackFormatContext(packs)
 		}
 		const project = new core.Project({
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: { dependencies: [], exclude: [] },
 			}),
 			externals: NodeJsExternals,
 			initializers: [initializer],
 			logger: core.Logger.noop(),
-			projectRoots: [core.fileUtil.ensureEndingSlash(pathToFileURL(projectDir).toString())],
+			projectRoots: [
+				core.fileUtil.ensureEndingSlash(
+					core.normalizeUri(pathToFileURL(projectDir).toString()),
+				),
+			],
 		})
 		const watcher = new FixtureWatcher(deepPackMcmetaUri)
 		try {
@@ -419,18 +439,24 @@ describe('Project pack format reinitialization (#1212)', () => {
 
 describe('Project cache reset (#1975)', () => {
 	const fixtureRoot = core.fileUtil.ensureEndingSlash(
-		new URL('./fixture/reset-project-cache/', import.meta.url).toString(),
+		core.normalizeUri(new URL('./fixture/reset-project-cache/', import.meta.url).toString()),
 	)
 	const fixtureFiles = {
-		pack: new URL('./fixture/reset-project-cache/pack.mcmeta', import.meta.url).toString(),
-		caller: new URL(
-			'./fixture/reset-project-cache/data/example/functions/a.mcfunction',
-			import.meta.url,
-		).toString(),
-		callee: new URL(
-			'./fixture/reset-project-cache/data/example/functions/b.mcfunction',
-			import.meta.url,
-		).toString(),
+		pack: core.normalizeUri(
+			new URL('./fixture/reset-project-cache/pack.mcmeta', import.meta.url).toString(),
+		),
+		caller: core.normalizeUri(
+			new URL(
+				'./fixture/reset-project-cache/data/example/functions/a.mcfunction',
+				import.meta.url,
+			).toString(),
+		),
+		callee: core.normalizeUri(
+			new URL(
+				'./fixture/reset-project-cache/data/example/functions/b.mcfunction',
+				import.meta.url,
+			).toString(),
+		),
 	} as const
 	const commands: je.dependency.McmetaCommands = {
 		type: 'root',
@@ -504,7 +530,9 @@ describe('Project cache reset (#1975)', () => {
 			return { loadedVersion: '1.20.4', errorSource: '1.20.4' }
 		}
 		const project = new core.Project({
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: { dependencies: [], exclude: [], gameVersion: '1.20.4' },
 			}),
@@ -754,7 +782,9 @@ describe('Project cache-backed documents (#1483)', () => {
 		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-project-'))
 		placedFeatureContent = await readFile(PlacedFeatureFixture, 'utf8')
 		project = new core.Project({
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: {
 					dependencies: [core.fileUtil.ensureEndingSlash(VanillaFixtureRoot.toString())],
@@ -765,7 +795,9 @@ describe('Project cache-backed documents (#1483)', () => {
 			initializers: [initializeJavaEditionFixture],
 			logger: core.Logger.noop(),
 			projectRoots: [
-				core.fileUtil.ensureEndingSlash(pathToFileURL(projectDir).toString()),
+				core.fileUtil.ensureEndingSlash(
+					core.normalizeUri(pathToFileURL(projectDir).toString()),
+				),
 				VanillaRootUri,
 			],
 		})
@@ -817,12 +849,14 @@ describe('Project cache-backed documents (#1483)', () => {
 	})
 
 	it('reports cache-backed diagnostics through the physical client URI mapping', async () => {
+		// No `{ once: true }`: a first documentErrored event for another URI would remove
+		// the listener before the matching event arrives.
 		const diagnostics = new Promise<core.PosRangeLanguageError[]>((resolve) => {
 			project.on('documentErrored', ({ errors, uri }) => {
 				if (uri === PlacedFeatureUri) {
 					resolve([...errors])
 				}
-			}, { once: true })
+			})
 		})
 
 		await project.onDidOpen(cachedUri, 'json', 1, '{')

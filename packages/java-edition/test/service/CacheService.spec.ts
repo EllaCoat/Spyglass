@@ -58,7 +58,10 @@ describe('CacheService binary file hashing (#1706)', () => {
 	beforeEach(async () => {
 		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-binary-cache-'))
 		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-binary-project-'))
-		binaryUri = pathToFileURL(join(projectDir, 'fixture.png')).toString()
+		// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
+		// like UriStore does for watched files) so that projectRoots, watcher entries, and
+		// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
+		binaryUri = core.normalizeUri(pathToFileURL(join(projectDir, 'fixture.png')).toString())
 		await writeFile(new URL(binaryUri), BinaryPngBytes)
 	})
 
@@ -75,7 +78,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 			return { binaryFixture: 'v1' }
 		}
 		return new core.Project({
-			cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: { dependencies: [], exclude: [] },
 			}),
@@ -83,7 +88,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 			initializers: [initializer],
 			logger: core.Logger.noop(),
 			projectRoots: [
-				core.fileUtil.ensureEndingSlash(pathToFileURL(projectDir).toString()),
+				core.fileUtil.ensureEndingSlash(
+					core.normalizeUri(pathToFileURL(projectDir).toString()),
+				),
 			],
 		})
 	}
