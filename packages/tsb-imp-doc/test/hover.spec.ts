@@ -12,7 +12,8 @@ describe('IMP-Doc contract hover', () => {
 	before(async () => {
 		runtime = await createContractRuntime()
 	})
-	after(async () => await runtime.close())
+	// `runtime` stays unassigned when `before` fails; guard so teardown stays idempotent.
+	after(async () => await runtime?.close())
 
 	it('includes function, visibility, and contract summary at a function call', () => {
 		const offset = runtime.caller.content.indexOf('contract:target') + 1

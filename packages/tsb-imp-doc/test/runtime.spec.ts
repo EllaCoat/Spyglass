@@ -10,35 +10,50 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { getImpDocSymbolData, ImpDocNode, initialize as initializeImpDoc } from '../lib/index.js'
 
 const Target = 'owner:helper'
+// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
+// like UriStore does for watched files) so that projectRoots, watcher entries, and
+// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
 const FixtureRoot = core.fileUtil.ensureEndingSlash(
-	new URL('./runtime/private-project/', import.meta.url).toString(),
+	core.normalizeUri(new URL('./runtime/private-project/', import.meta.url).toString()),
 )
 
 const RuntimeFiles = {
-	index: new URL(
-		'./runtime/private-project/data/owner/functions/_index.d.mcfunction',
-		import.meta.url,
-	).toString(),
-	helper: new URL(
-		'./runtime/private-project/data/owner/functions/helper.mcfunction',
-		import.meta.url,
-	).toString(),
-	main: new URL(
-		'./runtime/private-project/data/owner/functions/main.mcfunction',
-		import.meta.url,
-	).toString(),
-	external: new URL(
-		'./runtime/private-project/data/external/functions/caller.mcfunction',
-		import.meta.url,
-	).toString(),
-	denied: new URL(
-		'./runtime/private-project/data/other/functions/denied.mcfunction',
-		import.meta.url,
-	).toString(),
-	noHeader: new URL(
-		'./runtime/private-project/data/no_header/functions/caller.mcfunction',
-		import.meta.url,
-	).toString(),
+	index: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/owner/functions/_index.d.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	helper: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/owner/functions/helper.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	main: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/owner/functions/main.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	external: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/external/functions/caller.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	denied: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/other/functions/denied.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	noHeader: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/no_header/functions/caller.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
 } as const
 
 const FunctionIds = {
@@ -198,10 +213,9 @@ describe('IMP-Doc private visibility runtime', () => {
 
 	before(async () => {
 		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-'))
-		const packMcmeta = new URL(
-			'./runtime/private-project/pack.mcmeta',
-			import.meta.url,
-		).toString()
+		const packMcmeta = core.normalizeUri(
+			new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
+		)
 		const watcher = new FixtureWatcher([
 			packMcmeta,
 			...Object.values(RuntimeFiles),
@@ -521,10 +535,9 @@ describe('IMP-Doc private visibility runtime — open-order independence (P1b bi
 
 	before(async () => {
 		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-order-'))
-		const packMcmeta = new URL(
-			'./runtime/private-project/pack.mcmeta',
-			import.meta.url,
-		).toString()
+		const packMcmeta = core.normalizeUri(
+			new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
+		)
 		const watcher = new FixtureWatcher([
 			packMcmeta,
 			...Object.values(RuntimeFiles),
