@@ -2,7 +2,7 @@ import * as core from '@spyglassmc/core'
 import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -56,8 +56,11 @@ describe('CacheService binary file hashing (#1706)', () => {
 	let binaryUri: string
 
 	beforeEach(async () => {
-		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-binary-cache-'))
-		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-binary-project-'))
+		// realpath resolves Windows 8.3 short names (e.g. `RUNNER~1` on GitHub Actions runners)
+		// so that fixture URIs match the long form used by Node internally, avoiding
+		// `%7E` vs `~` URL encoding mismatches when cache keys are compared.
+		cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-binary-cache-')))
+		projectDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-binary-project-')))
 		// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
 		// like UriStore does for watched files) so that projectRoots, watcher entries, and
 		// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.

@@ -3,7 +3,7 @@ import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import * as json from '@spyglassmc/json'
 import * as mcdoc from '@spyglassmc/mcdoc'
 import assert from 'node:assert/strict'
-import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
@@ -39,8 +39,10 @@ describe('Project pack format reinitialization (#1212)', () => {
 	let packMcmetaUri: string
 
 	beforeEach(async () => {
-		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-pack-format-cache-'))
-		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-pack-format-project-'))
+		// realpath resolves Windows 8.3 short names so that fixture URIs match the long
+		// form used by Node internally, avoiding `%7E` vs `~` URL encoding mismatches.
+		cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-pack-format-cache-')))
+		projectDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-pack-format-project-')))
 		// Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
 		// like UriStore does for watched files) so that projectRoots, watcher entries, and
 		// assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
@@ -65,11 +67,15 @@ describe('Project pack format reinitialization (#1212)', () => {
 	}
 
 	async function waitForFileChecksum(project: core.Project, uri: string): Promise<void> {
-		for (let attempt = 0; attempt < 100; attempt += 1) {
+		// Time-based deadline instead of a fixed setImmediate tick count. Slow CI runners
+		// (especially Windows) can miss a 100-tick window when hash updates race against
+		// documentErrored side effects. 5 s covers observed jitter without hiding real hangs.
+		const deadline = Date.now() + 5000
+		while (Date.now() < deadline) {
 			if (project.cacheService.checksums.files[uri] !== undefined) {
 				return
 			}
-			await new Promise<void>(resolve => setImmediate(resolve))
+			await new Promise<void>(resolve => setTimeout(resolve, 20))
 		}
 		assert.fail(`Timed out waiting for checksum of ${uri}`)
 	}
@@ -505,7 +511,7 @@ describe('Project cache reset (#1975)', () => {
 		cacheDir: string
 		project: core.Project
 	}> {
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-reset-cache-'))
+		const cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-reset-cache-')))
 		const initializer: core.ProjectInitializer = (ctx) => {
 			ctx.meta.registerUriBinder(je.binder.uriBinder)
 			je.mcf.initialize(ctx, commands, '1.20.4')
@@ -778,8 +784,8 @@ describe('Project cache-backed documents (#1483)', () => {
 	let projectDir: string
 
 	beforeEach(async () => {
-		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-cache-'))
-		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-project-'))
+		cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-cache-')))
+		projectDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-vanilla-open-project-')))
 		placedFeatureContent = await readFile(PlacedFeatureFixture, 'utf8')
 		project = new core.Project({
 			cacheRoot: core.fileUtil.ensureEndingSlash(
