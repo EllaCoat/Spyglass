@@ -177,8 +177,12 @@ describe('CacheService binary file hashing (#1706)', () => {
 		// it encodes the drive-letter colon. The synthetic extra root never has to exist on
 		// disk: it only participates in config lookup (ENOENT tolerated) and the name hash.
 		const first = createProject(NodeJsExternals, 'file:///C:/variant-root/')
+		// Snapshot the canonical roots before `first.close()`; accessing project state after
+		// `close()` is not part of the public contract.
+		let firstProjectRootsSnapshot: readonly string[] = []
 		try {
 			await readyProject(first)
+			firstProjectRootsSnapshot = [...first.projectRoots]
 		} finally {
 			await first.close()
 		}
@@ -186,7 +190,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		const second = createProject(NodeJsExternals, 'file:///c%3a/variant-root/')
 		try {
 			await second.init()
-			assert.deepEqual([...second.projectRoots], [...first.projectRoots])
+			assert.deepEqual([...second.projectRoots], firstProjectRootsSnapshot)
 			const rawBytes = await second.externals.fs.readFile(binaryUri)
 			const expectedHash = createHash('sha1').update(rawBytes).digest('hex')
 			assert.equal(

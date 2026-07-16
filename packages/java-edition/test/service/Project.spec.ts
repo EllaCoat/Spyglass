@@ -560,7 +560,7 @@ describe('Project.projectRoots canonicalization + defensive copy', () => {
 describe('Project.updateRoots regression (latent bug fixed by canonical projectRoots)', () => {
 	// Before projectRoots were canonicalized in the constructor, `Project#updateRoots`
 	// compared the raw roots against watched files that LspFileWatcher had already
-	// normalized (see core/src/service/LspFileWatcher.ts), so a client sending
+	// normalized (see packages/language-server/src/util/LspFileWatcher.ts), so a client sending
 	// `%3A`-encoded roots never got nested `pack.mcmeta` roots detected. Synthetic URIs
 	// make that mismatch reproducible on every OS; only the cache directory is real so
 	// that init()/ready() and the close()-time cache save have a writable location.
