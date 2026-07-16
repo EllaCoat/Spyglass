@@ -1093,6 +1093,9 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			assert.ok(project.symbols.lookup('pack_format', ['42']).symbol)
 			assert.equal(project.symbols.lookup('pack_format', ['6']).symbol, undefined)
 		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting for a lifecycle drain that never completes.
+			releaseReinitialization.resolve()
 			await project.close()
 			await Promise.all([
 				rm(cacheDir, { recursive: true, force: true }),
@@ -1103,6 +1106,9 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 
 	it('skips a stale save when a reset advances the hash generation mid-flight', async () => {
 		const hooks: RaceHooks = {}
+		// Declared before `try` so the `finally` release below can reach it (see the finally
+		// note); the closure in `hooks.beforeCacheWrite` captures it either way.
+		const releaseSaveWrite = Promise.withResolvers<void>()
 		const { cacheDir, project } = await createResetRaceProject(hooks)
 		try {
 			await project.init()
@@ -1111,7 +1117,6 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			})
 
 			const saveWriteStarted = Promise.withResolvers<void>()
-			const releaseSaveWrite = Promise.withResolvers<void>()
 			let shouldBlockWrite = true
 			hooks.beforeCacheWrite = async () => {
 				if (shouldBlockWrite) {
@@ -1131,6 +1136,9 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			// The next save takes a fresh snapshot of the post-reset state and persists it.
 			assert.equal(await project.cacheService.save(), true)
 		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked save write.
+			releaseSaveWrite.resolve()
 			await project.close()
 			await rm(cacheDir, { recursive: true, force: true })
 		}
@@ -1138,6 +1146,9 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 
 	it('serializes a manual reset behind an in-flight config update, both completing without coalescing', async () => {
 		const hooks: RaceHooks = {}
+		// Declared before `try` so the `finally` release below can reach it (see the finally
+		// note); the closure in `hooks.beforeCheck` captures it either way.
+		const releaseRebuild = Promise.withResolvers<void>()
 		const { cacheDir, project } = await createResetRaceProject(hooks)
 		try {
 			await project.init()
@@ -1161,7 +1172,6 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			})
 
 			const rebuildStarted = Promise.withResolvers<void>()
-			const releaseRebuild = Promise.withResolvers<void>()
 			let shouldBlockCheck = true
 			hooks.beforeCheck = async (uri) => {
 				if (shouldBlockCheck && uri === fixtureFiles.caller) {
@@ -1190,6 +1200,9 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			assert.deepEqual(eventOrder, ['configChanged', 'ready', 'ready'])
 			assert.equal(project.config.lint.undeclaredSymbol, 'error')
 		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked config rebuild.
+			releaseRebuild.resolve()
 			await project.close()
 			await rm(cacheDir, { recursive: true, force: true })
 		}

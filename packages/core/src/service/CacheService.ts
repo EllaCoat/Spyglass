@@ -175,8 +175,10 @@ export class CacheService {
 	// Monotonic counter bumped on every mutation of cached state (root updates, file tracking,
 	// context commits, partial invalidation, transactions, reset). Saves snapshot it on start
 	// and skip persisting when it moved (see `isSaveSnapshotCurrent`), so a stale snapshot is
-	// never written to disk. Distinct in meaning from `Project`'s `#resetGeneration` /
-	// `#reinitializationGeneration`, which serialize lifecycle barriers.
+	// never published to the final cache file (a temporary `.tmp` write may still land on disk
+	// before the mismatch is detected; it is left behind rather than renamed into place).
+	// Distinct in meaning from `Project`'s `#resetGeneration` / `#reinitializationGeneration`,
+	// which serialize lifecycle barriers.
 	#hashUpdateGeneration = 0
 	#nextHashUpdateToken = 0
 	readonly #pendingHashUpdates = new Set<Promise<void>>()

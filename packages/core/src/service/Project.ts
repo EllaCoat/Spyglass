@@ -983,11 +983,12 @@ export class Project extends EventDispatcher<{
 	/**
 	 * Apply a changed config, rebuilding the project when the cache context fingerprint changed.
 	 *
-	 * The prepared context reports `changedHashKinds`, but it is intentionally unused here: a
-	 * config change always goes through a full {@link resetOnce} to keep initializer state
-	 * consistent and avoid partial-invalidation corner cases. Narrowing lint-only changes to
-	 * `CacheService#invalidatePartial` is tracked separately on the project board
-	 * ("[fork] cache transaction ..." item).
+	 * The prepared context reports `changedHashKinds`, but it is intentionally unused here:
+	 * when the cache context fingerprint changes, we always go through a full {@link resetOnce}
+	 * to keep initializer state consistent and avoid partial-invalidation corner cases (config
+	 * changes that leave the fingerprint unchanged do not trigger a rebuild at all). Narrowing
+	 * lint-only changes to `CacheService#invalidatePartial` is tracked separately on the
+	 * project board ("[fork] cache transaction ..." item).
 	 *
 	 * This path does not bump `#resetGeneration`, so it never coalesces with manual
 	 * {@link reset} calls; the two are serialized only by `enqueueLifecycle` (FIFO) order.
