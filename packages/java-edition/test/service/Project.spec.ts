@@ -520,6 +520,41 @@ describe('Project.projectRoots canonicalization + defensive copy', () => {
 			await project.close()
 		}
 	})
+
+	it('Should dedupe canonically-equal projectRoots preserving first occurrence order', async () => {
+		const project = createMinimalProject(['file:///C:/root/', 'file:///c:/root/'])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/root/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should keep distinct roots while deduping canonical duplicates', async () => {
+		const project = createMinimalProject([
+			'file:///C:/a/',
+			'file:///c:/b/',
+			'file:///C%3A/a/',
+		])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/a/', 'file:///c:/b/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should preserve first occurrence order when a later duplicate repeats an earlier root', async () => {
+		const project = createMinimalProject([
+			'file:///c:/b/',
+			'file:///C:/a/',
+			'file:///c%3a/a/',
+		])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/b/', 'file:///c:/a/'])
+		} finally {
+			await project.close()
+		}
+	})
 })
 
 describe('Project.updateRoots regression (latent bug fixed by canonical projectRoots)', () => {
