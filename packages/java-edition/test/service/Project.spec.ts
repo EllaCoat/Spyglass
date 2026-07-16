@@ -443,6 +443,167 @@ describe('Project pack format reinitialization (#1212)', () => {
 	})
 })
 
+describe('Project.cacheRoot canonicalization', () => {
+	// Synthetic `file:` URIs keep these tests independent of the host filesystem: the
+	// constructor and the `cacheRoot` getter never touch the disk, so no Windows runner is
+	// needed to exercise drive-letter variants. Idempotency and the trailing-slash guarantee
+	// of the canonical form are already pinned by the normalizeUri characterization tests in
+	// core/test/common/util.spec.ts.
+	function createMinimalProject(cacheRoot: core.RootUriString): core.Project {
+		return new core.Project({
+			cacheRoot,
+			externals: NodeJsExternals,
+			logger: core.Logger.noop(),
+			projectRoots: [],
+		})
+	}
+
+	it('Should lowercase the Windows drive letter in cacheRoot', async () => {
+		const project = createMinimalProject('file:///C:/cache/')
+		try {
+			assert.equal(project.cacheRoot, 'file:///c:/cache/')
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should decode %3A in cacheRoot', async () => {
+		const project = createMinimalProject('file:///C%3A/cache/')
+		try {
+			assert.equal(project.cacheRoot, 'file:///c:/cache/')
+		} finally {
+			await project.close()
+		}
+	})
+})
+
+describe('Project.projectRoots canonicalization + defensive copy', () => {
+	// Synthetic `file:` URIs keep these tests independent of the host filesystem: the
+	// constructor never touches the disk, so no Windows runner is needed to exercise
+	// drive-letter variants. The canonical form itself is pinned by the normalizeUri
+	// characterization tests in core/test/common/util.spec.ts.
+	function createMinimalProject(projectRoots: core.RootUriString[]): core.Project {
+		return new core.Project({
+			cacheRoot: 'file:///c:/cache/',
+			externals: NodeJsExternals,
+			logger: core.Logger.noop(),
+			projectRoots,
+		})
+	}
+
+	it('Should not propagate input array mutation after construction', async () => {
+		const inputRoots: core.RootUriString[] = ['file:///c:/root/']
+		const project = createMinimalProject(inputRoots)
+		try {
+			inputRoots.push('file:///c:/injected/')
+			inputRoots[0] = 'file:///c:/mutated/'
+			assert.deepEqual(project.projectRoots, ['file:///c:/root/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should lowercase Windows drive letters in projectRoots', async () => {
+		const project = createMinimalProject(['file:///C:/root/'])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/root/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should decode %3A in projectRoots', async () => {
+		const project = createMinimalProject(['file:///C%3A/root/'])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/root/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should dedupe canonically-equal projectRoots preserving first occurrence order', async () => {
+		const project = createMinimalProject(['file:///C:/root/', 'file:///c:/root/'])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/root/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should keep distinct roots while deduping canonical duplicates', async () => {
+		const project = createMinimalProject([
+			'file:///C:/a/',
+			'file:///c:/b/',
+			'file:///C%3A/a/',
+		])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/a/', 'file:///c:/b/'])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('Should preserve first occurrence order when a later duplicate repeats an earlier root', async () => {
+		const project = createMinimalProject([
+			'file:///c:/b/',
+			'file:///C:/a/',
+			'file:///c%3a/a/',
+		])
+		try {
+			assert.deepEqual(project.projectRoots, ['file:///c:/b/', 'file:///c:/a/'])
+		} finally {
+			await project.close()
+		}
+	})
+})
+
+describe('Project.updateRoots regression (latent bug fixed by canonical projectRoots)', () => {
+	// Before projectRoots were canonicalized in the constructor, `Project#updateRoots`
+	// compared the raw roots against watched files that LspFileWatcher had already
+	// normalized (see packages/language-server/src/util/LspFileWatcher.ts), so a client sending
+	// `%3A`-encoded roots never got nested `pack.mcmeta` roots detected. Synthetic URIs
+	// make that mismatch reproducible on every OS; only the cache directory is real so
+	// that init()/ready() and the close()-time cache save have a writable location.
+	// Reads of the nonexistent synthetic files are tolerated (ENOENT) by design.
+	it('Should detect a nested pack.mcmeta root from a non-canonical projectRoot', async () => {
+		const cacheDir = await realpath(
+			await mkdtemp(join(tmpdir(), 'spyglass-update-roots-cache-')),
+		)
+		// Raw form as an encoding client would send it; canonicalizes to
+		// file:///c:/spyglass-update-roots-fixture/.
+		const rawProjectRoot: core.RootUriString = 'file:///C%3A/spyglass-update-roots-fixture/'
+		// Watched files arrive already normalized, exactly like LspFileWatcher entries.
+		const nestedPackMcmeta = 'file:///c:/spyglass-update-roots-fixture/nested/pack.mcmeta'
+		const project = new core.Project({
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(cacheDir).toString()),
+			),
+			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
+				env: { dependencies: [], exclude: [] },
+			}),
+			externals: NodeJsExternals,
+			logger: core.Logger.noop(),
+			projectRoots: [rawProjectRoot],
+		})
+		try {
+			await project.init()
+			await project.ready({ projectRootsWatcher: new FixtureWatcher(nestedPackMcmeta) })
+			assert.deepEqual(project.projectRoots, [
+				'file:///c:/spyglass-update-roots-fixture/',
+			])
+			// Deeper roots sort first; the nested entry is only present because the canonical
+			// projectRoot is a prefix of the normalized watched pack.mcmeta URI.
+			assert.deepEqual(project.roots, [
+				'file:///c:/spyglass-update-roots-fixture/nested/',
+				'file:///c:/spyglass-update-roots-fixture/',
+			])
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+})
+
 describe('Project cache reset (#1975)', () => {
 	const fixtureRoot = core.fileUtil.ensureEndingSlash(
 		core.normalizeUri(new URL('./fixture/reset-project-cache/', import.meta.url).toString()),

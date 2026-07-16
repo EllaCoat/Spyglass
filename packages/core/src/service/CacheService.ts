@@ -19,6 +19,12 @@ import type { Project } from './Project.js'
 /**
  * The format version of the cache. Should be increased when any changes that
  * could invalidate the cache are introduced to the Spyglass codebase.
+ *
+ * Note: URI normalization of projectRoots (PR #25) does NOT require bumping this version.
+ * The version check runs after cache files are located by hash-derived filename, so
+ * pre-normalization cache files simply become orphaned (unread) rather than triggering
+ * migration or reset. Bumping would only invalidate the live cache of users already on
+ * canonical URIs (Linux/macOS + lowercase-drive Windows), for no gain.
  */
 export const LatestCacheVersion = 9
 const ChecksumReadConcurrency = 32
@@ -142,6 +148,18 @@ function isCacheFile(value: unknown): value is CacheFile {
 		&& typeof cache.errors === 'object'
 		&& !!cache.symbols
 		&& typeof cache.symbols === 'object'
+}
+
+/**
+ * Compute the symbol cache file basename from a list of canonical projectRoots.
+ * Callers must pass roots already normalized via `normalizeUri` / `fileUtil.ensureEndingSlash`
+ * (the Project constructor guarantees this since PR #25); passing raw URIs will produce a
+ * different hash and cause cache misses.
+ */
+export async function computeSymbolCacheName(projectRoots: readonly string[]): Promise<string> {
+	const sortedRoots = [...projectRoots].sort()
+	const hash = await getSha1(sortedRoots.join(':'))
+	return `symbols/${hash}.json.gz`
 }
 
 export class CacheService {
@@ -359,9 +377,8 @@ export class CacheService {
 	#cacheFilePath: string | undefined
 	private async getCacheFileUri(): Promise<string> {
 		if (!this.#cacheFilePath) {
-			const sortedRoots = [...this.project.projectRoots].sort()
-			const hash = await getSha1(sortedRoots.join(':'))
-			this.#cacheFilePath = new Uri(`symbols/${hash}.json.gz`, this.cacheRoot).toString()
+			const name = await computeSymbolCacheName(this.project.projectRoots)
+			this.#cacheFilePath = new Uri(name, this.cacheRoot).toString()
 		}
 		return this.#cacheFilePath
 	}

@@ -313,22 +313,27 @@ export class Project extends EventDispatcher<{
 		}: ProjectOptions,
 	) {
 		super()
-		this.#cacheRoot = cacheRoot
+		this.#cacheRoot = fileUtil.ensureEndingSlash(normalizeUri(cacheRoot))
 		this.externals = externals
 		this.fs = fs
 		this.#initializers = initializers
 		this.isDebugging = isDebugging
 		this.logger = logger
 		this.profilers = profilers
-		this.projectRoots = projectRoots
+		// `Set` keeps insertion order, so canonically-equal duplicates (e.g. `file:///C:/root/`
+		// and `file:///c:/root/`) collapse into the first occurrence, preventing Config from
+		// loading the same config file twice.
+		this.projectRoots = Array.from(
+			new Set(projectRoots.map((r) => fileUtil.ensureEndingSlash(normalizeUri(r)))),
+		)
 
-		this.cacheService = new CacheService(cacheRoot, this)
+		this.cacheService = new CacheService(this.#cacheRoot, this)
 		this.#configService = new ConfigService(this, defaultConfig)
 		this.symbols = new SymbolUtil({})
 
 		this.#ctx = {}
 
-		this.logger.info(`[Project] [init] cacheRoot = ${cacheRoot}`)
+		this.logger.info(`[Project] [init] cacheRoot = ${this.#cacheRoot}`)
 		this.logger.info(`[Project] [init] projectRoots = ${projectRoots.join(' ')}`)
 
 		this.#configService.on('changed', ({ config }) => {

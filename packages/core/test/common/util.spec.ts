@@ -48,6 +48,73 @@ describe('common util', () => {
 			const actual = normalizeUri('file:///project/foo%3abar%3Aqux')
 			assert.equal(actual, 'file:///project/foo:bar:qux')
 		})
+
+		// Characterization tests pinning the current normalization scope before Project.cacheRoot
+		// and Project.projectRoots are canonicalized on construction. All URIs below are synthetic
+		// so the suite behaves identically on every OS.
+		describe('Should normalize URI variants of the same root to one canonical form', () => {
+			const Variants = [
+				'file:///C:/root/',
+				'file:///c:/root/',
+				'file:///C%3A/root/',
+				'file:///c%3a/root/',
+			]
+			for (const testUri of Variants) {
+				it(testUri, () => {
+					assert.equal(normalizeUri(testUri), 'file:///c:/root/')
+				})
+			}
+		})
+		describe('Should not unify URIs outside the normalization scope', () => {
+			it('Should keep directory casing distinct', () => {
+				// Only the drive letter is lowercased; casing elsewhere in the path is untouched.
+				assert.equal(normalizeUri('file:///C:/Foo/'), 'file:///c:/Foo/')
+				assert.notEqual(normalizeUri('file:///C:/Foo/'), normalizeUri('file:///C:/foo/'))
+			})
+			it('Should keep encoded slashes distinct from path separators', () => {
+				// `%3A` is the only escape sequence that is decoded; `%2F` stays encoded.
+				assert.equal(normalizeUri('file:///C:/a%2Fb/'), 'file:///c:/a%2Fb/')
+				assert.notEqual(normalizeUri('file:///C:/a%2Fb/'), normalizeUri('file:///C:/a/b/'))
+			})
+		})
+		describe('Should be idempotent', () => {
+			const Tests = [
+				'file:///C:/root/',
+				'file:///c:/root/',
+				'file:///C%3A/root/',
+				'file:///c%3a/root/',
+				'file:///C:/a%2Fb/',
+				'file:///project/readme.md',
+			]
+			for (const testUri of Tests) {
+				it(testUri, () => {
+					const normalized = normalizeUri(testUri)
+					assert.equal(normalizeUri(normalized), normalized)
+				})
+			}
+		})
+		describe('Should not unify beyond the documented limits', () => {
+			// normalizeUri() performs exactly two transformations: decoding `%3A`/`%3a` in the
+			// pathname and lowercasing the Windows drive letter. The following identities are
+			// intentionally NOT resolved by string normalization; they require filesystem-level
+			// canonicalization (e.g. `realpath`) instead:
+			// - `%7E` vs `~` encoding, as produced by Windows 8.3 short names such as `RUNNER~1`
+			//   (see the `realpath` workaround in java-edition/test/service/CacheService.spec.ts)
+			// - Unicode NFC vs NFD forms of the same visible file name
+			// - symlinks pointing at the same physical directory (not expressible as URI strings)
+			it('Should keep `%7E` distinct from `~`', () => {
+				assert.notEqual(
+					normalizeUri('file:///C:/foo%7E1/'),
+					normalizeUri('file:///C:/foo~1/'),
+				)
+			})
+			it('Should keep Unicode NFC distinct from NFD', () => {
+				assert.notEqual(
+					normalizeUri('file:///C:/caf\u00E9/'), // NFC: single U+00E9
+					normalizeUri('file:///C:/cafe\u0301/'), // NFD: `e` + U+0301 combining accent
+				)
+			})
+		})
 	})
 
 	typing('InheritReadonly', () => {
