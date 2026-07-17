@@ -1,4 +1,4 @@
-import { ErrorReporter } from '@spyglassmc/core'
+import { ErrorReporter, StateProxy } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { ImpDocAnnotation, ImpDocValue } from '../lib/index.js'
@@ -235,6 +235,270 @@ describe('matchesVisibility', () => {
 		assert.equal(matchesVisibility(visibility, 'other:allowed/deep/nested'), true)
 		assert.equal(matchesVisibility(visibility, 'other:leaf/foo'), true)
 		assert.equal(matchesVisibility(visibility, 'other:leaf/foo/bar'), false)
+	})
+
+	it('filters mixed targetType patterns against the caller type', () => {
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					raw: 'star:allowed',
+					targetType: '*' as const,
+					regex: '^star:allowed$',
+				},
+				{
+					raw: 'func:allowed',
+					targetType: 'function' as const,
+					regex: '^func:allowed$',
+				},
+			],
+		}
+		// caller type default 'function' は `*` pattern と `function` pattern の両方に届く。
+		assert.equal(matchesVisibility(visibility, 'star:allowed'), true)
+		assert.equal(matchesVisibility(visibility, 'func:allowed'), true)
+		// caller type `*` を明示した場合、 `function` pattern は
+		// `pattern.targetType === '*' || pattern.targetType === callerType` を満たさない。
+		assert.equal(matchesVisibility(visibility, 'star:allowed', '*'), true)
+		assert.equal(matchesVisibility(visibility, 'func:allowed', '*'), false)
+	})
+
+	it('falls back to owner-only matching for within with empty patterns', () => {
+		// parseVisibility は patterns 空の within を生成しないが、 matchesVisibility 単体は
+		// 空 iterable の `.some()` が false を返す道を defensive に持つ。 その挙動を pin。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [],
+		}
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
+		assert.equal(matchesVisibility(visibility, 'other:caller'), false)
+	})
+
+	it('evaluates patterns by value regardless of object identity', () => {
+		// 同一 shape で identity が異なる pattern object でも判定は一致する。
+		// 将来 cache を導入しても semantics が identity で分岐しないことの証跡。
+		const makeVisibility = () => ({
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [{
+				raw: 'other:allowed/**',
+				targetType: 'function' as const,
+				regex: '^other:allowed/.*$',
+			}],
+		})
+		const first = makeVisibility()
+		const second = makeVisibility()
+		assert.notEqual(first.patterns[0], second.patterns[0])
+		assert.equal(matchesVisibility(first, 'other:allowed/deep'), true)
+		assert.equal(matchesVisibility(second, 'other:allowed/deep'), true)
+		assert.equal(matchesVisibility(first, 'denied:caller'), false)
+		assert.equal(matchesVisibility(second, 'denied:caller'), false)
+	})
+
+	it('behaves identically after a JSON round-trip', () => {
+		// WithinPattern は plain string 3 field のみで serialize 可能。 cache reload 経路
+		// (JSON 化 → 復元) を通しても判定が変わらないことを pin。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					raw: 'owner:main',
+					targetType: 'function' as const,
+					regex: '^owner:main$',
+				},
+				{
+					raw: 'other:allowed/**',
+					targetType: '*' as const,
+					regex: '^other:allowed/.*$',
+				},
+			],
+		}
+		const reloaded = JSON.parse(JSON.stringify(visibility)) as typeof visibility
+		assert.deepEqual(reloaded, visibility)
+		assert.equal(matchesVisibility(reloaded, 'owner:helper'), true)
+		assert.equal(matchesVisibility(reloaded, 'owner:main'), true)
+		assert.equal(matchesVisibility(reloaded, 'other:allowed/deep/nested'), true)
+		assert.equal(matchesVisibility(reloaded, 'denied:caller'), false)
+		for (
+			const caller of [
+				'owner:helper',
+				'owner:main',
+				'other:allowed/deep/nested',
+				'denied:caller',
+			]
+		) {
+			assert.equal(
+				matchesVisibility(reloaded, caller),
+				matchesVisibility(visibility, caller),
+			)
+		}
+	})
+
+	it('evaluates non-canonical patterns through the per-pattern fallback path', () => {
+		// raw と regex が食い違う pattern は unified regex (Option B) の canonical check
+		// で弾かれ、 per-pattern cache (Option A) の順序付き評価に降りる。 fallback path
+		// でも判定は pattern.regex 側で行われる semantics を pin。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [{
+				raw: 'foo:bar',
+				targetType: 'function' as const,
+				regex: '^completely/unrelated$',
+			}],
+		}
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
+		// raw ではなく regex が評価される (fallback path でも regex 基準)。
+		assert.equal(matchesVisibility(visibility, 'completely/unrelated'), true)
+		assert.equal(matchesVisibility(visibility, 'foo:bar'), false)
+	})
+
+	it('matches large canonical pattern sets through the unified regex path', () => {
+		// 16 個の canonical pattern (raw から legacyGlobToRegex で生成) は visibility
+		// 単位の unified regex (Option B) に畳まれる。 owner / 各 pattern match /
+		// no-match の全系で per-pattern `.some()` と semantically 等価であることを pin。
+		const patterns = Array.from({ length: 16 }, (_, i) => ({
+			raw: `allowed:ns${i}/**`,
+			targetType: 'function' as const,
+			regex: legacyGlobToRegex(`allowed:ns${i}/**`),
+		}))
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns,
+		}
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
+		for (let i = 0; i < patterns.length; i++) {
+			assert.equal(
+				matchesVisibility(visibility, `allowed:ns${i}/deep/nested`),
+				true,
+			)
+		}
+		assert.equal(matchesVisibility(visibility, 'denied:ns0/deep'), false)
+	})
+
+	it('resolves explicit star caller type against *-only patterns', () => {
+		// call site は現状すべて callerType 'function' だが、 `*` 経路の prepared regex
+		// も独立に引けることを pin (caller type 別 cache の将来 proofing)。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [{
+				raw: 'star:allowed/**',
+				targetType: '*' as const,
+				regex: '^star:allowed/.*$',
+			}],
+		}
+		assert.equal(matchesVisibility(visibility, 'star:allowed/deep', '*'), true)
+		assert.equal(matchesVisibility(visibility, 'denied:caller', '*'), false)
+	})
+
+	it('reuses unified regex cache across different StateProxy identities', () => {
+		// 実 linter は candidate ごとに別 StateProxy handler を通すため、 同一 origin visibility でも
+		// proxy identity が毎回異なる。 `StateProxy.dereference()` で origin を key にするため、
+		// 別 proxy で包んで二度呼んでも unified regex の追加 compile は発生しない (canonical 経路)。
+		const originVisibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					raw: 'other:allowed/**',
+					targetType: 'function' as const,
+					regex: '^other:allowed/.*$',
+				},
+				{
+					raw: 'other:leaf/*',
+					targetType: 'function' as const,
+					regex: '^other:leaf/[^/]*$',
+				},
+			],
+		}
+		const OriginalRegExp = globalThis.RegExp
+		let compileCount = 0
+		class SpiedRegExp extends OriginalRegExp {
+			constructor(source: string | RegExp, flags?: string) {
+				super(source, flags)
+				compileCount++
+			}
+		} // deno-lint-ignore no-explicit-any
+
+		;(globalThis as any).RegExp = SpiedRegExp
+		try {
+			const proxy1 = StateProxy.create(originVisibility)
+			const proxy2 = StateProxy.create(originVisibility)
+			assert.equal(
+				matchesVisibility(
+					proxy1 as unknown as typeof originVisibility,
+					'other:allowed/deep/nested',
+				),
+				true,
+			)
+			const afterFirst = compileCount
+			assert.equal(
+				matchesVisibility(proxy2 as unknown as typeof originVisibility, 'other:leaf/foo'),
+				true,
+			)
+			assert.equal(
+				compileCount,
+				afterFirst,
+				'proxy2 の呼び出しでは追加 compile が発生しないこと (identity 正規化)',
+			)
+		} finally {
+			// deno-lint-ignore no-explicit-any
+			;(globalThis as any).RegExp = OriginalRegExp
+		}
+	})
+
+	it('reuses per-pattern cache in fallback path across StateProxy identities', () => {
+		// canonical 外 pattern を持つ visibility は Option B の fallback path (per-pattern `.some()`) に
+		// 降ろされる。 fallback 経路でも `matchesVisibility` が visibility 側を origin に正規化してから
+		// `key.patterns` を反復するため、 per-pattern も origin element を key に cache hit する。
+		// 別 proxy で二度呼んでも追加 compile は発生しないことを pin (visibility-level 正規化の検証)。
+		const originVisibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					// canonical 外 : raw と regex が不整合 → PreparedFallback 発火
+					raw: 'foo:bar',
+					targetType: 'function' as const,
+					regex: '^completely/unrelated$',
+				},
+			],
+		}
+		const OriginalRegExp = globalThis.RegExp
+		let compileCount = 0
+		class SpiedRegExp extends OriginalRegExp {
+			constructor(source: string | RegExp, flags?: string) {
+				super(source, flags)
+				compileCount++
+			}
+		} // deno-lint-ignore no-explicit-any
+
+		;(globalThis as any).RegExp = SpiedRegExp
+		try {
+			const proxy1 = StateProxy.create(originVisibility)
+			const proxy2 = StateProxy.create(originVisibility)
+			assert.equal(
+				matchesVisibility(proxy1 as unknown as typeof originVisibility, 'completely/unrelated'),
+				true,
+			)
+			const afterFirst = compileCount
+			assert.equal(
+				matchesVisibility(proxy2 as unknown as typeof originVisibility, 'completely/unrelated'),
+				true,
+			)
+			assert.equal(
+				compileCount,
+				afterFirst,
+				'proxy2 の fallback 呼び出しでは追加 compile が発生しないこと',
+			)
+		} finally {
+			// deno-lint-ignore no-explicit-any
+			;(globalThis as any).RegExp = OriginalRegExp
+		}
 	})
 })
 

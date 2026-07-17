@@ -137,24 +137,29 @@ export type WithinTargetType = '*' | 'function'
 
 /**
  * Symbol.data/cache に保存するため RegExp ではなく文字列で保持する。
- * 実行時は共有 `matchesVisibility()` が `new RegExp(regex)` で評価する。
+ * 実行時は共有 `matchesVisibility()` が module-level WeakMap cache 経由で
+ * compile 済 RegExp を再利用する。 cache 前提を破らないための規約 :
+ * - RegExp を field に直接埋め込まない (`JSON.stringify` で `{}` に情報落ちする、
+ *   compile 結果は withinPattern.ts の module-level WeakMap 側に分離して持つ)
+ * - pattern object の field は readonly で immutable を型に強制 (identity ベースの
+ *   cache key と semantics 一貫性の担保、 in-place mutation は build error になる)
  */
 export interface WithinPattern {
 	/** annotation に書かれた原文 */
-	raw: string
+	readonly raw: string
 	/** Legacy の対象 file type。 Tier A の consumer は function と * を扱う。 */
-	targetType: WithinTargetType
+	readonly targetType: WithinTargetType
 	/** ^...$ を含む RegExp source */
-	regex: string
+	readonly regex: string
 }
 
 export type ImpDocVisibility =
-	| { type: 'public' }
-	| { type: 'private'; owner: string }
+	| { readonly type: 'public' }
+	| { readonly type: 'private'; readonly owner: string }
 	| {
-		type: 'within'
-		owner: string
-		patterns: readonly WithinPattern[]
+		readonly type: 'within'
+		readonly owner: string
+		readonly patterns: readonly WithinPattern[]
 	}
 
 export interface ImpDocDeclarationSource {
