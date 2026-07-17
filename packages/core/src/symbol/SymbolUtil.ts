@@ -300,6 +300,32 @@ export class SymbolUtil extends EventDispatcher<{
 		return SymbolUtil.filterVisibleSymbols(uri, map)
 	}
 
+	/**
+	 * @returns A superset of the symbols that have contributed a location to `uri`. Entries are
+	 * added to the internal reverse cache when a symbol location is created (including via
+	 * {@link SymbolUtil.buildCache}), but they are intentionally never removed when the location
+	 * is removed. Callers are responsible for re-verifying that a returned symbol still has a
+	 * relevant location at `uri` before using it. Symbols that no longer exist in the global
+	 * symbol table are filtered out.
+	 */
+	getSymbolCandidatesAtUri(uri: string): Symbol[] {
+		const pathStrings = new Set<string>()
+		for (const cache of Object.values(this.#cache)) {
+			for (const pathString of cache[uri] ?? []) {
+				pathStrings.add(pathString)
+			}
+		}
+		const ans: Symbol[] = []
+		for (const pathString of pathStrings) {
+			const path = SymbolPath.fromString(pathString)
+			const { symbol } = SymbolUtil.lookupTable(this.#global, path.category, path.path)
+			if (symbol) {
+				ans.push(symbol)
+			}
+		}
+		return ans
+	}
+
 	static toUri(uri: DocAndNode | TextDocument | string): string {
 		if (typeof uri === 'string') {
 			return uri
