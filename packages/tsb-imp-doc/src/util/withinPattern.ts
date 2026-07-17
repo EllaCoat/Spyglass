@@ -1,5 +1,6 @@
 // core の Symbol 型は global Symbol constructor (unique symbol 宣言で使用) と
 // 衝突するため alias で import する。
+import { StateProxy } from '@spyglassmc/core'
 import type { ErrorReporter, Symbol as CoreSymbol } from '@spyglassmc/core'
 import type {
 	ImpDocAnnotation,
@@ -44,15 +45,18 @@ type CompiledEntry = { source: string; regexp: RegExp }
 const compiledPatternCache: WeakMap<WithinPattern, CompiledEntry> = new WeakMap()
 
 function getCompiledPatternRegExp(pattern: WithinPattern): RegExp {
-	const entry = compiledPatternCache.get(pattern)
+	// linter は StateProxy 経由で pattern を渡すため handler ごとに identity が異なる。
+	// origin object を key に正規化しないと cache が hit しない (Terra 2 巡目 MUST)。
+	const key = StateProxy.dereference(pattern)
+	const entry = compiledPatternCache.get(key)
 	// source 一致確認は defense in depth (同一 identity のまま regex が書き換わる
 	// ケースは想定外だが、 食い違ったら新 entry で上書きする)。
-	if (entry && entry.source === pattern.regex) {
+	if (entry && entry.source === key.regex) {
 		return entry.regexp
 	}
 	// flag は付けない (g / y は lastIndex が呼び出し間で残り判定が非決定的になる)。
-	const regexp = new RegExp(pattern.regex)
-	compiledPatternCache.set(pattern, { source: pattern.regex, regexp })
+	const regexp = new RegExp(key.regex)
+	compiledPatternCache.set(key, { source: key.regex, regexp })
 	return regexp
 }
 
@@ -85,23 +89,20 @@ function buildPreparedRegExp(
 	patterns: readonly WithinPattern[],
 	callerType: WithinTargetType,
 ): PreparedRegExp {
-	const applicable = patterns.filter(pattern =>
-		pattern.targetType === '*' || pattern.targetType === callerType
-	)
-	// 空 alternation `(?:)` は全 match (= default-allow bug) になるため regex を作らない。
-	if (applicable.length === 0) {
-		return undefined
-	}
-	// 累積長で判定 (map().join() 一括構築だと巨大 pattern set で無駄な一時文字列を確保する)。
+	// filter/canonical/累積を単一 loop に統合 (巨大入力を早期停止)。 順序は最軽 (targetType
+	// 一致 → 単一 source 長 → canonical 再生成 → 累積長) で fallback 判定を最短化。
 	let unifiedLength = 0
 	const sources: string[] = []
-	for (const pattern of applicable) {
+	for (const pattern of patterns) {
+		if (pattern.targetType !== '*' && pattern.targetType !== callerType) {
+			continue
+		}
+		if (pattern.regex.length > MaxPatternSourceLength) {
+			return PreparedFallback
+		}
 		// canonical 外 (raw から regex を再導出できない) は Option A の semantics を保護
 		// するため per-pattern 評価に降ろす。
-		if (
-			pattern.regex !== legacyGlobToRegex(pattern.raw)
-			|| pattern.regex.length > MaxPatternSourceLength
-		) {
+		if (pattern.regex !== legacyGlobToRegex(pattern.raw)) {
 			return PreparedFallback
 		}
 		const source = `(?:${pattern.regex})`
@@ -111,6 +112,10 @@ function buildPreparedRegExp(
 			return PreparedFallback
 		}
 		sources.push(source)
+	}
+	// 空 alternation `(?:)` は全 match (= default-allow bug) になるため regex を作らない。
+	if (sources.length === 0) {
+		return undefined
 	}
 	try {
 		// flag は付けない (g / y は lastIndex が呼び出し間で残り判定が非決定的になる)。
@@ -259,17 +264,21 @@ export function matchesVisibility(
 			if (caller === visibility.owner) {
 				return true
 			}
-			let prepared = preparedVisibilityCache.get(visibility)
+			// linter は StateProxy 経由で visibility を渡すため handler ごとに identity が異なる。
+			// origin object を key に正規化しないと cache が hit しない (Terra 2 巡目 MUST)。
+			const key = StateProxy.dereference(visibility)
+			let prepared = preparedVisibilityCache.get(key)
 			if (!prepared) {
-				prepared = prepareVisibility(visibility)
-				preparedVisibilityCache.set(visibility, prepared)
+				prepared = prepareVisibility(key)
+				preparedVisibilityCache.set(key, prepared)
 			}
 			const compiled = callerType === 'function' ? prepared.function : prepared.star
 			if (compiled === undefined) {
 				return false
 			}
 			if (compiled === PreparedFallback) {
-				return visibility.patterns.some(pattern =>
+				// fallback path も origin patterns を回す (per-pattern cache も identity dependent)。
+				return key.patterns.some(pattern =>
 					(pattern.targetType === '*' || pattern.targetType === callerType)
 					&& getCompiledPatternRegExp(pattern).test(caller)
 				)

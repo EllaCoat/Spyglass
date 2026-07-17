@@ -154,12 +154,12 @@ export interface WithinPattern {
 }
 
 export type ImpDocVisibility =
-	| { type: 'public' }
-	| { type: 'private'; owner: string }
+	| { readonly type: 'public' }
+	| { readonly type: 'private'; readonly owner: string }
 	| {
-		type: 'within'
-		owner: string
-		patterns: readonly WithinPattern[]
+		readonly type: 'within'
+		readonly owner: string
+		readonly patterns: readonly WithinPattern[]
 	}
 
 export interface ImpDocDeclarationSource {
