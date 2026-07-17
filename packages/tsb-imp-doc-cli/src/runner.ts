@@ -26,6 +26,8 @@ import type { DiagnosticSeverity, LintDiagnostic } from './reporter.js'
 const CacheVersion = 2
 const ImpDocPrivateRule = 'impDocPrivate'
 const UnresolvedRule = 'unresolved'
+export const SerializeProfilerId = 'project#cache#serialize'
+export const SerializeManifestProfilerId = 'project#cache#serialize#manifest'
 const ExportUsageTypes = [
 	'declaration',
 	'definition',
@@ -349,14 +351,6 @@ async function readCacheSnapshot(
 	} catch {
 		return { token }
 	}
-}
-
-async function writeResultCache(
-	path: string,
-	expectedToken: string | undefined,
-	cache: ResultCache,
-): Promise<boolean> {
-	return writeCacheAtomically(path, expectedToken, JSON.stringify(cache))
 }
 
 async function readInputs(
@@ -748,6 +742,7 @@ export async function runImpDocLint(
 	}
 	sortDiagnostics(diagnostics)
 
+	const serializeProfiler = projectData.profilers.get(SerializeProfilerId)
 	const generation = (activated?.cache.generation ?? 0) + 1
 	const manifestFiles: Record<string, FileManifestEntry> = {}
 	if (activated) {
@@ -757,6 +752,7 @@ export async function runImpDocLint(
 			}
 		}
 	}
+	const manifestProfiler = projectData.profilers.get(SerializeManifestProfilerId, 'top-n', 50)
 	for (const state of states) {
 		manifestFiles[state.file] = {
 			generation,
@@ -770,9 +766,13 @@ export async function runImpDocLint(
 			references: collectReferences(state),
 			diagnostics: diagnostics.filter(diagnostic => diagnostic.file === state.file),
 		}
+		manifestProfiler.task(state.uri)
 	}
+	manifestProfiler.finalize()
 	const manifest: PerFileManifest = { generation, files: manifestFiles }
+	serializeProfiler.task('Build manifest / collect exports')
 	const graph = createDependencyGraph(manifest)
+	serializeProfiler.task('Build dependency graph')
 	const result: RunResult = {
 		diagnostics,
 		filesScanned: normalizedFiles.length,
@@ -781,19 +781,30 @@ export async function runImpDocLint(
 		fullScan,
 	}
 
-	if (
-		cachePath
-		&& await checksumBarrier(normalizedFiles, inputs, options.parallel)
-	) {
-		await writeResultCache(cachePath, cacheSnapshot.token, {
-			version: CacheVersion,
-			contextHash: activeContextHash,
-			generation,
-			manifest,
-			graph,
-			symbols: core.SymbolTable.unlink(symbols.global),
-			filesScanned: normalizedFiles.length,
-		})
+	if (cachePath) {
+		const checksumIntact = await checksumBarrier(normalizedFiles, inputs, options.parallel)
+		serializeProfiler.task('Checksum barrier')
+		if (checksumIntact) {
+			const unlinkedSymbols = core.SymbolTable.unlink(symbols.global)
+			serializeProfiler.task('Unlink symbol table')
+			// Serialize before entering the process-local write queue, so queue waits
+			// inside writeCacheAtomically are not attributed to JSON.stringify.
+			const serializedCache = JSON.stringify(
+				{
+					version: CacheVersion,
+					contextHash: activeContextHash,
+					generation,
+					manifest,
+					graph,
+					symbols: unlinkedSymbols,
+					filesScanned: normalizedFiles.length,
+				} satisfies ResultCache,
+			)
+			serializeProfiler.task('JSON.stringify')
+			await writeCacheAtomically(cachePath, cacheSnapshot.token, serializedCache)
+			serializeProfiler.task('Atomic cache write')
+		}
 	}
+	serializeProfiler.finalize()
 	return result
 }

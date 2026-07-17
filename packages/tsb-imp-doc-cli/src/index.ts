@@ -1,11 +1,13 @@
 #!/usr/bin/env node
+import * as core from '@spyglassmc/core'
 import { readFile } from 'node:fs/promises'
 import { availableParallelism } from 'node:os'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
+import { AssetProfilerIds } from './assetPerformance.js'
 import { report, type ReportFormat } from './reporter.js'
-import { runImpDocLint } from './runner.js'
+import { runImpDocLint, SerializeManifestProfilerId, SerializeProfilerId } from './runner.js'
 import { scanMcfunctionFiles } from './scanner.js'
 
 export * from './assetPerformance.js'
@@ -23,6 +25,7 @@ Options:
   --parallel <n>        Parallel tasks (default: available CPU count)
   --cache <path>        Result cache file (default: .tsb-lint-cache.json)
   --exclude <glob>      Exclude a path or glob (repeatable)
+  --profile             Print stage profiler summaries to stderr
   --help, -h            Show this help
 `
 
@@ -56,6 +59,26 @@ async function loadConfig(path: string | undefined): Promise<Record<string, unkn
 	return value as Record<string, unknown>
 }
 
+const ProfileProfilerIds: string[] = [
+	...AssetProfilerIds,
+	SerializeProfilerId,
+	SerializeManifestProfilerId,
+]
+
+/**
+ * Profiler summaries must go to stderr. Stdout is reserved for the reporter
+ * output, which CI consumers parse.
+ */
+function createProfilerFactory(): core.ProfilerFactory {
+	const toStderr = (data: unknown, ...args: unknown[]): void => {
+		console.error(data, ...args)
+	}
+	return new core.ProfilerFactory(
+		{ error: toStderr, info: toStderr, log: toStderr, warn: toStderr },
+		ProfileProfilerIds,
+	)
+}
+
 function configExcludes(config: Record<string, unknown> | undefined): string[] {
 	const env = config?.['env']
 	if (!env || typeof env !== 'object' || Array.isArray(env)) {
@@ -84,6 +107,7 @@ export async function main(argv: readonly string[]): Promise<number> {
 				format: { type: 'string' },
 				help: { type: 'boolean', short: 'h' },
 				parallel: { type: 'string' },
+				profile: { type: 'boolean' },
 				'skip-unresolved': { type: 'boolean' },
 				strict: { type: 'boolean' },
 			},
@@ -109,6 +133,7 @@ export async function main(argv: readonly string[]): Promise<number> {
 			skipUnresolved: values['skip-unresolved'],
 			cachePath: resolve(values.cache ?? '.tsb-lint-cache.json'),
 			config,
+			profilers: values.profile ? createProfilerFactory() : undefined,
 		})
 		const output = report(result.diagnostics, {
 			filesScanned: result.filesScanned,

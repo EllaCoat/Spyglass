@@ -1,5 +1,9 @@
+import * as core from '@spyglassmc/core'
 import assert from 'node:assert/strict'
-import { describe, it } from 'node:test'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, beforeEach, describe, it } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import {
 	AssetProfilerIds,
@@ -12,7 +16,7 @@ import {
 	evaluatePhase1ImprovementGate,
 	evaluateWarmNoopGate,
 } from '../lib/assetPerformance.js'
-import { runImpDocLint } from '../lib/runner.js'
+import { runImpDocLint, SerializeManifestProfilerId, SerializeProfilerId } from '../lib/runner.js'
 import { scanMcfunctionFiles } from '../lib/scanner.js'
 
 const FixtureDir = fileURLToPath(
@@ -91,6 +95,103 @@ describe('Phase 5b Asset profiler', () => {
 			assert.equal(profiler.totalTasks, 13)
 			assert.ok(profiler.tasks.length > 0)
 		}
+	})
+})
+
+describe('serialize stage profiler', () => {
+	const SerializeTaskNames = [
+		'Build manifest / collect exports',
+		'Build dependency graph',
+		'Checksum barrier',
+		'Unlink symbol table',
+		'JSON.stringify',
+		'Atomic cache write',
+	]
+
+	let tempDir: string
+
+	beforeEach(async () => {
+		tempDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-cli-profiler-'))
+	})
+
+	afterEach(async () => {
+		await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+	})
+
+	function createSession() {
+		const summaries: core.ProfilerSummary[] = []
+		const factory = new core.ProfilerFactory(
+			core.Logger.noop(),
+			[SerializeProfilerId, SerializeManifestProfilerId],
+			summary => summaries.push(summary),
+		)
+		return { factory, summaries }
+	}
+
+	function serializeTasks(summaries: readonly core.ProfilerSummary[]): string[] {
+		const summary = summaries.find(candidate => candidate.id === SerializeProfilerId)
+		assert.ok(summary)
+		return summary.tasks.map(task => task.name)
+	}
+
+	it('records all six serialize tasks when the cache is written', async () => {
+		const files = await scanMcfunctionFiles(FixtureDir)
+		const { factory, summaries } = createSession()
+		await runImpDocLint(files, {
+			targetDir: FixtureDir,
+			parallel: 2,
+			skipUnresolved: true,
+			cachePath: join(tempDir, 'cache.json'),
+			profilers: factory,
+		})
+
+		assert.deepEqual(serializeTasks(summaries), SerializeTaskNames)
+		const manifest = summaries.find(candidate => candidate.id === SerializeManifestProfilerId)
+		assert.ok(manifest)
+		assert.equal(manifest.style, 'top-n')
+		assert.equal(manifest.totalTasks, 13)
+	})
+
+	it('stops after the dependency graph when no cache path is configured', async () => {
+		const files = await scanMcfunctionFiles(FixtureDir)
+		const { factory, summaries } = createSession()
+		await runImpDocLint(files, {
+			targetDir: FixtureDir,
+			parallel: 2,
+			skipUnresolved: true,
+			profilers: factory,
+		})
+
+		assert.deepEqual(serializeTasks(summaries), SerializeTaskNames.slice(0, 2))
+	})
+
+	it('stops after the checksum barrier when an input could not be read', async () => {
+		const files = await scanMcfunctionFiles(FixtureDir)
+		const { factory, summaries } = createSession()
+		await runImpDocLint([...files, join(FixtureDir, 'missing.mcfunction')], {
+			targetDir: FixtureDir,
+			parallel: 2,
+			skipUnresolved: true,
+			cachePath: join(tempDir, 'cache.json'),
+			profilers: factory,
+		})
+
+		assert.deepEqual(serializeTasks(summaries), SerializeTaskNames.slice(0, 3))
+	})
+
+	it('records the atomic write task even when publication fails', async () => {
+		const files = await scanMcfunctionFiles(FixtureDir)
+		const { factory, summaries } = createSession()
+		// A directory as the cache path makes writeCacheAtomically fail closed.
+		await runImpDocLint(files, {
+			targetDir: FixtureDir,
+			parallel: 2,
+			skipUnresolved: true,
+			cachePath: tempDir,
+			profilers: factory,
+		})
+
+		assert.deepEqual(serializeTasks(summaries), SerializeTaskNames)
 	})
 })
 
