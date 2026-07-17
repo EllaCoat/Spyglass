@@ -1,4 +1,4 @@
-import { ErrorReporter } from '@spyglassmc/core'
+import { ErrorReporter, StateProxy } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { ImpDocAnnotation, ImpDocValue } from '../lib/index.js'
@@ -393,6 +393,96 @@ describe('matchesVisibility', () => {
 		}
 		assert.equal(matchesVisibility(visibility, 'star:allowed/deep', '*'), true)
 		assert.equal(matchesVisibility(visibility, 'denied:caller', '*'), false)
+	})
+
+	it('reuses unified regex cache across different StateProxy identities', () => {
+		// 実 linter は candidate ごとに別 StateProxy handler を通すため、 同一 origin visibility でも
+		// proxy identity が毎回異なる。 `StateProxy.dereference()` で origin を key にするため、
+		// 別 proxy で包んで二度呼んでも unified regex の追加 compile は発生しない (canonical 経路)。
+		const originVisibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					raw: 'other:allowed/**',
+					targetType: 'function' as const,
+					regex: '^other:allowed/.*$',
+				},
+				{
+					raw: 'other:leaf/*',
+					targetType: 'function' as const,
+					regex: '^other:leaf/[^/]*$',
+				},
+			],
+		}
+		const OriginalRegExp = globalThis.RegExp
+		let compileCount = 0
+		class SpiedRegExp extends OriginalRegExp {
+			constructor(source: string | RegExp, flags?: string) {
+				super(source, flags)
+				compileCount++
+			}
+		}
+		// deno-lint-ignore no-explicit-any
+		;(globalThis as any).RegExp = SpiedRegExp
+		try {
+			const proxy1 = StateProxy.create(originVisibility)
+			const proxy2 = StateProxy.create(originVisibility)
+			assert.equal(matchesVisibility(proxy1 as unknown as typeof originVisibility, 'other:allowed/deep/nested'), true)
+			const afterFirst = compileCount
+			assert.equal(matchesVisibility(proxy2 as unknown as typeof originVisibility, 'other:leaf/foo'), true)
+			assert.equal(
+				compileCount,
+				afterFirst,
+				'proxy2 の呼び出しでは追加 compile が発生しないこと (identity 正規化)',
+			)
+		} finally {
+			// deno-lint-ignore no-explicit-any
+			;(globalThis as any).RegExp = OriginalRegExp
+		}
+	})
+
+	it('reuses per-pattern cache in fallback path across StateProxy identities', () => {
+		// canonical 外 pattern を持つ visibility は Option B の fallback path (per-pattern `.some()`) に
+		// 降ろされる。 fallback path でも `getCompiledPatternRegExp` が dereference 済 identity を
+		// key にするため、 別 proxy で二度呼んでも per-pattern cache の追加 compile は発生しない。
+		const originVisibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					// canonical 外 : raw と regex が不整合 → PreparedFallback 発火
+					raw: 'foo:bar',
+					targetType: 'function' as const,
+					regex: '^completely/unrelated$',
+				},
+			],
+		}
+		const OriginalRegExp = globalThis.RegExp
+		let compileCount = 0
+		class SpiedRegExp extends OriginalRegExp {
+			constructor(source: string | RegExp, flags?: string) {
+				super(source, flags)
+				compileCount++
+			}
+		}
+		// deno-lint-ignore no-explicit-any
+		;(globalThis as any).RegExp = SpiedRegExp
+		try {
+			const proxy1 = StateProxy.create(originVisibility)
+			const proxy2 = StateProxy.create(originVisibility)
+			assert.equal(matchesVisibility(proxy1 as unknown as typeof originVisibility, 'completely/unrelated'), true)
+			const afterFirst = compileCount
+			assert.equal(matchesVisibility(proxy2 as unknown as typeof originVisibility, 'completely/unrelated'), true)
+			assert.equal(
+				compileCount,
+				afterFirst,
+				'proxy2 の fallback 呼び出しでは追加 compile が発生しないこと',
+			)
+		} finally {
+			// deno-lint-ignore no-explicit-any
+			;(globalThis as any).RegExp = OriginalRegExp
+		}
 	})
 })
 
