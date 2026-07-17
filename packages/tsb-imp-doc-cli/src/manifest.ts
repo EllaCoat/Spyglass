@@ -12,8 +12,6 @@ export interface ExportSymbolSummary {
 	path: string[]
 	key: string
 	usage: ('declaration' | 'definition' | 'implementation' | 'typeDefinition')[]
-	data?: unknown
-	description?: string
 }
 
 export interface FileManifestEntry {
@@ -75,7 +73,6 @@ function isExportSummary(value: unknown): value is ExportSymbolSummary {
 			|| usage === 'implementation'
 			|| usage === 'typeDefinition'
 		)
-		&& (value['description'] === undefined || typeof value['description'] === 'string')
 }
 
 function isEntry(value: unknown, generation: number): value is FileManifestEntry {

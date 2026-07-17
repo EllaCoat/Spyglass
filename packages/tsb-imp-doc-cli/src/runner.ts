@@ -494,8 +494,6 @@ function collectAllExports(
 				path: [...symbol.path],
 				key: toSymbolKey(symbol.category, symbol.path),
 				usage,
-				...('data' in symbol ? { data: symbol.data } : {}),
-				...(symbol.desc === undefined ? {} : { description: symbol.desc }),
 			})
 		}
 	})
@@ -783,7 +781,19 @@ export async function runImpDocLint(
 	if (activated) {
 		for (const [file, entry] of Object.entries(activated.cache.manifest.files)) {
 			if (inputs.has(file) && !affectedFiles.has(file)) {
-				manifestFiles[file] = { ...entry, generation }
+				// Legacy v2 entries may still carry metadata that is no longer part of
+				// ExportSymbolSummary. Project retained entries onto the lean schema so
+				// any cache rewrite never creates a mixed-shape manifest.
+				manifestFiles[file] = {
+					...entry,
+					generation,
+					exports: entry.exports.map(({ category, path, key, usage }) => ({
+						category,
+						path,
+						key,
+						usage,
+					})),
+				}
 			}
 		}
 	}
