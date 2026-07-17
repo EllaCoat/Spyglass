@@ -1,4 +1,6 @@
-import type { ErrorReporter, Symbol } from '@spyglassmc/core'
+// core の Symbol 型は global Symbol constructor (unique symbol 宣言で使用) と
+// 衝突するため alias で import する。
+import type { ErrorReporter, Symbol as CoreSymbol } from '@spyglassmc/core'
 import type {
 	ImpDocAnnotation,
 	ImpDocDeclarationSource,
@@ -33,9 +35,10 @@ const RegexSpecials = new Set([
 ])
 
 /**
- * `matchesVisibility()` が compile した RegExp の per-pattern cache。 key は
+ * `matchesVisibility()` が compile した RegExp の per-pattern cache (Option A)。 key は
  * `WithinPattern` の object identity (寿命は WeakMap 経由で GC 任せ)。 pattern
  * 自体は serialize されるため RegExp を埋め込まず、 cache 側に分離して保持する。
+ * Option B (`preparedVisibilityCache`) の fallback path でも使用する。
  */
 type CompiledEntry = { source: string; regexp: RegExp }
 const compiledPatternCache: WeakMap<WithinPattern, CompiledEntry> = new WeakMap()
@@ -51,6 +54,73 @@ function getCompiledPatternRegExp(pattern: WithinPattern): RegExp {
 	const regexp = new RegExp(pattern.regex)
 	compiledPatternCache.set(pattern, { source: pattern.regex, regexp })
 	return regexp
+}
+
+/**
+ * visibility 単位の caller type 別 unified RegExp cache (Option B)。 有効 patterns を
+ * `(?:...)|(?:...)` に畳んで 1 回の `test()` で判定する。 各 slot の意味 :
+ * - `RegExp` : compile 済 unified regex
+ * - `undefined` : 該当 caller type 向けの有効 patterns がゼロ (owner short-circuit 後は常に false)
+ * - `PreparedFallback` : canonical 外 / 巨大 source / compile failure。 per-pattern
+ *   cache (Option A) の順序付き `.some()` 評価に降ろす
+ */
+const PreparedFallback: unique symbol = Symbol('PreparedFallback')
+type PreparedRegExp = RegExp | undefined | typeof PreparedFallback
+interface PreparedVisibility {
+	function: PreparedRegExp
+	star: PreparedRegExp
+}
+const preparedVisibilityCache: WeakMap<
+	Extract<ImpDocVisibility, { type: 'within' }>,
+	PreparedVisibility
+> = new WeakMap()
+
+// fallback 閾値。 実 workload の pattern source は 100 bytes 以下なので 10x 余裕の
+// 安全側 (V8 Irregexp の compile time が悪化しない範囲)。
+const MaxPatternSourceLength = 1024
+const MaxUnifiedSourceLength = 16384
+
+/** caller type 向けの unified regex を組む。 fallback 条件は `PreparedFallback` の doc 参照。 */
+function buildPreparedRegExp(
+	patterns: readonly WithinPattern[],
+	callerType: WithinTargetType,
+): PreparedRegExp {
+	const applicable = patterns.filter(pattern =>
+		pattern.targetType === '*' || pattern.targetType === callerType
+	)
+	// 空 alternation `(?:)` は全 match (= default-allow bug) になるため regex を作らない。
+	if (applicable.length === 0) {
+		return undefined
+	}
+	for (const pattern of applicable) {
+		// canonical 外 (raw から regex を再導出できない) は Option A の semantics を保護
+		// するため per-pattern 評価に降ろす。
+		if (
+			pattern.regex !== legacyGlobToRegex(pattern.raw)
+			|| pattern.regex.length > MaxPatternSourceLength
+		) {
+			return PreparedFallback
+		}
+	}
+	const joined = applicable.map(pattern => `(?:${pattern.regex})`).join('|')
+	if (joined.length > MaxUnifiedSourceLength) {
+		return PreparedFallback
+	}
+	try {
+		// flag は付けない (g / y は lastIndex が呼び出し間で残り判定が非決定的になる)。
+		return new RegExp(joined)
+	} catch {
+		return PreparedFallback
+	}
+}
+
+function prepareVisibility(
+	visibility: Extract<ImpDocVisibility, { type: 'within' }>,
+): PreparedVisibility {
+	return {
+		function: buildPreparedRegExp(visibility.patterns, 'function'),
+		star: buildPreparedRegExp(visibility.patterns, '*'),
+	}
 }
 
 /**
@@ -164,7 +234,9 @@ export function parseVisibility(
  * caller (= function identifier) が visibility の許可条件を満たすか判定。
  * public / undefined は defensive に許可、 private は owner exact、 within は owner
  * OR patterns。 targetType が `*` なら caller の kind を問わず match。
- * pattern の RegExp は `compiledPatternCache` 経由で再利用し per-call compile を避ける。
+ * within の patterns は `preparedVisibilityCache` (Option B) の unified regex で 1 回の
+ * `test()` に畳む。 fallback 発火時は `compiledPatternCache` (Option A) の per-pattern
+ * 評価に降ろす。
  */
 export function matchesVisibility(
 	visibility: ImpDocVisibility | undefined,
@@ -177,12 +249,27 @@ export function matchesVisibility(
 			return true
 		case 'private':
 			return caller === visibility.owner
-		case 'within':
-			return caller === visibility.owner
-				|| visibility.patterns.some(pattern =>
+		case 'within': {
+			if (caller === visibility.owner) {
+				return true
+			}
+			let prepared = preparedVisibilityCache.get(visibility)
+			if (!prepared) {
+				prepared = prepareVisibility(visibility)
+				preparedVisibilityCache.set(visibility, prepared)
+			}
+			const compiled = callerType === 'function' ? prepared.function : prepared.star
+			if (compiled === undefined) {
+				return false
+			}
+			if (compiled === PreparedFallback) {
+				return visibility.patterns.some(pattern =>
 					(pattern.targetType === '*' || pattern.targetType === callerType)
 					&& getCompiledPatternRegExp(pattern).test(caller)
 				)
+			}
+			return compiled.test(caller)
+		}
 	}
 }
 
@@ -215,7 +302,7 @@ export function visibilityRestrictions(
  * 渡された場合 canonical location として保存。
  */
 export function stampVisibility(
-	symbol: Symbol,
+	symbol: CoreSymbol,
 	visibility: ImpDocVisibility,
 	declaration?: ImpDocDeclarationSource,
 ): void {
@@ -244,7 +331,7 @@ export function stampVisibility(
  * Remove visibility metadata previously contributed by an IMP-Doc function
  * header. Other symbol data and canonical declaration metadata are preserved.
  */
-export function clearVisibility(symbol: Symbol): void {
+export function clearVisibility(symbol: CoreSymbol): void {
 	const root = asRecord(symbol.data)
 	const previous = getImpDocSymbolData(symbol.data)
 	if (!previous) {

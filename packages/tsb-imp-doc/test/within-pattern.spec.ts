@@ -335,6 +335,65 @@ describe('matchesVisibility', () => {
 			)
 		}
 	})
+
+	it('evaluates non-canonical patterns through the per-pattern fallback path', () => {
+		// raw と regex が食い違う pattern は unified regex (Option B) の canonical check
+		// で弾かれ、 per-pattern cache (Option A) の順序付き評価に降りる。 fallback path
+		// でも判定は pattern.regex 側で行われる semantics を pin。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [{
+				raw: 'foo:bar',
+				targetType: 'function' as const,
+				regex: '^completely/unrelated$',
+			}],
+		}
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
+		// raw ではなく regex が評価される (fallback path でも regex 基準)。
+		assert.equal(matchesVisibility(visibility, 'completely/unrelated'), true)
+		assert.equal(matchesVisibility(visibility, 'foo:bar'), false)
+	})
+
+	it('matches large canonical pattern sets through the unified regex path', () => {
+		// 16 個の canonical pattern (raw から legacyGlobToRegex で生成) は visibility
+		// 単位の unified regex (Option B) に畳まれる。 owner / 各 pattern match /
+		// no-match の全系で per-pattern `.some()` と semantically 等価であることを pin。
+		const patterns = Array.from({ length: 16 }, (_, i) => ({
+			raw: `allowed:ns${i}/**`,
+			targetType: 'function' as const,
+			regex: legacyGlobToRegex(`allowed:ns${i}/**`),
+		}))
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns,
+		}
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
+		for (let i = 0; i < patterns.length; i++) {
+			assert.equal(
+				matchesVisibility(visibility, `allowed:ns${i}/deep/nested`),
+				true,
+			)
+		}
+		assert.equal(matchesVisibility(visibility, 'denied:ns0/deep'), false)
+	})
+
+	it('resolves explicit star caller type against *-only patterns', () => {
+		// call site は現状すべて callerType 'function' だが、 `*` 経路の prepared regex
+		// も独立に引けることを pin (caller type 別 cache の将来 proofing)。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [{
+				raw: 'star:allowed/**',
+				targetType: '*' as const,
+				regex: '^star:allowed/.*$',
+			}],
+		}
+		assert.equal(matchesVisibility(visibility, 'star:allowed/deep', '*'), true)
+		assert.equal(matchesVisibility(visibility, 'denied:caller', '*'), false)
+	})
 })
 
 describe('visibilityRestrictions', () => {
