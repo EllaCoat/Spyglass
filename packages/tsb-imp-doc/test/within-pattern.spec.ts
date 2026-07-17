@@ -422,15 +422,24 @@ describe('matchesVisibility', () => {
 				super(source, flags)
 				compileCount++
 			}
-		}
-		// deno-lint-ignore no-explicit-any
+		} // deno-lint-ignore no-explicit-any
+
 		;(globalThis as any).RegExp = SpiedRegExp
 		try {
 			const proxy1 = StateProxy.create(originVisibility)
 			const proxy2 = StateProxy.create(originVisibility)
-			assert.equal(matchesVisibility(proxy1 as unknown as typeof originVisibility, 'other:allowed/deep/nested'), true)
+			assert.equal(
+				matchesVisibility(
+					proxy1 as unknown as typeof originVisibility,
+					'other:allowed/deep/nested',
+				),
+				true,
+			)
 			const afterFirst = compileCount
-			assert.equal(matchesVisibility(proxy2 as unknown as typeof originVisibility, 'other:leaf/foo'), true)
+			assert.equal(
+				matchesVisibility(proxy2 as unknown as typeof originVisibility, 'other:leaf/foo'),
+				true,
+			)
 			assert.equal(
 				compileCount,
 				afterFirst,
@@ -466,15 +475,21 @@ describe('matchesVisibility', () => {
 				super(source, flags)
 				compileCount++
 			}
-		}
-		// deno-lint-ignore no-explicit-any
+		} // deno-lint-ignore no-explicit-any
+
 		;(globalThis as any).RegExp = SpiedRegExp
 		try {
 			const proxy1 = StateProxy.create(originVisibility)
 			const proxy2 = StateProxy.create(originVisibility)
-			assert.equal(matchesVisibility(proxy1 as unknown as typeof originVisibility, 'completely/unrelated'), true)
+			assert.equal(
+				matchesVisibility(proxy1 as unknown as typeof originVisibility, 'completely/unrelated'),
+				true,
+			)
 			const afterFirst = compileCount
-			assert.equal(matchesVisibility(proxy2 as unknown as typeof originVisibility, 'completely/unrelated'), true)
+			assert.equal(
+				matchesVisibility(proxy2 as unknown as typeof originVisibility, 'completely/unrelated'),
+				true,
+			)
 			assert.equal(
 				compileCount,
 				afterFirst,
