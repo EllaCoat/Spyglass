@@ -449,25 +449,60 @@ function collectReferences(state: FileState): string[] {
 	return [...references].sort()
 }
 
-function collectExports(symbols: core.SymbolUtil, uri: string): ExportSymbolSummary[] {
-	const exports: ExportSymbolSummary[] = []
+/**
+ * Collects exported symbol summaries for every URI in `uris` with a single
+ * traversal of the global symbol table, instead of one traversal per file.
+ *
+ * Equivalent to the previous per-file collection: for each symbol, `usage`
+ * lists the matching {@link ExportUsageTypes} in declaration order
+ * (`reference` stays excluded), and each per-URI bucket is sorted by symbol
+ * key. URIs without exports have no entry in the returned map.
+ */
+function collectAllExports(
+	symbols: core.SymbolUtil,
+	uris: ReadonlySet<string>,
+): Map<string, ExportSymbolSummary[]> {
+	const exportsByUri = new Map<string, ExportSymbolSummary[]>()
 	core.SymbolUtil.forEachSymbol(symbols.global, (symbol) => {
-		const usage = ExportUsageTypes.filter(type =>
-			symbol[type]?.some(location => location.uri === uri)
-		)
-		if (usage.length === 0) {
+		let usageByUri: Map<string, ExportSymbolSummary['usage']> | undefined
+		for (const type of ExportUsageTypes) {
+			for (const location of symbol[type] ?? []) {
+				if (!uris.has(location.uri)) {
+					continue
+				}
+				const usage = (usageByUri ??= new Map()).get(location.uri)
+				if (!usage) {
+					usageByUri.set(location.uri, [type])
+				} else if (usage[usage.length - 1] !== type) {
+					// Types are visited in declaration order, so a duplicate of
+					// the current type can only be the last element.
+					usage.push(type)
+				}
+			}
+		}
+		if (!usageByUri) {
 			return
 		}
-		exports.push({
-			category: symbol.category,
-			path: [...symbol.path],
-			key: toSymbolKey(symbol.category, symbol.path),
-			usage: [...usage],
-			...('data' in symbol ? { data: symbol.data } : {}),
-			...(symbol.desc === undefined ? {} : { description: symbol.desc }),
-		})
+		for (const [uri, usage] of usageByUri) {
+			let exports = exportsByUri.get(uri)
+			if (!exports) {
+				exports = []
+				exportsByUri.set(uri, exports)
+			}
+			exports.push({
+				category: symbol.category,
+				path: [...symbol.path],
+				key: toSymbolKey(symbol.category, symbol.path),
+				usage,
+				...('data' in symbol ? { data: symbol.data } : {}),
+				...(symbol.desc === undefined ? {} : { description: symbol.desc }),
+			})
+		}
 	})
-	return exports.sort((a, b) => a.key.localeCompare(b.key))
+	for (const exports of exportsByUri.values()) {
+		exports.sort((a, b) => a.key.localeCompare(b.key))
+	}
+	return exportsByUri
 }
 
 function sortDiagnostics(diagnostics: LintDiagnostic[]): void {
@@ -752,6 +787,7 @@ export async function runImpDocLint(
 			}
 		}
 	}
+	const exportsByUri = collectAllExports(symbols, new Set(states.map(state => state.uri)))
 	const manifestProfiler = projectData.profilers.get(SerializeManifestProfilerId, 'top-n', 50)
 	for (const state of states) {
 		manifestFiles[state.file] = {
@@ -762,7 +798,7 @@ export async function runImpDocLint(
 				lines: state.content.split(/\r?\n/).length,
 				parserErrors: state.node.parserErrors.length,
 			},
-			exports: collectExports(symbols, state.uri),
+			exports: exportsByUri.get(state.uri) ?? [],
 			references: collectReferences(state),
 			diagnostics: diagnostics.filter(diagnostic => diagnostic.file === state.file),
 		}

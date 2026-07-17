@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { pathToFileURL } from 'node:url'
 import { rawCacheToken, writeCacheAtomically } from '../lib/cache-file.js'
 import { createDependencyGraph, expandAffectedFiles, toSymbolKey } from '../lib/graph.js'
 import { isPerFileManifest, type PerFileManifest } from '../lib/manifest.js'
@@ -258,4 +259,341 @@ describe('incremental runner cache', () => {
 			)
 		},
 	)
+})
+
+describe('manifest exports characterization', () => {
+	let cachePath: string
+	let projectDir: string
+	let functionsDir: string
+	let privateFile: string
+
+	beforeEach(async () => {
+		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-cli-'))
+		functionsDir = join(projectDir, 'data', 'example', 'functions')
+		await mkdir(functionsDir, { recursive: true })
+		cachePath = join(projectDir, '.tsb-lint-cache.json')
+		privateFile = join(functionsDir, 'private.mcfunction')
+		await Promise.all([
+			writeFile(privateFile, '#> example:private\n# @private\n\nsay private\n'),
+			writeFile(
+				join(functionsDir, 'caller.mcfunction'),
+				'#> example:caller\n# @public\n\nfunction example:private\n',
+			),
+			writeFile(
+				join(functionsDir, 'declares.mcfunction'),
+				'#> example:declares\n# @public\n\n'
+					+ '#> Tag declaration\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ '#> Storage declaration\n# @private\n    #declare storage example:data\n\n'
+					+ '#> Score holder declaration\n# @public\n    #declare score_holder $Counter\n\n'
+					+ 'say declares\n',
+			),
+			writeFile(join(functionsDir, 'noexports.mcfunction'), 'say hello\n'),
+		])
+	})
+
+	afterEach(async () => {
+		await rm(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+	})
+
+	async function run() {
+		const files = await scanMcfunctionFiles(projectDir)
+		return runImpDocLint(files, {
+			targetDir: projectDir,
+			parallel: 2,
+			cachePath,
+		})
+	}
+
+	async function cachedExports(): Promise<unknown> {
+		const value = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: { files: Record<string, { exports: unknown }> }
+		}
+		return Object.fromEntries(
+			Object.entries(value.manifest.files).map(([file, entry]) => [file, entry.exports]),
+		)
+	}
+
+	/**
+	 * Pinned output of the manifest `exports` field. Captured from the per-file
+	 * `collectExports` implementation to guard usage filtering (`reference` is
+	 * excluded), the per-file key sort, and the `data` / `description`
+	 * passthrough during refactors of the collection strategy.
+	 */
+	function expectedExports(): Record<string, unknown> {
+		const declaresUri = pathToFileURL(join(functionsDir, 'declares.mcfunction')).toString()
+		return {
+			// References example:private, which must not surface as an export here.
+			[join(functionsDir, 'caller.mcfunction')]: [{
+				category: 'function',
+				path: ['example:caller'],
+				key: toSymbolKey('function', ['example:caller']),
+				usage: ['declaration'],
+				data: { impDoc: { visibility: { type: 'public' } } },
+				description: '**Visibility:** public\n\n\n\n@public',
+			}],
+			// Multiple categories in one file pin the sort by symbol key.
+			[join(functionsDir, 'declares.mcfunction')]: [{
+				category: 'function',
+				path: ['example:declares'],
+				key: toSymbolKey('function', ['example:declares']),
+				usage: ['declaration'],
+				data: { impDoc: { visibility: { type: 'public' } } },
+				description: '**Visibility:** public\n\n\n\n@public',
+			}, {
+				category: 'score_holder',
+				path: ['$Counter'],
+				key: toSymbolKey('score_holder', ['$Counter']),
+				usage: ['declaration'],
+				data: {
+					impDoc: {
+						visibility: { type: 'public' },
+						declaration: {
+							uri: declaresUri,
+							range: { start: 222, end: 230 },
+							owner: 'example:declares',
+						},
+					},
+				},
+				description: 'Score holder declaration\n\n\n@public',
+			}, {
+				category: 'storage',
+				path: ['example:data'],
+				key: toSymbolKey('storage', ['example:data']),
+				usage: ['declaration'],
+				data: {
+					impDoc: {
+						visibility: { type: 'private', owner: 'example:declares' },
+						declaration: {
+							uri: declaresUri,
+							range: { start: 144, end: 156 },
+							owner: 'example:declares',
+						},
+						privateOwner: 'example:declares',
+					},
+				},
+				description: 'Storage declaration\n\n\n@private',
+			}, {
+				category: 'tag',
+				path: ['Enemy.Boss'],
+				key: toSymbolKey('tag', ['Enemy.Boss']),
+				usage: ['declaration'],
+				data: {
+					impDoc: {
+						visibility: { type: 'public' },
+						declaration: {
+							uri: declaresUri,
+							range: { start: 77, end: 87 },
+							owner: 'example:declares',
+						},
+					},
+				},
+				description: 'Tag declaration\n\n\n@public',
+			}],
+			// No imp-doc header: the synthesized declaration has no data or description.
+			[join(functionsDir, 'noexports.mcfunction')]: [{
+				category: 'function',
+				path: ['example:noexports'],
+				key: toSymbolKey('function', ['example:noexports']),
+				usage: ['declaration'],
+			}],
+			[join(functionsDir, 'private.mcfunction')]: [{
+				category: 'function',
+				path: ['example:private'],
+				key: toSymbolKey('function', ['example:private']),
+				usage: ['declaration'],
+				data: {
+					impDoc: {
+						visibility: { type: 'private', owner: 'example:private' },
+						privateOwner: 'example:private',
+					},
+				},
+				description: '**Visibility:** private (example:private)\n\n\n\n@private',
+			}],
+		}
+	}
+
+	it('pins per-file exports across cold and incremental runs', async () => {
+		const cold = await run()
+		assert.equal(cold.fullScan, true)
+		assert.equal(cold.filesProcessed, 4)
+		assert.deepEqual(await cachedExports(), expectedExports())
+
+		await writeFile(privateFile, '#> example:private\n# @private\n\nsay private again\n')
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 2)
+		assert.deepEqual(await cachedExports(), expectedExports())
+	})
+})
+
+/**
+ * Multi-usage behavior of the batched export collection, pinned through real
+ * runs: duplicate same-type locations collapse into a single `usage` entry,
+ * `reference` locations never surface (also when they share a URI with a
+ * declaration of the same symbol), and the locations of one symbol split into
+ * separate per-URI buckets. The CLI pipeline only ever enters `declaration`
+ * (URI binder, IMP-Doc declarations) and `reference` (checker) usages, so the
+ * relative order of `definition` / `implementation` / `typeDefinition` usages
+ * cannot surface through `runImpDocLint` and stays unpinned here.
+ */
+describe('manifest exports multi-usage characterization', () => {
+	let cachePath: string
+	let projectDir: string
+	let functionsDir: string
+	let dupFile: string
+
+	beforeEach(async () => {
+		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-cli-'))
+		functionsDir = join(projectDir, 'data', 'example', 'functions')
+		await mkdir(functionsDir, { recursive: true })
+		cachePath = join(projectDir, '.tsb-lint-cache.json')
+		dupFile = join(functionsDir, 'dup.mcfunction')
+		await Promise.all([
+			writeFile(
+				dupFile,
+				'#> example:dup\n# @public\n\n'
+					+ '#> First duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ '#> Second duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ 'say dup\n',
+			),
+			writeFile(
+				join(functionsDir, 'other.mcfunction'),
+				'#> example:other\n# @public\n\n'
+					+ '#> Shared tag\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ 'say other\n',
+			),
+			writeFile(
+				join(functionsDir, 'selfref.mcfunction'),
+				'#> example:selfref\n# @public\n\n'
+					+ 'function example:selfref\nfunction example:missing\n',
+			),
+		])
+	})
+
+	afterEach(async () => {
+		await rm(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+	})
+
+	async function run() {
+		const files = await scanMcfunctionFiles(projectDir)
+		return runImpDocLint(files, {
+			targetDir: projectDir,
+			parallel: 2,
+			cachePath,
+		})
+	}
+
+	interface CachedSymbol {
+		declaration?: { uri: string }[]
+		reference?: { uri: string }[]
+	}
+
+	interface CacheContent {
+		manifest: {
+			files: Record<string, { exports: { key: string; usage: string[] }[] }>
+		}
+		symbols: Record<string, Record<string, CachedSymbol | undefined> | undefined>
+	}
+
+	async function readCache(): Promise<CacheContent> {
+		return JSON.parse(await readFile(cachePath, 'utf8')) as CacheContent
+	}
+
+	async function exportSummaries(): Promise<Record<string, { key: string; usage: string[] }[]>> {
+		return Object.fromEntries(
+			Object.entries((await readCache()).manifest.files).map(([file, entry]) => [
+				file,
+				entry.exports.map(({ key, usage }) => ({ key, usage })),
+			]),
+		)
+	}
+
+	function expectedSummaries(): Record<string, { key: string; usage: string[] }[]> {
+		return {
+			[join(functionsDir, 'dup.mcfunction')]: [
+				{ key: toSymbolKey('function', ['example:dup']), usage: ['declaration'] },
+				{ key: toSymbolKey('tag', ['Enemy.Boss']), usage: ['declaration'] },
+			],
+			[join(functionsDir, 'other.mcfunction')]: [
+				{ key: toSymbolKey('function', ['example:other']), usage: ['declaration'] },
+				{ key: toSymbolKey('tag', ['Enemy.Boss']), usage: ['declaration'] },
+			],
+			[join(functionsDir, 'selfref.mcfunction')]: [{
+				key: toSymbolKey('function', ['example:selfref']),
+				usage: ['declaration'],
+			}],
+		}
+	}
+
+	it('collapses duplicate same-type locations into a single usage entry across runs', async () => {
+		const cold = await run()
+		assert.equal(cold.fullScan, true)
+		assert.equal(cold.filesProcessed, 3)
+		assert.deepEqual(cold.diagnostics, [])
+
+		// Fixture premise: the duplicate `#declare` lines produce two declaration
+		// locations at the same URI before the collection deduplicates them.
+		const tag = (await readCache()).symbols['tag']?.['Enemy.Boss']
+		assert.deepEqual(tag?.declaration?.map(location => location.uri), [
+			pathToFileURL(dupFile).toString(),
+			pathToFileURL(dupFile).toString(),
+			pathToFileURL(join(functionsDir, 'other.mcfunction')).toString(),
+		])
+		assert.deepEqual(await exportSummaries(), expectedSummaries())
+
+		await writeFile(
+			dupFile,
+			'#> example:dup\n# @public\n\n'
+				+ '#> First duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+				+ '#> Second duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+				+ 'say dup again\n',
+		)
+		// The unchanged co-exporter of the shared tag is re-processed as well, so
+		// both URI buckets are rebuilt by the batched collection in this pass.
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 2)
+		assert.deepEqual(await exportSummaries(), expectedSummaries())
+	})
+
+	it('excludes reference usages, also when mixed with a declaration at one URI', async () => {
+		await run()
+		const selfrefUri = pathToFileURL(join(functionsDir, 'selfref.mcfunction')).toString()
+		const cache = await readCache()
+
+		// Fixture premise: the self call mixes declaration and reference locations
+		// of one symbol at one URI, and example:missing has only references.
+		const selfref = cache.symbols['function']?.['example:selfref']
+		assert.deepEqual(selfref?.declaration?.map(location => location.uri), [selfrefUri])
+		assert.deepEqual(selfref?.reference?.map(location => location.uri), [selfrefUri])
+		const missing = cache.symbols['function']?.['example:missing']
+		assert.deepEqual(missing?.declaration ?? [], [])
+		assert.deepEqual(missing?.reference?.map(location => location.uri), [selfrefUri])
+
+		assert.deepEqual(
+			(await exportSummaries())[join(functionsDir, 'selfref.mcfunction')],
+			[{ key: toSymbolKey('function', ['example:selfref']), usage: ['declaration'] }],
+		)
+	})
+
+	it('splits the locations of one symbol into separate per-URI buckets', async () => {
+		await run()
+		const summaries = await exportSummaries()
+		const tagKey = toSymbolKey('tag', ['Enemy.Boss'])
+		assert.deepEqual(
+			Object.entries(summaries)
+				.filter(([, exports]) => exports.some(entry => entry.key === tagKey))
+				.map(([file]) => file)
+				.sort(),
+			[join(functionsDir, 'dup.mcfunction'), join(functionsDir, 'other.mcfunction')],
+		)
+		assert.deepEqual(summaries[join(functionsDir, 'dup.mcfunction')], [
+			{ key: toSymbolKey('function', ['example:dup']), usage: ['declaration'] },
+			{ key: tagKey, usage: ['declaration'] },
+		])
+		assert.deepEqual(summaries[join(functionsDir, 'other.mcfunction')], [
+			{ key: toSymbolKey('function', ['example:other']), usage: ['declaration'] },
+			{ key: tagKey, usage: ['declaration'] },
+		])
+	})
 })
