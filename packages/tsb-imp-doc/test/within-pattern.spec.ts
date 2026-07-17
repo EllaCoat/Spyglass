@@ -444,8 +444,9 @@ describe('matchesVisibility', () => {
 
 	it('reuses per-pattern cache in fallback path across StateProxy identities', () => {
 		// canonical 外 pattern を持つ visibility は Option B の fallback path (per-pattern `.some()`) に
-		// 降ろされる。 fallback path でも `getCompiledPatternRegExp` が dereference 済 identity を
-		// key にするため、 別 proxy で二度呼んでも per-pattern cache の追加 compile は発生しない。
+		// 降ろされる。 fallback 経路でも `matchesVisibility` が visibility 側を origin に正規化してから
+		// `key.patterns` を反復するため、 per-pattern も origin element を key に cache hit する。
+		// 別 proxy で二度呼んでも追加 compile は発生しないことを pin (visibility-level 正規化の検証)。
 		const originVisibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
