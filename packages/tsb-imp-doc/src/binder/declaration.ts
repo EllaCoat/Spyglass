@@ -18,9 +18,15 @@ function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
 	return undefined
 }
 
+const ownerCache = new WeakMap<core.BinderContext, { value: string | undefined }>()
+
 function ownerForDocument(
 	ctx: core.BinderContext,
 ): string | undefined {
+	const cached = ownerCache.get(ctx)
+	if (cached) {
+		return cached.value
+	}
 	const functions = ctx.symbols.lookup('function', []).parentMap
 	let declaredOwner: string | undefined
 	for (const symbol of Object.values(functions ?? {})) {
@@ -28,6 +34,7 @@ function ownerForDocument(
 			continue
 		}
 		if (symbol.definition?.some(location => location.uri === ctx.doc.uri)) {
+			ownerCache.set(ctx, { value: symbol.identifier })
 			return symbol.identifier
 		}
 		if (
@@ -37,6 +44,7 @@ function ownerForDocument(
 			declaredOwner = symbol.identifier
 		}
 	}
+	ownerCache.set(ctx, { value: declaredOwner })
 	return declaredOwner
 }
 
