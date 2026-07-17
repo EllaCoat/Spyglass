@@ -137,7 +137,12 @@ export type WithinTargetType = '*' | 'function'
 
 /**
  * Symbol.data/cache に保存するため RegExp ではなく文字列で保持する。
- * 実行時は共有 `matchesVisibility()` が `new RegExp(regex)` で評価する。
+ * 実行時は共有 `matchesVisibility()` が module-level WeakMap cache 経由で
+ * compile 済 RegExp を再利用する。 cache 前提を破らないための規約 :
+ * - RegExp を field に直接埋め込まない (`JSON.stringify` で `{}` に情報落ちする、
+ *   compile 結果は withinPattern.ts の module-level WeakMap 側に分離して持つ)
+ * - pattern object の in-place mutation 禁止 (`readonly` は patterns 配列側にしか
+ *   付かず field 書き換えは型で防げないが、 identity ベースの cache key が破綻する)
  */
 export interface WithinPattern {
 	/** annotation に書かれた原文 */

@@ -33,6 +33,27 @@ const RegexSpecials = new Set([
 ])
 
 /**
+ * `matchesVisibility()` が compile した RegExp の per-pattern cache。 key は
+ * `WithinPattern` の object identity (寿命は WeakMap 経由で GC 任せ)。 pattern
+ * 自体は serialize されるため RegExp を埋め込まず、 cache 側に分離して保持する。
+ */
+type CompiledEntry = { source: string; regexp: RegExp }
+const compiledPatternCache: WeakMap<WithinPattern, CompiledEntry> = new WeakMap()
+
+function getCompiledPatternRegExp(pattern: WithinPattern): RegExp {
+	const entry = compiledPatternCache.get(pattern)
+	// source 一致確認は defense in depth (同一 identity のまま regex が書き換わる
+	// ケースは想定外だが、 食い違ったら新 entry で上書きする)。
+	if (entry && entry.source === pattern.regex) {
+		return entry.regexp
+	}
+	// flag は付けない (g / y は lastIndex が呼び出し間で残り判定が非決定的になる)。
+	const regexp = new RegExp(pattern.regex)
+	compiledPatternCache.set(pattern, { source: pattern.regex, regexp })
+	return regexp
+}
+
+/**
  * Legacy IMP-Doc の path pattern を anchored regex source に変換する。
  * `*` は `/` を跨がない、 `**` は `/` を跨ぐ、 その他 regex meta character は escape。
  */
@@ -143,6 +164,7 @@ export function parseVisibility(
  * caller (= function identifier) が visibility の許可条件を満たすか判定。
  * public / undefined は defensive に許可、 private は owner exact、 within は owner
  * OR patterns。 targetType が `*` なら caller の kind を問わず match。
+ * pattern の RegExp は `compiledPatternCache` 経由で再利用し per-call compile を避ける。
  */
 export function matchesVisibility(
 	visibility: ImpDocVisibility | undefined,
@@ -159,7 +181,7 @@ export function matchesVisibility(
 			return caller === visibility.owner
 				|| visibility.patterns.some(pattern =>
 					(pattern.targetType === '*' || pattern.targetType === callerType)
-					&& new RegExp(pattern.regex).test(caller)
+					&& getCompiledPatternRegExp(pattern).test(caller)
 				)
 	}
 }
