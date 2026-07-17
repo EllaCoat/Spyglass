@@ -141,16 +141,16 @@ export type WithinTargetType = '*' | 'function'
  * compile 済 RegExp を再利用する。 cache 前提を破らないための規約 :
  * - RegExp を field に直接埋め込まない (`JSON.stringify` で `{}` に情報落ちする、
  *   compile 結果は withinPattern.ts の module-level WeakMap 側に分離して持つ)
- * - pattern object の in-place mutation 禁止 (`readonly` は patterns 配列側にしか
- *   付かず field 書き換えは型で防げないが、 identity ベースの cache key が破綻する)
+ * - pattern object の field は readonly で immutable を型に強制 (identity ベースの
+ *   cache key と semantics 一貫性の担保、 in-place mutation は build error になる)
  */
 export interface WithinPattern {
 	/** annotation に書かれた原文 */
-	raw: string
+	readonly raw: string
 	/** Legacy の対象 file type。 Tier A の consumer は function と * を扱う。 */
-	targetType: WithinTargetType
+	readonly targetType: WithinTargetType
 	/** ^...$ を含む RegExp source */
-	regex: string
+	readonly regex: string
 }
 
 export type ImpDocVisibility =

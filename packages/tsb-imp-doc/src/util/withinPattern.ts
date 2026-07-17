@@ -92,6 +92,9 @@ function buildPreparedRegExp(
 	if (applicable.length === 0) {
 		return undefined
 	}
+	// 累積長で判定 (map().join() 一括構築だと巨大 pattern set で無駄な一時文字列を確保する)。
+	let unifiedLength = 0
+	const sources: string[] = []
 	for (const pattern of applicable) {
 		// canonical 外 (raw から regex を再導出できない) は Option A の semantics を保護
 		// するため per-pattern 評価に降ろす。
@@ -101,14 +104,17 @@ function buildPreparedRegExp(
 		) {
 			return PreparedFallback
 		}
-	}
-	const joined = applicable.map(pattern => `(?:${pattern.regex})`).join('|')
-	if (joined.length > MaxUnifiedSourceLength) {
-		return PreparedFallback
+		const source = `(?:${pattern.regex})`
+		// separator `|` は 2 個目以降で 1 char 加算。
+		unifiedLength += source.length + (sources.length > 0 ? 1 : 0)
+		if (unifiedLength > MaxUnifiedSourceLength) {
+			return PreparedFallback
+		}
+		sources.push(source)
 	}
 	try {
 		// flag は付けない (g / y は lastIndex が呼び出し間で残り判定が非決定的になる)。
-		return new RegExp(joined)
+		return new RegExp(sources.join('|'))
 	} catch {
 		return PreparedFallback
 	}
