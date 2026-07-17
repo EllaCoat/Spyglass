@@ -425,3 +425,175 @@ describe('manifest exports characterization', () => {
 		assert.deepEqual(await cachedExports(), expectedExports())
 	})
 })
+
+/**
+ * Multi-usage behavior of the batched export collection, pinned through real
+ * runs: duplicate same-type locations collapse into a single `usage` entry,
+ * `reference` locations never surface (also when they share a URI with a
+ * declaration of the same symbol), and the locations of one symbol split into
+ * separate per-URI buckets. The CLI pipeline only ever enters `declaration`
+ * (URI binder, IMP-Doc declarations) and `reference` (checker) usages, so the
+ * relative order of `definition` / `implementation` / `typeDefinition` usages
+ * cannot surface through `runImpDocLint` and stays unpinned here.
+ */
+describe('manifest exports multi-usage characterization', () => {
+	let cachePath: string
+	let projectDir: string
+	let functionsDir: string
+	let dupFile: string
+
+	beforeEach(async () => {
+		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-cli-'))
+		functionsDir = join(projectDir, 'data', 'example', 'functions')
+		await mkdir(functionsDir, { recursive: true })
+		cachePath = join(projectDir, '.tsb-lint-cache.json')
+		dupFile = join(functionsDir, 'dup.mcfunction')
+		await Promise.all([
+			writeFile(
+				dupFile,
+				'#> example:dup\n# @public\n\n'
+					+ '#> First duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ '#> Second duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ 'say dup\n',
+			),
+			writeFile(
+				join(functionsDir, 'other.mcfunction'),
+				'#> example:other\n# @public\n\n'
+					+ '#> Shared tag\n# @public\n    #declare tag Enemy.Boss\n\n'
+					+ 'say other\n',
+			),
+			writeFile(
+				join(functionsDir, 'selfref.mcfunction'),
+				'#> example:selfref\n# @public\n\n'
+					+ 'function example:selfref\nfunction example:missing\n',
+			),
+		])
+	})
+
+	afterEach(async () => {
+		await rm(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+	})
+
+	async function run() {
+		const files = await scanMcfunctionFiles(projectDir)
+		return runImpDocLint(files, {
+			targetDir: projectDir,
+			parallel: 2,
+			cachePath,
+		})
+	}
+
+	interface CachedSymbol {
+		declaration?: { uri: string }[]
+		reference?: { uri: string }[]
+	}
+
+	interface CacheContent {
+		manifest: {
+			files: Record<string, { exports: { key: string; usage: string[] }[] }>
+		}
+		symbols: Record<string, Record<string, CachedSymbol | undefined> | undefined>
+	}
+
+	async function readCache(): Promise<CacheContent> {
+		return JSON.parse(await readFile(cachePath, 'utf8')) as CacheContent
+	}
+
+	async function exportSummaries(): Promise<Record<string, { key: string; usage: string[] }[]>> {
+		return Object.fromEntries(
+			Object.entries((await readCache()).manifest.files).map(([file, entry]) => [
+				file,
+				entry.exports.map(({ key, usage }) => ({ key, usage })),
+			]),
+		)
+	}
+
+	function expectedSummaries(): Record<string, { key: string; usage: string[] }[]> {
+		return {
+			[join(functionsDir, 'dup.mcfunction')]: [
+				{ key: toSymbolKey('function', ['example:dup']), usage: ['declaration'] },
+				{ key: toSymbolKey('tag', ['Enemy.Boss']), usage: ['declaration'] },
+			],
+			[join(functionsDir, 'other.mcfunction')]: [
+				{ key: toSymbolKey('function', ['example:other']), usage: ['declaration'] },
+				{ key: toSymbolKey('tag', ['Enemy.Boss']), usage: ['declaration'] },
+			],
+			[join(functionsDir, 'selfref.mcfunction')]: [{
+				key: toSymbolKey('function', ['example:selfref']),
+				usage: ['declaration'],
+			}],
+		}
+	}
+
+	it('collapses duplicate same-type locations into a single usage entry across runs', async () => {
+		const cold = await run()
+		assert.equal(cold.fullScan, true)
+		assert.equal(cold.filesProcessed, 3)
+		assert.deepEqual(cold.diagnostics, [])
+
+		// Fixture premise: the duplicate `#declare` lines produce two declaration
+		// locations at the same URI before the collection deduplicates them.
+		const tag = (await readCache()).symbols['tag']?.['Enemy.Boss']
+		assert.deepEqual(tag?.declaration?.map(location => location.uri), [
+			pathToFileURL(dupFile).toString(),
+			pathToFileURL(dupFile).toString(),
+			pathToFileURL(join(functionsDir, 'other.mcfunction')).toString(),
+		])
+		assert.deepEqual(await exportSummaries(), expectedSummaries())
+
+		await writeFile(
+			dupFile,
+			'#> example:dup\n# @public\n\n'
+				+ '#> First duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+				+ '#> Second duplicate\n# @public\n    #declare tag Enemy.Boss\n\n'
+				+ 'say dup again\n',
+		)
+		// The unchanged co-exporter of the shared tag is re-processed as well, so
+		// both URI buckets are rebuilt by the batched collection in this pass.
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 2)
+		assert.deepEqual(await exportSummaries(), expectedSummaries())
+	})
+
+	it('excludes reference usages, also when mixed with a declaration at one URI', async () => {
+		await run()
+		const selfrefUri = pathToFileURL(join(functionsDir, 'selfref.mcfunction')).toString()
+		const cache = await readCache()
+
+		// Fixture premise: the self call mixes declaration and reference locations
+		// of one symbol at one URI, and example:missing has only references.
+		const selfref = cache.symbols['function']?.['example:selfref']
+		assert.deepEqual(selfref?.declaration?.map(location => location.uri), [selfrefUri])
+		assert.deepEqual(selfref?.reference?.map(location => location.uri), [selfrefUri])
+		const missing = cache.symbols['function']?.['example:missing']
+		assert.deepEqual(missing?.declaration ?? [], [])
+		assert.deepEqual(missing?.reference?.map(location => location.uri), [selfrefUri])
+
+		assert.deepEqual(
+			(await exportSummaries())[join(functionsDir, 'selfref.mcfunction')],
+			[{ key: toSymbolKey('function', ['example:selfref']), usage: ['declaration'] }],
+		)
+	})
+
+	it('splits the locations of one symbol into separate per-URI buckets', async () => {
+		await run()
+		const summaries = await exportSummaries()
+		const tagKey = toSymbolKey('tag', ['Enemy.Boss'])
+		assert.deepEqual(
+			Object.entries(summaries)
+				.filter(([, exports]) => exports.some(entry => entry.key === tagKey))
+				.map(([file]) => file)
+				.sort(),
+			[join(functionsDir, 'dup.mcfunction'), join(functionsDir, 'other.mcfunction')],
+		)
+		assert.deepEqual(summaries[join(functionsDir, 'dup.mcfunction')], [
+			{ key: toSymbolKey('function', ['example:dup']), usage: ['declaration'] },
+			{ key: tagKey, usage: ['declaration'] },
+		])
+		assert.deepEqual(summaries[join(functionsDir, 'other.mcfunction')], [
+			{ key: toSymbolKey('function', ['example:other']), usage: ['declaration'] },
+			{ key: tagKey, usage: ['declaration'] },
+		])
+	})
+})
