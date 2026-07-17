@@ -236,6 +236,105 @@ describe('matchesVisibility', () => {
 		assert.equal(matchesVisibility(visibility, 'other:leaf/foo'), true)
 		assert.equal(matchesVisibility(visibility, 'other:leaf/foo/bar'), false)
 	})
+
+	it('filters mixed targetType patterns against the caller type', () => {
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					raw: 'star:allowed',
+					targetType: '*' as const,
+					regex: '^star:allowed$',
+				},
+				{
+					raw: 'func:allowed',
+					targetType: 'function' as const,
+					regex: '^func:allowed$',
+				},
+			],
+		}
+		// caller type default 'function' は `*` pattern と `function` pattern の両方に届く。
+		assert.equal(matchesVisibility(visibility, 'star:allowed'), true)
+		assert.equal(matchesVisibility(visibility, 'func:allowed'), true)
+		// caller type `*` を明示した場合、 `function` pattern は
+		// `pattern.targetType === '*' || pattern.targetType === callerType` を満たさない。
+		assert.equal(matchesVisibility(visibility, 'star:allowed', '*'), true)
+		assert.equal(matchesVisibility(visibility, 'func:allowed', '*'), false)
+	})
+
+	it('falls back to owner-only matching for within with empty patterns', () => {
+		// parseVisibility は patterns 空の within を生成しないが、 matchesVisibility 単体は
+		// 空 iterable の `.some()` が false を返す道を defensive に持つ。 その挙動を pin。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [],
+		}
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
+		assert.equal(matchesVisibility(visibility, 'other:caller'), false)
+	})
+
+	it('evaluates patterns by value regardless of object identity', () => {
+		// 同一 shape で identity が異なる pattern object でも判定は一致する。
+		// 将来 cache を導入しても semantics が identity で分岐しないことの証跡。
+		const makeVisibility = () => ({
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [{
+				raw: 'other:allowed/**',
+				targetType: 'function' as const,
+				regex: '^other:allowed/.*$',
+			}],
+		})
+		const first = makeVisibility()
+		const second = makeVisibility()
+		assert.notEqual(first.patterns[0], second.patterns[0])
+		assert.equal(matchesVisibility(first, 'other:allowed/deep'), true)
+		assert.equal(matchesVisibility(second, 'other:allowed/deep'), true)
+		assert.equal(matchesVisibility(first, 'denied:caller'), false)
+		assert.equal(matchesVisibility(second, 'denied:caller'), false)
+	})
+
+	it('behaves identically after a JSON round-trip', () => {
+		// WithinPattern は plain string 3 field のみで serialize 可能。 cache reload 経路
+		// (JSON 化 → 復元) を通しても判定が変わらないことを pin。
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			patterns: [
+				{
+					raw: 'owner:main',
+					targetType: 'function' as const,
+					regex: '^owner:main$',
+				},
+				{
+					raw: 'other:allowed/**',
+					targetType: '*' as const,
+					regex: '^other:allowed/.*$',
+				},
+			],
+		}
+		const reloaded = JSON.parse(JSON.stringify(visibility)) as typeof visibility
+		assert.deepEqual(reloaded, visibility)
+		assert.equal(matchesVisibility(reloaded, 'owner:helper'), true)
+		assert.equal(matchesVisibility(reloaded, 'owner:main'), true)
+		assert.equal(matchesVisibility(reloaded, 'other:allowed/deep/nested'), true)
+		assert.equal(matchesVisibility(reloaded, 'denied:caller'), false)
+		for (
+			const caller of [
+				'owner:helper',
+				'owner:main',
+				'other:allowed/deep/nested',
+				'denied:caller',
+			]
+		) {
+			assert.equal(
+				matchesVisibility(reloaded, caller),
+				matchesVisibility(visibility, caller),
+			)
+		}
+	})
 })
 
 describe('visibilityRestrictions', () => {
