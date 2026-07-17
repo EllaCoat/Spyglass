@@ -592,3 +592,98 @@ describe('IMP-Doc private visibility runtime — open-order independence (P1b bi
 		assertSingleViolation(externalState, 'external:caller')
 	})
 })
+
+describe('IMP-Doc private visibility runtime — getCaller characterization', () => {
+	let project: core.Project | undefined
+	let cacheDir: string | undefined
+
+	before(async () => {
+		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-getcaller-'))
+		const packMcmeta = core.normalizeUri(
+			new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
+		)
+		const watcher = new FixtureWatcher([
+			packMcmeta,
+			...Object.values(RuntimeFiles),
+		])
+
+		project = new core.Project({
+			cacheRoot: core.fileUtil.ensureEndingSlash(
+				pathToFileURL(cacheDir).toString(),
+			),
+			defaultConfig: createConfig(),
+			externals: NodeJsExternals,
+			initializers: [initializeRuntime],
+			logger: {
+				error: () => {},
+				info: () => {},
+				log: () => {},
+				warn: () => {},
+			},
+			projectRoots: [FixtureRoot],
+		})
+
+		await project.init()
+		await project.ready({ projectRootsWatcher: watcher })
+	})
+
+	after(async () => {
+		await project?.close()
+		if (cacheDir) {
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
+	function fixtureUri(path: string): string {
+		return core.normalizeUri(
+			new URL(`./runtime/private-project/${path}`, import.meta.url).toString(),
+		)
+	}
+
+	function enterFunction(
+		usage: core.SymbolUsageType,
+		id: string,
+		uri: string,
+	): void {
+		project!.symbols.contributeAs('uri_binder', () => {
+			project!.symbols.query(uri, 'function', id).enter({ usage: { type: usage } })
+		})
+	}
+
+	async function lintSyntheticCaller(uri: string): Promise<RuntimeState> {
+		assert.ok(project)
+		const content = 'function owner:helper\n'
+		await project.onDidOpen(uri, 'mcfunction', 1, content)
+		const state = project.getClientManaged(uri)
+		assert.ok(state)
+		await project.onDidClose(uri)
+		return { ...state, content }
+	}
+
+	it('resolves the declaration fallback in symbol-map insertion order, not location-entry order', async () => {
+		const callerUri = fixtureUri('data/order/functions/decl_caller.mcfunction')
+		const elsewhereUri = fixtureUri('data/order/functions/elsewhere.mcfunction')
+		// `order:second` enters the function symbol map first (via a location at a
+		// different URI), while its declaration at `callerUri` is entered only after
+		// `order:first`. The legacy getCaller scans the symbol map in insertion
+		// order, so the caller must resolve to `order:second` even though
+		// `order:first` contributed a location to `callerUri` earlier.
+		enterFunction('declaration', 'order:second', elsewhereUri)
+		enterFunction('declaration', 'order:first', callerUri)
+		enterFunction('declaration', 'order:second', callerUri)
+
+		const state = await lintSyntheticCaller(callerUri)
+		assertSingleViolation(state, 'order:second')
+	})
+
+	it('prefers a definition over an earlier-inserted declaration', async () => {
+		const callerUri = fixtureUri('data/order/functions/def_caller.mcfunction')
+		// `order:decl` is inserted into the symbol map before `order:def`, but a
+		// definition always wins over a declaration regardless of insertion order.
+		enterFunction('declaration', 'order:decl', callerUri)
+		enterFunction('definition', 'order:def', callerUri)
+
+		const state = await lintSyntheticCaller(callerUri)
+		assertSingleViolation(state, 'order:def')
+	})
+})
