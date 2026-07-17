@@ -226,6 +226,48 @@ describe('incremental runner cache', () => {
 		assert.equal(result.filesProcessed, 3)
 	})
 
+	it('accepts lean and legacy v2 export summaries, then rewrites legacy entries lean', async () => {
+		const cold = await run()
+		const leanCache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: {
+				files: Record<string, { exports: Record<string, unknown>[] }>
+			}
+		}
+		const leanExports = Object.values(leanCache.manifest.files).flatMap(entry => entry.exports)
+		assert.ok(leanExports.length > 0)
+		assert.ok(leanExports.every(entry => !('data' in entry) && !('description' in entry)))
+
+		const leanReload = await run()
+		assert.equal(leanReload.cacheHit, true)
+		assert.equal(leanReload.filesProcessed, 0)
+		assert.deepEqual(leanReload.diagnostics, cold.diagnostics)
+
+		for (const entry of Object.values(leanCache.manifest.files)) {
+			for (const exported of entry.exports) {
+				exported['data'] = { legacy: true }
+				exported['description'] = 'legacy v2 metadata'
+			}
+		}
+		await writeFile(cachePath, JSON.stringify(leanCache))
+
+		const legacyReload = await run()
+		assert.equal(legacyReload.cacheHit, true)
+		assert.equal(legacyReload.filesProcessed, 0)
+		assert.deepEqual(legacyReload.diagnostics, cold.diagnostics)
+
+		await writeFile(privateFile, '#> example:private\n# @private\n\nsay private changed\n')
+		const rewritten = await run()
+		assert.equal(rewritten.fullScan, false)
+		const rewrittenCache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: {
+				files: Record<string, { exports: Record<string, unknown>[] }>
+			}
+		}
+		const rewrittenExports = Object.values(rewrittenCache.manifest.files)
+			.flatMap(entry => entry.exports)
+		assert.ok(rewrittenExports.every(entry => !('data' in entry) && !('description' in entry)))
+	})
+
 	it(
 		'uses raw-byte tokens and permits only one process-local writer for a shared token',
 		{ timeout: 2_000 },
@@ -316,11 +358,10 @@ describe('manifest exports characterization', () => {
 	/**
 	 * Pinned output of the manifest `exports` field. Captured from the per-file
 	 * `collectExports` implementation to guard usage filtering (`reference` is
-	 * excluded), the per-file key sort, and the `data` / `description`
-	 * passthrough during refactors of the collection strategy.
+	 * excluded) and the per-file key sort during refactors of the collection
+	 * strategy.
 	 */
 	function expectedExports(): Record<string, unknown> {
-		const declaresUri = pathToFileURL(join(functionsDir, 'declares.mcfunction')).toString()
 		return {
 			// References example:private, which must not surface as an export here.
 			[join(functionsDir, 'caller.mcfunction')]: [{
@@ -328,8 +369,6 @@ describe('manifest exports characterization', () => {
 				path: ['example:caller'],
 				key: toSymbolKey('function', ['example:caller']),
 				usage: ['declaration'],
-				data: { impDoc: { visibility: { type: 'public' } } },
-				description: '**Visibility:** public\n\n\n\n@public',
 			}],
 			// Multiple categories in one file pin the sort by symbol key.
 			[join(functionsDir, 'declares.mcfunction')]: [{
@@ -337,59 +376,23 @@ describe('manifest exports characterization', () => {
 				path: ['example:declares'],
 				key: toSymbolKey('function', ['example:declares']),
 				usage: ['declaration'],
-				data: { impDoc: { visibility: { type: 'public' } } },
-				description: '**Visibility:** public\n\n\n\n@public',
 			}, {
 				category: 'score_holder',
 				path: ['$Counter'],
 				key: toSymbolKey('score_holder', ['$Counter']),
 				usage: ['declaration'],
-				data: {
-					impDoc: {
-						visibility: { type: 'public' },
-						declaration: {
-							uri: declaresUri,
-							range: { start: 222, end: 230 },
-							owner: 'example:declares',
-						},
-					},
-				},
-				description: 'Score holder declaration\n\n\n@public',
 			}, {
 				category: 'storage',
 				path: ['example:data'],
 				key: toSymbolKey('storage', ['example:data']),
 				usage: ['declaration'],
-				data: {
-					impDoc: {
-						visibility: { type: 'private', owner: 'example:declares' },
-						declaration: {
-							uri: declaresUri,
-							range: { start: 144, end: 156 },
-							owner: 'example:declares',
-						},
-						privateOwner: 'example:declares',
-					},
-				},
-				description: 'Storage declaration\n\n\n@private',
 			}, {
 				category: 'tag',
 				path: ['Enemy.Boss'],
 				key: toSymbolKey('tag', ['Enemy.Boss']),
 				usage: ['declaration'],
-				data: {
-					impDoc: {
-						visibility: { type: 'public' },
-						declaration: {
-							uri: declaresUri,
-							range: { start: 77, end: 87 },
-							owner: 'example:declares',
-						},
-					},
-				},
-				description: 'Tag declaration\n\n\n@public',
 			}],
-			// No imp-doc header: the synthesized declaration has no data or description.
+			// No imp-doc header: the synthesized declaration remains a regular export.
 			[join(functionsDir, 'noexports.mcfunction')]: [{
 				category: 'function',
 				path: ['example:noexports'],
@@ -401,13 +404,6 @@ describe('manifest exports characterization', () => {
 				path: ['example:private'],
 				key: toSymbolKey('function', ['example:private']),
 				usage: ['declaration'],
-				data: {
-					impDoc: {
-						visibility: { type: 'private', owner: 'example:private' },
-						privateOwner: 'example:private',
-					},
-				},
-				description: '**Visibility:** private (example:private)\n\n\n\n@private',
 			}],
 		}
 	}
