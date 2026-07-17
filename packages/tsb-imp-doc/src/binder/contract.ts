@@ -96,7 +96,11 @@ export function cloneContract(contract: ImpDocContract): ImpDocContract {
 	}
 }
 
-export function getCurrentFunctionSymbol(
+/**
+ * Preserve the legacy parent-map insertion-order lookup for cases where the
+ * reverse URI index cannot determine one unambiguous definition match.
+ */
+function getCurrentFunctionSymbolByFullScan(
 	ctx: Pick<BinderContext, 'doc' | 'symbols'>,
 ): Symbol | undefined {
 	const functions = ctx.symbols.lookup('function', []).parentMap
@@ -107,6 +111,34 @@ export function getCurrentFunctionSymbol(
 		) {
 			return symbol
 		}
+	}
+	return undefined
+}
+
+export function getCurrentFunctionSymbol(
+	ctx: Pick<BinderContext, 'doc' | 'symbols'>,
+): Symbol | undefined {
+	const candidates = ctx.symbols.getSymbolCandidatesAtUri(ctx.doc.uri)
+	// A SymbolUtil reconstructed without buildCache() has no reverse entries.
+	// Retain the complete legacy scan as its safety net.
+	if (candidates.length === 0) {
+		return getCurrentFunctionSymbolByFullScan(ctx)
+	}
+
+	// The reverse index is a superset, so re-verify definitions here. Deliberately
+	// do not use declaration locations: the legacy implementation did not either.
+	const matches = candidates.filter(
+		symbol =>
+			symbol.category === 'function'
+			&& symbol.path.length === 1
+			&& symbol.definition?.some(location => location.uri === ctx.doc.uri),
+	)
+	if (matches.length === 1) {
+		return matches[0]
+	}
+	if (matches.length > 1) {
+		// URI cache insertion order can differ from parent-map insertion order.
+		return getCurrentFunctionSymbolByFullScan(ctx)
 	}
 	return undefined
 }
