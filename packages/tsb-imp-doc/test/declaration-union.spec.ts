@@ -107,6 +107,7 @@ function createConfig(): core.Config {
 function createRuntimeProject(
 	cacheDir: string,
 	projectRoot: core.RootUriString,
+	initializers: readonly core.ProjectInitializer[] = [initializeRuntime],
 ): core.Project {
 	return new core.Project({
 		cacheRoot: core.fileUtil.ensureEndingSlash(
@@ -114,7 +115,7 @@ function createRuntimeProject(
 		),
 		defaultConfig: createConfig(),
 		externals: NodeJsExternals,
-		initializers: [initializeRuntime],
+		initializers,
 		logger: {
 			error: () => {},
 			info: () => {},
@@ -373,7 +374,7 @@ describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 })
 
 describe('IMP-Doc function header purge on file deletion', () => {
-	it('drops a deleted @public header from the union across a warm reload', async () => {
+	it('purges a deleted header and settles its new owner before warm READY', async () => {
 		const projectRoot = await mkdtemp(
 			join(tmpdir(), 'spyglass-imp-doc-header-purge-project-'),
 		)
@@ -389,12 +390,20 @@ describe('IMP-Doc function header purge on file deletion', () => {
 			const header = await writeRuntimeFixtureFile(
 				projectRoot,
 				'data/a/functions/target.mcfunction',
-				'#> a:target\n# @public\n\nsay target\n',
+				'#> a:target\n# @public\n\nbadcommand target\n',
 			)
+			const declaringContent = '#> b:decl\n# @public\n\n'
+				+ '#> Restricted declaration\n# @private\n#declare function a:target\n'
 			const declaring = await writeRuntimeFixtureFile(
 				projectRoot,
 				'data/b/functions/decl.mcfunction',
-				'#> b:decl\n# @public\n\n#> Restricted declaration\n# @private\n#declare function a:target\n',
+				declaringContent,
+			)
+			const otherDeclaring = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/c/functions/decl.mcfunction',
+				'#> c:decl\n# @public\n\n'
+					+ '#> Other restricted declaration\n# @private\n#declare function a:target\n',
 			)
 			const projectRootUri = core.fileUtil.ensureEndingSlash(
 				core.normalizeUri(pathToFileURL(projectRoot).toString()),
@@ -403,7 +412,12 @@ describe('IMP-Doc function header purge on file deletion', () => {
 			first = createRuntimeProject(cacheDir, projectRootUri)
 			await first.init()
 			await first.ready({
-				projectRootsWatcher: new FixtureWatcher([pack.uri, header.uri, declaring.uri]),
+				projectRootsWatcher: new FixtureWatcher([
+					pack.uri,
+					header.uri,
+					declaring.uri,
+					otherDeclaring.uri,
+				]),
 			})
 			const before = getImpDocSymbolData(
 				first.symbols.lookup('function', ['a:target']).symbol?.data,
@@ -411,33 +425,70 @@ describe('IMP-Doc function header purge on file deletion', () => {
 			assert.equal(before?.headerUri, header.uri)
 			// The @public header keeps the union open for any caller.
 			assert.equal(matchesAnyVisibility(before, 'other:caller'), true)
+			// Linting a declaration queues the canonical header owner. Persist both
+			// its parser error and the public/private conflict as stale diagnostics.
+			await first.onDidOpen(declaring.uri, 'mcfunction', 1, declaringContent)
+			const seededHeaderErrors = first.cacheService.errors[header.uri] ?? []
+			assert.ok(seededHeaderErrors.length > 0)
+			assert.ok(
+				seededHeaderErrors.some(error => error.message.includes('impDocVisibilityConflict')),
+			)
 			await first.close()
 			first = undefined
 
 			await rm(header.path, { force: true })
 
 			second = createRuntimeProject(cacheDir, projectRootUri)
-			await second.init()
-			await second.ready({
-				projectRootsWatcher: new FixtureWatcher([pack.uri, declaring.uri]),
+			const secondProject = second
+			await secondProject.init()
+			let readyObserved = false
+			let readyHeaderUri: string | undefined
+			let readyHeaderErrors: readonly core.PosRangeLanguageError[] | undefined
+			let readyOwnerErrors: readonly core.PosRangeLanguageError[] | undefined
+			secondProject.on('ready', () => {
+				readyObserved = true
+				const readySymbol = secondProject.symbols.lookup(
+					'function',
+					['a:target'],
+				).symbol
+				readyHeaderUri = getImpDocSymbolData(readySymbol?.data)?.headerUri
+				readyHeaderErrors = [...(secondProject.cacheService.errors[header.uri] ?? [])]
+				readyOwnerErrors = [
+					...(secondProject.cacheService.errors[declaring.uri] ?? []),
+				]
 			})
-			// The fileDeleted lifecycle operation is enqueued behind ready();
-			// fence on another lifecycle operation before asserting.
-			await second.onDidClose(declaring.uri)
+			await secondProject.ready({
+				projectRootsWatcher: new FixtureWatcher([
+					pack.uri,
+					declaring.uri,
+					otherDeclaring.uri,
+				]),
+			})
 
-			const symbol = second.symbols.lookup('function', ['a:target']).symbol
+			assert.equal(readyObserved, true)
+			assert.equal(readyHeaderUri, undefined)
+			assert.deepEqual(readyHeaderErrors, [])
+			assert.ok(
+				readyOwnerErrors?.some(error =>
+					/private to “b:decl” here and private to “c:decl”/.test(error.message)
+				),
+				'the surviving declaration owner must be linted before READY',
+			)
+
+			const symbol = secondProject.symbols.lookup('function', ['a:target']).symbol
 			assert.ok(symbol)
 			const data = getImpDocSymbolData(symbol.data)
 			assert.equal(data?.visibility, undefined)
 			assert.equal(data?.headerUri, undefined)
 			assert.deepEqual(
 				data?.declarations?.map(entry => entry.uri),
-				[declaring.uri],
+				[declaring.uri, otherDeclaring.uri],
 			)
 			// Without the header purge the stale @public entry would keep the
 			// union public for every caller.
 			assert.equal(matchesAnyVisibility(data, 'other:caller'), false)
 			assert.equal(matchesAnyVisibility(data, 'b:decl'), true)
+			assert.equal(matchesAnyVisibility(data, 'c:decl'), true)
 			assert.equal(symbol.visibility, 3)
 		} finally {
 			await first?.close()
@@ -710,6 +761,166 @@ describe('IMP-Doc implicit lint checker preservation for closed cache documents'
 				'the implicit lint must not drop the closed document checker diagnostics',
 			)
 		} finally {
+			await project?.close()
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
+	it('restores checker preservation from a persisted warm cache', async () => {
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-checked-warm-cache-'))
+		const projectRoot = join(cacheDir, 'project')
+		await mkdir(projectRoot, { recursive: true })
+		let first: core.Project | undefined
+		let second: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Checked warm cache fixture"\n\t}\n}\n',
+			)
+			const ownerContent = '#> a:mismatch\n# @public\n\n'
+				+ '#> Canonical declaration\n# @public\n#declare storage shared:warm_data\n'
+			const sideContent = '#> b:side\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:warm_data\n'
+			const owner = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/owner.mcfunction',
+				ownerContent,
+			)
+			const side = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/side.mcfunction',
+				sideContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watchedUris = [pack.uri, owner.uri, side.uri]
+			const checkerMessage = /Expected function ID/
+
+			first = createRuntimeProject(cacheDir, projectRootUri)
+			await first.init()
+			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			await first.onDidOpen(owner.uri, 'mcfunction', 1, ownerContent)
+			await first.onDidClose(owner.uri)
+			assert.ok(
+				(first.cacheService.errors[owner.uri] ?? []).some(error =>
+					checkerMessage.test(error.message)
+				),
+			)
+			await first.close()
+			first = undefined
+
+			second = createRuntimeProject(cacheDir, projectRootUri)
+			await second.init()
+			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			assert.ok(
+				(second.cacheService.errors[owner.uri] ?? []).some(error =>
+					checkerMessage.test(error.message)
+				),
+				'the checker diagnostic must be restored from disk',
+			)
+
+			await second.onDidOpen(side.uri, 'mcfunction', 1, sideContent)
+			assert.equal(second.getClientManaged(owner.uri), undefined)
+			const republished = second.cacheService.errors[owner.uri] ?? []
+			assert.ok(
+				republished.some(error => error.message.includes('impDocVisibilityConflict')),
+				'the warm-start implicit lint must republish the conflict warning',
+			)
+			assert.ok(
+				republished.some(error => checkerMessage.test(error.message)),
+				'the warm-start implicit lint must preserve the restored checker diagnostic',
+			)
+		} finally {
+			await first?.close()
+			await second?.close()
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
+	it('restores checker preservation when a rebuild transaction rolls back', async () => {
+		const cacheDir = await mkdtemp(
+			join(tmpdir(), 'spyglass-imp-doc-checked-rollback-cache-'),
+		)
+		const projectRoot = join(cacheDir, 'project')
+		await mkdir(projectRoot, { recursive: true })
+		let project: core.Project | undefined
+		let contextGeneration = 'before'
+		let failRegistrar = false
+		const initializeRollbackFixture: core.ProjectInitializer = async (ctx) => {
+			const runtimeContext = await initializeRuntime(ctx)
+			ctx.meta.registerSymbolRegistrar('checked-cache-rollback', {
+				checksum: contextGeneration,
+				registrar: () => {
+					if (failRegistrar) {
+						throw new Error('Injected checked cache registrar failure')
+					}
+				},
+			})
+			return { ...runtimeContext, checkedCacheGeneration: contextGeneration }
+		}
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Checked rollback fixture"\n\t}\n}\n',
+			)
+			const ownerContent = '#> a:mismatch\n# @public\n\n'
+				+ '#> Canonical declaration\n# @public\n#declare storage shared:rollback_data\n'
+			const sideContent = '#> b:side\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:rollback_data\n'
+			const owner = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/owner.mcfunction',
+				ownerContent,
+			)
+			const side = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/side.mcfunction',
+				sideContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watchedUris = [pack.uri, owner.uri, side.uri]
+			const checkerMessage = /Expected function ID/
+
+			project = createRuntimeProject(
+				cacheDir,
+				projectRootUri,
+				[initializeRollbackFixture],
+			)
+			await project.init()
+			await project.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			await project.onDidOpen(owner.uri, 'mcfunction', 1, ownerContent)
+			await project.onDidClose(owner.uri)
+			assert.ok(
+				(project.cacheService.errors[owner.uri] ?? []).some(error =>
+					checkerMessage.test(error.message)
+				),
+			)
+
+			contextGeneration = 'after'
+			failRegistrar = true
+			await assert.rejects(
+				project.reinitialize(),
+				/Injected checked cache registrar failure/,
+			)
+
+			await project.onDidOpen(side.uri, 'mcfunction', 1, sideContent)
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+			const republished = project.cacheService.errors[owner.uri] ?? []
+			assert.ok(
+				republished.some(error => error.message.includes('impDocVisibilityConflict')),
+				'the post-rollback implicit lint must republish the conflict warning',
+			)
+			assert.ok(
+				republished.some(error => checkerMessage.test(error.message)),
+				'the rollback must restore checker provenance with cached diagnostics',
+			)
+		} finally {
+			failRegistrar = false
 			await project?.close()
 			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 		}

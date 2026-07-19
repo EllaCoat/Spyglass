@@ -208,9 +208,13 @@ export class Project extends EventDispatcher<{
 	 * Non-client-managed cache URIs whose published diagnostics include checker
 	 * results (produced by the `onDidClose` restore path). Implicit lint passes
 	 * must re-run the checker for them, or republishing would drop the checker
-	 * errors from the published superset.
+	 * errors from the published superset. Persisted diagnostics do not retain
+	 * stage provenance, so warm cache/archive documents are restored here
+	 * conservatively as checker candidates.
 	 */
 	readonly #checkedCacheDocUris = new Set<string>()
+	/** File-deletion events whose core cleanup is run inline by `#ready`. */
+	readonly #inlineFileDeletedUris = new Set<string>()
 	readonly #initializers: readonly ProjectInitializer[]
 	#reinitializationPredicates = new Set<ProjectChangePredicate>()
 	#reinitializationGeneration = 0
@@ -404,14 +408,14 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
-			const process = async () => {
-				if (uri.endsWith(Project.RootSuffix)) {
-					this.updateRoots()
+			const process = () => this.processFileDeleted(uri)
+			if (this.#inlineFileDeletedUris.has(uri)) {
+				// `#ready` has already taken responsibility for the cleanup, but a
+				// removed pack/config file must retain its reinitialization trigger.
+				if (this.shouldReinitializeFor(uri)) {
+					this.requestReinitialization(uri, () => {})
 				}
-				this.#symbolUpToDateUris.delete(uri)
-				this.clearUriSymbolLocations(uri)
-				this.tryClearingCache(uri)
-				await this.flushQueuedLints()
+				return
 			}
 			if (this.shouldReinitializeFor(uri)) {
 				this.requestReinitialization(uri, process)
@@ -419,6 +423,22 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileDeleted] ${uri}`)
 		})
+	}
+
+	private async processFileDeleted(uri: string, forceDocumentRemoval = false): Promise<void> {
+		if (uri.endsWith(Project.RootSuffix)) {
+			this.updateRoots()
+		}
+		this.#symbolUpToDateUris.delete(uri)
+		this.#checkedCacheDocUris.delete(uri)
+		this.clearUriSymbolLocations(uri)
+		if (forceDocumentRemoval) {
+			this.removeCachedTextDocument(uri)
+			this.emit('documentRemoved', { uri })
+		} else {
+			this.tryClearingCache(uri)
+		}
+		await this.flushQueuedLints()
 	}
 
 	/**
@@ -448,6 +468,15 @@ export class Project extends EventDispatcher<{
 		})
 		this.symbols = new SymbolUtil(symbols)
 		this.symbols.buildCache()
+		// Cache JSON stores the combined diagnostics but not their processing
+		// stage. Only physical cache-root documents and logical archive documents
+		// can have entered the checked onDidClose path, so conservatively re-check
+		// that bounded set if a later implicit lint republishes one of them.
+		for (const uri of Object.keys(this.cacheService.errors)) {
+			if (this.isCacheUri(uri) || uri.startsWith(ArchiveUriSupporter.Protocol)) {
+				this.#checkedCacheDocUris.add(uri)
+			}
+		}
 		__profiler.task('Activate Cache').finalize()
 
 		this.#isInitialized = true
@@ -502,6 +531,7 @@ export class Project extends EventDispatcher<{
 	private beginProjectRebuildTransaction(): ProjectRebuildTransaction {
 		const snapshot = {
 			bindingInProgressUris: new Set(this.#bindingInProgressUris),
+			checkedCacheDocUris: new Set(this.#checkedCacheDocUris),
 			clientManagedDocAndNodes: new Map(this.#clientManagedDocAndNodes),
 			ctx: this.#ctx,
 			dependencyFiles: this.#dependencyFiles,
@@ -532,6 +562,8 @@ export class Project extends EventDispatcher<{
 				cacheTransaction.rollback()
 				this.#bindingInProgressUris.clear()
 				snapshot.bindingInProgressUris.forEach(uri => this.#bindingInProgressUris.add(uri))
+				this.#checkedCacheDocUris.clear()
+				snapshot.checkedCacheDocUris.forEach(uri => this.#checkedCacheDocUris.add(uri))
 				this.#clientManagedDocAndNodes.clear()
 				snapshot.clientManagedDocAndNodes.forEach((value, uri) =>
 					this.#clientManagedDocAndNodes.set(uri, value)
@@ -814,8 +846,20 @@ export class Project extends EventDispatcher<{
 		this.logger.info(
 			`[Project#ready] Files added/changed/removed: ${addedFiles.length}/${changedFiles.length}/${removedFiles.length}`,
 		)
+		const freshlyPublishedUris = new Set<string>()
 		for (const uri of removedFiles) {
-			this.emit('fileDeleted', { uri })
+			// A queued fileDeleted lifecycle task would run only after the current
+			// ready operation. Perform the same cleanup now so READY cannot expose
+			// deleted symbols or cached diagnostics; still dispatch the public event
+			// for cache/config listeners while suppressing only our queued duplicate.
+			this.#inlineFileDeletedUris.add(uri)
+			try {
+				this.emit('fileDeleted', { uri })
+			} finally {
+				this.#inlineFileDeletedUris.delete(uri)
+			}
+			await this.processFileDeleted(uri, true)
+			freshlyPublishedUris.add(uri)
 		}
 		__profiler.task('Validate Cache')
 
@@ -841,7 +885,6 @@ export class Project extends EventDispatcher<{
 
 		const __parseProfiler = this.profilers.get('project#ready#parse', 'top-n', 50)
 		const __bindProfiler = this.profilers.get('project#ready#bind', 'top-n', 50)
-		const freshlyPublishedUris = new Set<string>()
 		for (const uri of files) {
 			await this.#parseAndBindForReady(
 				uri,
