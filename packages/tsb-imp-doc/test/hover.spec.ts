@@ -1,10 +1,23 @@
 import assert from 'node:assert/strict'
 import { after, before, describe, it } from 'node:test'
-import { formatContractEntry } from '../lib/hover/contract.js'
-import type { ImpDocContractEntry, ImpDocContractField } from '../lib/index.js'
+import { formatContractEntry, formatContractHoverDescription } from '../lib/hover/contract.js'
+import type {
+	ImpDocContract,
+	ImpDocContractEntry,
+	ImpDocContractField,
+	ImpDocVisibility,
+} from '../lib/index.js'
+import { matchesVisibility } from '../lib/index.js'
 import { type ContractRuntime, createContractRuntime } from './contract-runtime.ts'
 
 const range = { start: 0, end: 0 }
+const EmptyContract: ImpDocContract = {
+	inputs: [],
+	outputs: [],
+	apis: [],
+	users: [],
+	deprecated: [],
+}
 
 describe('IMP-Doc contract hover', () => {
 	let runtime: ContractRuntime
@@ -80,5 +93,62 @@ describe('IMP-Doc contract hover', () => {
 			formatContractEntry(entry),
 			'@input args (Payload: compound { Count: int })',
 		)
+	})
+
+	it('characterizes restricted hover/access gates headlessly', () => {
+		const cases: {
+			visibility: ImpDocVisibility
+			allowed: string
+			denied: string
+			label: string
+		}[] = [
+			{
+				visibility: { type: 'private', owner: 'owner:target' },
+				allowed: 'owner:target',
+				denied: 'owner:other',
+				label: 'private',
+			},
+			{
+				visibility: { type: 'internal', owner: 'owner:target' },
+				allowed: 'minecraft:load',
+				denied: 'external:caller',
+				label: 'internal',
+			},
+			{
+				visibility: { type: 'denied', owner: 'owner:target' },
+				allowed: 'owner:target',
+				denied: 'external:caller',
+				label: 'denied',
+			},
+			{
+				visibility: {
+					type: 'within',
+					owner: 'owner:target',
+					includeOwner: false,
+					patterns: [{
+						raw: 'owner:allowed',
+						targetType: 'function',
+						regex: '^owner:allowed$',
+					}],
+				},
+				allowed: 'owner:allowed',
+				denied: 'owner:other',
+				label: 'within',
+			},
+		]
+
+		for (const testCase of cases) {
+			assert.match(
+				formatContractHoverDescription(
+					'owner:target',
+					testCase.visibility,
+					EmptyContract,
+					'',
+				),
+				new RegExp(`Visibility:\\*\\* ${testCase.label}`),
+			)
+			assert.equal(matchesVisibility(testCase.visibility, testCase.allowed), true)
+			assert.equal(matchesVisibility(testCase.visibility, testCase.denied), false)
+		}
 	})
 })

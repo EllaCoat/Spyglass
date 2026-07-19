@@ -1,4 +1,4 @@
-import type * as core from '@spyglassmc/core'
+import * as core from '@spyglassmc/core'
 import { getCurrentFunctionSymbol } from '../binder/contract.js'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
 import { checkContract } from './contract.js'
@@ -11,11 +11,13 @@ export const impDoc: core.Checker<ImpDocNode> = async (node, ctx) => {
 	checkContract(node, ctx)
 
 	const parsedID = node.functionID?.raw
+		? core.ResourceLocation.lengthen(node.functionID.raw)
+		: undefined
 	const currentFunction = getCurrentFunctionSymbol(ctx)
 
 	if (parsedID && currentFunction && parsedID !== currentFunction.identifier) {
 		ctx.err.report(
-			`Expected function ID “${currentFunction.identifier}”, got “${parsedID}”`,
+			`Expected function ID “${currentFunction.identifier}”, got “${node.functionID!.raw}”`,
 			node.functionID!,
 		)
 	}

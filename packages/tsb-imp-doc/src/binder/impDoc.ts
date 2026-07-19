@@ -2,7 +2,7 @@ import * as core from '@spyglassmc/core'
 import { formatContractHoverDescription } from '../hover/contract.js'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
 import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { parseVisibility, stampVisibility } from '../util/withinPattern.js'
+import { fallbackVisibility, parseVisibility, stampVisibility } from '../util/withinPattern.js'
 import { bindContract, getCurrentFunctionSymbol } from './contract.js'
 
 /**
@@ -13,6 +13,8 @@ import { bindContract, getCurrentFunctionSymbol } from './contract.js'
  */
 export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
 	const parsedID = node.functionID?.raw
+		? core.ResourceLocation.lengthen(node.functionID.raw)
+		: undefined
 	const currentFunction = getCurrentFunctionSymbol(ctx)
 
 	if (
@@ -24,7 +26,7 @@ export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
 			.symbol
 		if (symbol) {
 			const visibility = parseVisibility(node.annotations, parsedID, ctx.err)
-				?? { type: 'public' as const }
+				?? fallbackVisibility(node.annotations, parsedID, ctx.err)
 
 			node.symbol = symbol
 			node.visibility = visibility

@@ -3,9 +3,15 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { ImpDocAnnotation, ImpDocValue } from '../lib/index.js'
 import {
+	LEGACY_FILE_TYPE_IDS,
+	LEGACY_MISC_TYPES,
+	LEGACY_WITHIN_TARGET_IDS,
+} from '../lib/legacy/categories.js'
+import {
 	legacyGlobToRegex,
 	matchesVisibility,
 	parseVisibility,
+	toShortestString,
 	visibilityRestrictions,
 } from '../lib/util/withinPattern.js'
 
@@ -32,11 +38,36 @@ describe('legacyGlobToRegex', () => {
 	it('anchors exact identifiers', () => {
 		assert.equal(legacyGlobToRegex('foo:bar'), '^foo:bar$')
 	})
-	it('translates * to non-slash wildcard', () => {
-		assert.equal(legacyGlobToRegex('foo:bar/*'), '^foo:bar/[^/]*$')
+	it('translates ? to exactly one non-separator character', () => {
+		const regexp = new RegExp(legacyGlobToRegex('foo:?'))
+		assert.equal(legacyGlobToRegex('foo:?'), '^foo:[^:/]$')
+		assert.equal(regexp.test('foo:a'), true)
+		assert.equal(regexp.test('foo:'), false)
+		assert.equal(regexp.test('foo:ab'), false)
+		assert.equal(regexp.test('foo:/'), false)
+		assert.equal(regexp.test('foo::'), false)
 	})
-	it('translates ** to slash-crossing wildcard', () => {
-		assert.equal(legacyGlobToRegex('foo:bar/**'), '^foo:bar/.*$')
+	it('translates * to a zero-or-more non-separator wildcard', () => {
+		const regexp = new RegExp(legacyGlobToRegex('foo:*'))
+		assert.equal(regexp.test('foo:'), true)
+		assert.equal(regexp.test('foo:bar'), true)
+		assert.equal(regexp.test('foo:bar/baz'), false)
+		assert.equal(regexp.test('foo:bar:baz'), false)
+		assert.equal(legacyGlobToRegex('foo:bar/*'), '^foo:bar/[^:/]{0,}$')
+	})
+	it('translates **/ before ** and permits a zero-segment match', () => {
+		const regexp = new RegExp(legacyGlobToRegex('foo/**/leaf'))
+		assert.equal(legacyGlobToRegex('foo/**/leaf'), '^foo/.{0,}leaf$')
+		assert.equal(regexp.test('foo/leaf'), true)
+		assert.equal(regexp.test('foo/deep/path/leaf'), true)
+		assert.equal(regexp.test('foo/deep:path/leaf'), true)
+	})
+	it('translates ** to a separator-crossing wildcard', () => {
+		const regexp = new RegExp(legacyGlobToRegex('foo:**'))
+		assert.equal(regexp.test('foo:'), true)
+		assert.equal(regexp.test('foo:bar/baz'), true)
+		assert.equal(regexp.test('foo:bar:baz'), true)
+		assert.equal(legacyGlobToRegex('foo:bar/**'), '^foo:bar/.{0,}$')
 	})
 	it('escapes regex meta characters', () => {
 		assert.equal(
@@ -47,8 +78,21 @@ describe('legacyGlobToRegex', () => {
 	it('handles mixed * and ** in a single path', () => {
 		assert.equal(
 			legacyGlobToRegex('a/*/b/**/c'),
-			'^a/[^/]*/b/.*/c$',
+			'^a/[^:/]{0,}/b/.{0,}c$',
 		)
+	})
+	it('preserves legacy sequential replacement semantics for overlaps', () => {
+		for (
+			const [pattern, expected] of [
+				['***/', '^[^:/]{0,}.{0,}$'],
+				['****/', '^.{0,}.{0,}$'],
+				['**?/', '^.{0,}[^:/]/$'],
+				['***?/', '^.{0,}[^:/]{0,}[^:/]/$'],
+				['?**/', '^[^:/].{0,}$'],
+			] as const
+		) {
+			assert.equal(legacyGlobToRegex(pattern), expected, pattern)
+		}
 	})
 })
 
@@ -83,6 +127,11 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, { type: 'private', owner })
 	})
 
+	it('returns internal for a lone @internal', () => {
+		const result = parseVisibility([annotation('@internal')], owner)
+		assert.deepEqual(result, { type: 'internal', owner })
+	})
+
 	it('returns within for @within function <path>', () => {
 		const result = parseVisibility(
 			[annotation('@within', 'function', 'owner:main')],
@@ -91,6 +140,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: false,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function',
@@ -107,6 +157,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: false,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: '*',
@@ -126,6 +177,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: true,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function',
@@ -145,6 +197,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: false,
 			patterns: [
 				{
 					raw: 'owner:main',
@@ -154,10 +207,88 @@ describe('parseVisibility', () => {
 				{
 					raw: 'other:allowed/**',
 					targetType: 'function',
-					regex: '^other:allowed/.*$',
+					regex: '^other:allowed/.{0,}$',
 				},
 			],
 		})
+	})
+
+	it('accepts all 47 legacy FileTypes and * as explicit targets', () => {
+		assert.equal(LEGACY_FILE_TYPE_IDS.length, 47)
+		assert.equal(LEGACY_WITHIN_TARGET_IDS.length, 48)
+		for (const targetType of LEGACY_WITHIN_TARGET_IDS) {
+			const err = new ErrorReporter()
+			const result = parseVisibility(
+				[annotation('@within', targetType, 'allowed:path')],
+				owner,
+				err,
+			)
+			assert.equal(result?.type, 'within', targetType)
+			assert.equal(
+				result?.type === 'within' ? result.patterns[0]?.targetType : undefined,
+				targetType,
+			)
+			assert.deepEqual(err.errors, [], targetType)
+		}
+	})
+
+	it('rejects all eight non-file MiscTypes as explicit targets', () => {
+		assert.equal(LEGACY_MISC_TYPES.length, 8)
+		for (const { id } of LEGACY_MISC_TYPES) {
+			const err = new ErrorReporter()
+			const result = parseVisibility(
+				[annotation('@within', id, 'allowed:path')],
+				owner,
+				err,
+			)
+			assert.deepEqual(result, { type: 'denied', owner }, id)
+			assert.ok(
+				err.errors.some(error => error.message.includes('Unsupported @within target type')),
+				id,
+			)
+		}
+	})
+
+	it('returns denied for each malformed @within shape', () => {
+		for (
+			const [name, malformed] of [
+				['unknown target', annotation('@within', 'unknown_type', 'allowed:path')],
+				['no arguments', annotation('@within')],
+				['extra arguments', annotation('@within', 'function', 'tag1', 'tag2')],
+			] as const
+		) {
+			const err = new ErrorReporter()
+			assert.deepEqual(
+				parseVisibility([malformed], owner, err),
+				{ type: 'denied', owner },
+				name,
+			)
+			assert.ok(
+				err.errors.some(error => error.message.includes('falling back to deny state')),
+				name,
+			)
+		}
+	})
+
+	it('makes malformed @within override public and other valid annotations', () => {
+		for (
+			const annotations of [
+				[annotation('@public'), annotation('@within', 'unknown_type', 'x')],
+				[annotation('@api'), annotation('@within')],
+				[
+					annotation('@internal'),
+					annotation('@within', 'function', 'owner:allowed'),
+					annotation('@within', 'function', 'one', 'two'),
+				],
+			]
+		) {
+			const err = new ErrorReporter()
+			assert.deepEqual(
+				parseVisibility(annotations, owner, err),
+				{ type: 'denied', owner },
+			)
+			assert.ok(err.errors.some(error => error.message.includes('falling back to deny state')))
+		}
 	})
 
 	it('reports diagnostic when owner is missing for restricted visibility', () => {
@@ -200,10 +331,47 @@ describe('matchesVisibility', () => {
 		)
 	})
 
-	it('allows owner or pattern match for within', () => {
+	it('treats denied as private owner-exact visibility', () => {
+		assert.equal(
+			matchesVisibility({ type: 'denied', owner: 'owner:helper' }, 'owner:helper'),
+			true,
+		)
+		assert.equal(
+			matchesVisibility({ type: 'denied', owner: 'owner:helper' }, 'owner:other'),
+			false,
+		)
+	})
+
+	it('allows @internal from the owner namespace or minecraft namespace', () => {
+		const visibility = { type: 'internal' as const, owner: 'owner:helper' }
+		assert.equal(matchesVisibility(visibility, 'owner:other/deep'), true)
+		assert.equal(matchesVisibility(visibility, 'minecraft:load'), true)
+		assert.equal(matchesVisibility(visibility, 'external:caller'), false)
+
+		const defaultVisibility = {
+			type: 'internal' as const,
+			owner: 'minecraft:private',
+		}
+		assert.equal(matchesVisibility(defaultVisibility, 'minecraft:load'), true)
+		assert.equal(matchesVisibility(defaultVisibility, 'owner:caller'), false)
+	})
+
+	it('tests both canonical and default-namespace-short caller forms', () => {
+		assert.equal(toShortestString('minecraft:allowed/deep'), 'allowed/deep')
+		assert.equal(toShortestString('custom:allowed/deep'), 'custom:allowed/deep')
+		const visibility = parseVisibility(
+			[annotation('@within', 'function', 'allowed/**')],
+			'owner:helper',
+		)
+		assert.ok(visibility)
+		assert.equal(matchesVisibility(visibility, 'minecraft:allowed/deep'), true)
+	})
+
+	it('allows owner or pattern match when @private accompanies @within', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function' as const,
@@ -215,20 +383,36 @@ describe('matchesVisibility', () => {
 		assert.equal(matchesVisibility(visibility, 'other:caller'), false)
 	})
 
+	it('does not implicitly allow the owner for a lone @within', () => {
+		const visibility = parseVisibility(
+			[annotation('@within', 'function', 'owner:main')],
+			'owner:helper',
+		)
+		assert.ok(visibility)
+		assert.equal(visibility.type, 'within')
+		assert.equal(
+			visibility.type === 'within' ? visibility.includeOwner : undefined,
+			false,
+		)
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), false)
+		assert.equal(matchesVisibility(visibility, 'owner:main'), true)
+	})
+
 	it('honors ** across slashes and * within a segment', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'other:allowed/**',
 					targetType: 'function' as const,
-					regex: '^other:allowed/.*$',
+					regex: '^other:allowed/.{0,}$',
 				},
 				{
 					raw: 'other:leaf/*',
 					targetType: 'function' as const,
-					regex: '^other:leaf/[^/]*$',
+					regex: '^other:leaf/[^:/]{0,}$',
 				},
 			],
 		}
@@ -241,6 +425,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'star:allowed',
@@ -269,6 +454,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [],
 		}
 		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
@@ -281,10 +467,11 @@ describe('matchesVisibility', () => {
 		const makeVisibility = () => ({
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'other:allowed/**',
 				targetType: 'function' as const,
-				regex: '^other:allowed/.*$',
+				regex: '^other:allowed/.{0,}$',
 			}],
 		})
 		const first = makeVisibility()
@@ -302,6 +489,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'owner:main',
@@ -311,7 +499,7 @@ describe('matchesVisibility', () => {
 				{
 					raw: 'other:allowed/**',
 					targetType: '*' as const,
-					regex: '^other:allowed/.*$',
+					regex: '^other:allowed/.{0,}$',
 				},
 			],
 		}
@@ -343,6 +531,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'foo:bar',
 				targetType: 'function' as const,
@@ -367,6 +556,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns,
 		}
 		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
@@ -385,14 +575,52 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'star:allowed/**',
 				targetType: '*' as const,
-				regex: '^star:allowed/.*$',
+				regex: '^star:allowed/.{0,}$',
 			}],
 		}
 		assert.equal(matchesVisibility(visibility, 'star:allowed/deep', '*'), true)
 		assert.equal(matchesVisibility(visibility, 'denied:caller', '*'), false)
+	})
+
+	it('compiles unified regexes lazily for each first-touched caller type', () => {
+		const visibility = {
+			type: 'within' as const,
+			owner: 'owner:helper',
+			includeOwner: true,
+			patterns: [{
+				raw: 'allowed:**',
+				targetType: '*' as const,
+				regex: legacyGlobToRegex('allowed:**'),
+			}],
+		}
+		const OriginalRegExp = globalThis.RegExp
+		let compileCount = 0
+		class SpiedRegExp extends OriginalRegExp {
+			constructor(source: string | RegExp, flags?: string) {
+				super(source, flags)
+				compileCount++
+			}
+		} // deno-lint-ignore no-explicit-any
+
+		;(globalThis as any).RegExp = SpiedRegExp
+		try {
+			assert.equal(matchesVisibility(visibility, 'allowed:function'), true)
+			assert.equal(compileCount, 1)
+			assert.equal(matchesVisibility(visibility, 'allowed:again'), true)
+			assert.equal(compileCount, 1)
+			assert.equal(
+				matchesVisibility(visibility, 'allowed:loot', 'loot_table'),
+				true,
+			)
+			assert.equal(compileCount, 2)
+		} finally {
+			// deno-lint-ignore no-explicit-any
+			;(globalThis as any).RegExp = OriginalRegExp
+		}
 	})
 
 	it('reuses unified regex cache across different StateProxy identities', () => {
@@ -402,16 +630,17 @@ describe('matchesVisibility', () => {
 		const originVisibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'other:allowed/**',
 					targetType: 'function' as const,
-					regex: '^other:allowed/.*$',
+					regex: '^other:allowed/.{0,}$',
 				},
 				{
 					raw: 'other:leaf/*',
 					targetType: 'function' as const,
-					regex: '^other:leaf/[^/]*$',
+					regex: '^other:leaf/[^:/]{0,}$',
 				},
 			],
 		}
@@ -451,6 +680,41 @@ describe('matchesVisibility', () => {
 		}
 	})
 
+	it('reuses @internal regexes across different StateProxy identities', () => {
+		const originVisibility = {
+			type: 'internal' as const,
+			owner: 'owner:helper',
+		}
+		const OriginalRegExp = globalThis.RegExp
+		let compileCount = 0
+		class SpiedRegExp extends OriginalRegExp {
+			constructor(source: string | RegExp, flags?: string) {
+				super(source, flags)
+				compileCount++
+			}
+		} // deno-lint-ignore no-explicit-any
+
+		;(globalThis as any).RegExp = SpiedRegExp
+		try {
+			const proxy1 = StateProxy.create(originVisibility)
+			const proxy2 = StateProxy.create(originVisibility)
+			assert.equal(
+				matchesVisibility(proxy1 as unknown as typeof originVisibility, 'owner:allowed'),
+				true,
+			)
+			const afterFirst = compileCount
+			assert.equal(afterFirst, 2)
+			assert.equal(
+				matchesVisibility(proxy2 as unknown as typeof originVisibility, 'minecraft:load'),
+				true,
+			)
+			assert.equal(compileCount, afterFirst)
+		} finally {
+			// deno-lint-ignore no-explicit-any
+			;(globalThis as any).RegExp = OriginalRegExp
+		}
+	})
+
 	it('reuses per-pattern cache in fallback path across StateProxy identities', () => {
 		// canonical 外 pattern を持つ visibility は Option B の fallback path (per-pattern `.some()`) に
 		// 降ろされる。 fallback 経路でも `matchesVisibility` が visibility 側を origin に正規化してから
@@ -459,6 +723,7 @@ describe('matchesVisibility', () => {
 		const originVisibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					// canonical 外 : raw と regex が不整合 → PreparedFallback 発火
@@ -517,11 +782,26 @@ describe('visibilityRestrictions', () => {
 		)
 	})
 
-	it('returns owner plus pattern regexes for within', () => {
+	it('returns owner regex for denied', () => {
+		assert.deepEqual(
+			visibilityRestrictions({ type: 'denied', owner: 'owner:helper' }),
+			['^owner:helper$'],
+		)
+	})
+
+	it('returns both legacy namespace patterns for non-default @internal', () => {
+		assert.deepEqual(
+			visibilityRestrictions({ type: 'internal', owner: 'owner:helper' }),
+			['^owner:.{0,}$', '^minecraft:.{0,}$'],
+		)
+	})
+
+	it('returns owner plus pattern regexes when includeOwner is true', () => {
 		assert.deepEqual(
 			visibilityRestrictions({
 				type: 'within',
 				owner: 'owner:helper',
+				includeOwner: true,
 				patterns: [
 					{
 						raw: 'owner:main',
@@ -531,6 +811,22 @@ describe('visibilityRestrictions', () => {
 				],
 			}),
 			['^owner:helper$', '^owner:main$'],
+		)
+	})
+
+	it('omits the owner regex when includeOwner is false', () => {
+		assert.deepEqual(
+			visibilityRestrictions({
+				type: 'within',
+				owner: 'owner:helper',
+				includeOwner: false,
+				patterns: [{
+					raw: 'owner:main',
+					targetType: 'function',
+					regex: '^owner:main$',
+				}],
+			}),
+			['^owner:main$'],
 		)
 	})
 })

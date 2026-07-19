@@ -1,5 +1,5 @@
 {
-  "impDocVersion": "0.0.4-contract-semantics.0",
+  "impDocVersion": "0.0.5-visibility-parity.1",
   "public": {
     "visibility": {
       "type": "public"
@@ -12,15 +12,30 @@
     },
     "privateOwner": "example:owner"
   },
+  "internal": {
+    "visibility": {
+      "type": "internal",
+      "owner": "example:owner"
+    },
+    "privateOwner": "example:owner"
+  },
+  "denied": {
+    "visibility": {
+      "type": "denied",
+      "owner": "example:owner"
+    },
+    "privateOwner": "example:owner"
+  },
   "withinDeclaration": {
     "visibility": {
       "type": "within",
       "owner": "example:owner",
+      "includeOwner": true,
       "patterns": [
         {
           "raw": "example:allowed/**",
           "targetType": "function",
-          "regex": "^example:allowed/.*$"
+          "regex": "^example:allowed/.{0,}$"
         }
       ]
     },

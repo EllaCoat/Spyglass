@@ -5,7 +5,7 @@ import type {
 	ImpDocNode,
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { parseVisibility, stampVisibility } from '../util/withinPattern.js'
+import { fallbackVisibility, parseVisibility, stampVisibility } from '../util/withinPattern.js'
 
 function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
 	let parent = node.parent
@@ -83,7 +83,10 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			return
 		}
 
-		const owner = ownerForDocument(ctx) ?? doc.functionID?.raw
+		const owner = ownerForDocument(ctx)
+			?? (doc.functionID?.raw
+				? core.ResourceLocation.lengthen(doc.functionID.raw)
+				: undefined)
 		if (!owner) {
 			ctx.err.report(
 				'Cannot resolve #declare owner function',
@@ -93,7 +96,7 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 		}
 
 		const visibility = parseVisibility(doc.annotations, owner, ctx.err)
-			?? { type: 'public' as const }
+			?? fallbackVisibility(doc.annotations, owner, ctx.err)
 
 		doc.visibility = visibility
 

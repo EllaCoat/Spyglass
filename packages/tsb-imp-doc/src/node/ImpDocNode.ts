@@ -1,4 +1,5 @@
 import type { AstNode } from '@spyglassmc/core'
+import type { LegacyFileTypeId } from '../legacy/categories.js'
 
 export interface ImpDocValue {
 	raw: string
@@ -133,7 +134,7 @@ export interface ImpDocDeclarationBlock {
 	range: AstNode['range']
 }
 
-export type WithinTargetType = '*' | 'function'
+export type WithinTargetType = LegacyFileTypeId | '*'
 
 /**
  * Symbol.data/cache に保存するため RegExp ではなく文字列で保持する。
@@ -156,9 +157,13 @@ export interface WithinPattern {
 export type ImpDocVisibility =
 	| { readonly type: 'public' }
 	| { readonly type: 'private'; readonly owner: string }
+	| { readonly type: 'internal'; readonly owner: string }
+	| { readonly type: 'denied'; readonly owner: string }
 	| {
 		readonly type: 'within'
 		readonly owner: string
+		/** `@private` が明示され、 owner 自身も許可対象に含むか。 */
+		readonly includeOwner: boolean
 		readonly patterns: readonly WithinPattern[]
 	}
 
