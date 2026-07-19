@@ -1,7 +1,7 @@
 import type { AstNode, Linter, LinterContext, Logger, StateProxy } from '@spyglassmc/core'
 import { ResourceLocationNode } from '@spyglassmc/core'
 import type { ImpDocVisibility } from '../node/ImpDocNode.js'
-import { getImpDocSymbolData } from '../node/ImpDocNode.js'
+import { getImpDocSymbolData, getRefProvenance } from '../node/ImpDocNode.js'
 import { getVisibilityEntries, matchesVisibility } from '../util/withinPattern.js'
 
 export function configValidator(_ruleName: string, value: unknown, logger: Logger): boolean {
@@ -92,6 +92,11 @@ export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => 
 
 	visit(node as StateProxy<AstNode>, (candidate) => {
 		if (!ResourceLocationNode.is(candidate) || candidate.options.category !== 'function') {
+			return
+		}
+		// Best-effort provenance (macro line / quoted string) hands the
+		// reference over to the warning-level impDocPrivateBestEffort rule.
+		if (getRefProvenance(candidate) !== undefined) {
 			return
 		}
 		const data = getImpDocSymbolData(candidate.symbol?.data)
