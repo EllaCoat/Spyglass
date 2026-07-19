@@ -1,6 +1,6 @@
 import * as core from '@spyglassmc/core'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
-import { matchesVisibility } from '../util/withinPattern.js'
+import { getVisibilityEntries, matchesVisibility } from '../util/withinPattern.js'
 
 /**
  * java-edition の `mcfunction:score_holder` node を production dependency 追加なしに
@@ -59,17 +59,19 @@ function getAllowedImpDocIdentifiers(
 			continue
 		}
 
-		const visibility = getImpDocSymbolData(symbol.data)?.visibility
-		if (!visibility) {
+		const entries = getVisibilityEntries(getImpDocSymbolData(symbol.data))
+		if (entries.length === 0) {
 			// IMP-Doc 管理外の symbol は base completer に任せる (= 重複追加しない)。
 			continue
 		}
 
+		// v3 union parity: definition / declaration のどれか 1 entry でも public
+		// か caller を許可すれば候補に載せる (any-match)。
 		if (
-			visibility.type !== 'public'
+			!entries.some(entry => entry.type === 'public')
 			&& (
 				caller === undefined
-				|| !matchesVisibility(visibility, caller, 'function')
+				|| !entries.some(entry => matchesVisibility(entry, caller, 'function'))
 			)
 		) {
 			continue

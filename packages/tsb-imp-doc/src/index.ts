@@ -6,6 +6,7 @@ import { mcfunction as bindMcfunction } from './binder/mcfunction.js'
 import { getImpDocCacheContext } from './cachePolicy.js'
 import { checkAlias, impDoc as checkImpDoc } from './checker/impDoc.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
+import { conflictConfigValidator, visibilityConflict } from './linter/conflict.js'
 import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
 import { configValidator, privateVisibility } from './linter/private.js'
 import type { ImpDocAliasNode, ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
@@ -51,6 +52,11 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 	meta.registerLinter('impDocPrivate', {
 		configValidator,
 		linter: privateVisibility,
+		nodePredicate: node => node.type === 'file',
+	})
+	meta.registerLinter('impDocVisibilityConflict', {
+		configValidator: conflictConfigValidator,
+		linter: visibilityConflict,
 		nodePredicate: node => node.type === 'file',
 	})
 	meta.registerLinter('impDocContractCheck', {

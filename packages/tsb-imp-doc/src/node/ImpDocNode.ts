@@ -194,6 +194,11 @@ export interface ImpDocDeclarationSource {
 	owner: string
 }
 
+/** One `#declare` site's visibility record (v3 `dcl` position parity). */
+export interface ImpDocDeclarationVisibility extends ImpDocDeclarationSource {
+	visibility: ImpDocVisibility
+}
+
 export interface ImpDocNode extends AstNode {
 	type: 'impDoc'
 	annotations: ImpDocAnnotation[]
@@ -235,8 +240,19 @@ export namespace ImpDocNode {
 }
 
 export interface ImpDocSymbolData {
+	/**
+	 * Definition-side (function header IMP-Doc) visibility. Declaration-side
+	 * visibility lives in `declarations`; reference checks OR every entry
+	 * together (v3 union parity), see `matchesAnyVisibility()`.
+	 */
 	visibility?: ImpDocVisibility
-	declaration?: ImpDocDeclarationSource
+	/**
+	 * Per-`#declare` visibility entries ordered by (uri, range). v3 kept the
+	 * visibility on each cache position (`dcl`/`def`); a symbol stays
+	 * resolvable for a caller when any entry admits it (OR semantics,
+	 * legacy-v3 `ClientCache.getCacheForID`).
+	 */
+	declarations?: ImpDocDeclarationVisibility[]
 	/** Serializable function contract copied from the bound IMP-Doc header. */
 	contract?: ImpDocContract
 	/** Serializable alias payload retained across symbol-cache reloads. */
