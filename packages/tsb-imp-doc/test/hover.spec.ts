@@ -95,7 +95,7 @@ describe('IMP-Doc contract hover', () => {
 		)
 	})
 
-	it('characterizes private, internal, and within hover/access gates headlessly', () => {
+	it('characterizes restricted hover/access gates headlessly', () => {
 		const cases: {
 			visibility: ImpDocVisibility
 			allowed: string
@@ -115,9 +115,16 @@ describe('IMP-Doc contract hover', () => {
 				label: 'internal',
 			},
 			{
+				visibility: { type: 'denied', owner: 'owner:target' },
+				allowed: 'owner:target',
+				denied: 'external:caller',
+				label: 'denied',
+			},
+			{
 				visibility: {
 					type: 'within',
 					owner: 'owner:target',
+					includeOwner: false,
 					patterns: [{
 						raw: 'owner:allowed',
 						targetType: 'function',

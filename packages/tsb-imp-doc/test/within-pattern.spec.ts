@@ -81,6 +81,19 @@ describe('legacyGlobToRegex', () => {
 			'^a/[^:/]{0,}/b/.{0,}c$',
 		)
 	})
+	it('preserves legacy sequential replacement semantics for overlaps', () => {
+		for (
+			const [pattern, expected] of [
+				['***/', '^[^:/]{0,}.{0,}$'],
+				['****/', '^.{0,}.{0,}$'],
+				['**?/', '^.{0,}[^:/]/$'],
+				['***?/', '^.{0,}[^:/]{0,}[^:/]/$'],
+				['?**/', '^[^:/].{0,}$'],
+			] as const
+		) {
+			assert.equal(legacyGlobToRegex(pattern), expected, pattern)
+		}
+	})
 })
 
 describe('parseVisibility', () => {
@@ -127,6 +140,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: false,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function',
@@ -143,6 +157,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: false,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: '*',
@@ -162,6 +177,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: true,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function',
@@ -181,6 +197,7 @@ describe('parseVisibility', () => {
 		assert.deepEqual(result, {
 			type: 'within',
 			owner,
+			includeOwner: false,
 			patterns: [
 				{
 					raw: 'owner:main',
@@ -224,13 +241,15 @@ describe('parseVisibility', () => {
 				owner,
 				err,
 			)
-			assert.equal(result, undefined, id)
-			assert.equal(err.errors.length, 1, id)
-			assert.match(err.errors[0]!.message, /Unsupported @within target type/)
+			assert.deepEqual(result, { type: 'denied', owner }, id)
+			assert.ok(
+				err.errors.some(error => error.message.includes('Unsupported @within target type')),
+				id,
+			)
 		}
 	})
 
-	it('returns undefined for each malformed @within shape', () => {
+	it('returns denied for each malformed @within shape', () => {
 		for (
 			const [name, malformed] of [
 				['unknown target', annotation('@within', 'unknown_type', 'allowed:path')],
@@ -239,8 +258,36 @@ describe('parseVisibility', () => {
 			] as const
 		) {
 			const err = new ErrorReporter()
-			assert.equal(parseVisibility([malformed], owner, err), undefined, name)
-			assert.ok(err.errors.length > 0, name)
+			assert.deepEqual(
+				parseVisibility([malformed], owner, err),
+				{ type: 'denied', owner },
+				name,
+			)
+			assert.ok(
+				err.errors.some(error => error.message.includes('falling back to deny state')),
+				name,
+			)
+		}
+	})
+
+	it('makes malformed @within override public and other valid annotations', () => {
+		for (
+			const annotations of [
+				[annotation('@public'), annotation('@within', 'unknown_type', 'x')],
+				[annotation('@api'), annotation('@within')],
+				[
+					annotation('@internal'),
+					annotation('@within', 'function', 'owner:allowed'),
+					annotation('@within', 'function', 'one', 'two'),
+				],
+			]
+		) {
+			const err = new ErrorReporter()
+			assert.deepEqual(
+				parseVisibility(annotations, owner, err),
+				{ type: 'denied', owner },
+			)
+			assert.ok(err.errors.some(error => error.message.includes('falling back to deny state')))
 		}
 	})
 
@@ -320,10 +367,11 @@ describe('matchesVisibility', () => {
 		assert.equal(matchesVisibility(visibility, 'minecraft:allowed/deep'), true)
 	})
 
-	it('allows owner or pattern match for within', () => {
+	it('allows owner or pattern match when @private accompanies @within', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function' as const,
@@ -335,10 +383,26 @@ describe('matchesVisibility', () => {
 		assert.equal(matchesVisibility(visibility, 'other:caller'), false)
 	})
 
+	it('does not implicitly allow the owner for a lone @within', () => {
+		const visibility = parseVisibility(
+			[annotation('@within', 'function', 'owner:main')],
+			'owner:helper',
+		)
+		assert.ok(visibility)
+		assert.equal(visibility.type, 'within')
+		assert.equal(
+			visibility.type === 'within' ? visibility.includeOwner : undefined,
+			false,
+		)
+		assert.equal(matchesVisibility(visibility, 'owner:helper'), false)
+		assert.equal(matchesVisibility(visibility, 'owner:main'), true)
+	})
+
 	it('honors ** across slashes and * within a segment', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'other:allowed/**',
@@ -361,6 +425,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'star:allowed',
@@ -389,6 +454,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [],
 		}
 		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
@@ -401,6 +467,7 @@ describe('matchesVisibility', () => {
 		const makeVisibility = () => ({
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'other:allowed/**',
 				targetType: 'function' as const,
@@ -422,6 +489,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'owner:main',
@@ -463,6 +531,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'foo:bar',
 				targetType: 'function' as const,
@@ -487,6 +556,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns,
 		}
 		assert.equal(matchesVisibility(visibility, 'owner:helper'), true)
@@ -505,6 +575,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'star:allowed/**',
 				targetType: '*' as const,
@@ -519,6 +590,7 @@ describe('matchesVisibility', () => {
 		const visibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [{
 				raw: 'allowed:**',
 				targetType: '*' as const,
@@ -558,6 +630,7 @@ describe('matchesVisibility', () => {
 		const originVisibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					raw: 'other:allowed/**',
@@ -650,6 +723,7 @@ describe('matchesVisibility', () => {
 		const originVisibility = {
 			type: 'within' as const,
 			owner: 'owner:helper',
+			includeOwner: true,
 			patterns: [
 				{
 					// canonical 外 : raw と regex が不整合 → PreparedFallback 発火
@@ -722,11 +796,12 @@ describe('visibilityRestrictions', () => {
 		)
 	})
 
-	it('returns owner plus pattern regexes for within', () => {
+	it('returns owner plus pattern regexes when includeOwner is true', () => {
 		assert.deepEqual(
 			visibilityRestrictions({
 				type: 'within',
 				owner: 'owner:helper',
+				includeOwner: true,
 				patterns: [
 					{
 						raw: 'owner:main',
@@ -736,6 +811,22 @@ describe('visibilityRestrictions', () => {
 				],
 			}),
 			['^owner:helper$', '^owner:main$'],
+		)
+	})
+
+	it('omits the owner regex when includeOwner is false', () => {
+		assert.deepEqual(
+			visibilityRestrictions({
+				type: 'within',
+				owner: 'owner:helper',
+				includeOwner: false,
+				patterns: [{
+					raw: 'owner:main',
+					targetType: 'function',
+					regex: '^owner:main$',
+				}],
+			}),
+			['^owner:main$'],
 		)
 	})
 })

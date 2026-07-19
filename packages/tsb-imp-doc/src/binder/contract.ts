@@ -1,3 +1,4 @@
+import { ResourceLocation } from '@spyglassmc/core'
 import type { BinderContext, Symbol } from '@spyglassmc/core'
 import type {
 	ImpDocAnnotationBase,
@@ -185,7 +186,8 @@ export function bindContract(
 ): void {
 	if (
 		symbol
-		&& node.functionID?.raw === symbol.identifier
+		&& node.functionID
+		&& ResourceLocation.lengthen(node.functionID.raw) === symbol.identifier
 	) {
 		stampContract(symbol, node.contract)
 	}

@@ -10,6 +10,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url'
 import { getImpDocSymbolData, ImpDocNode, initialize as initializeImpDoc } from '../lib/index.js'
 
 const Target = 'owner:helper'
+const MalformedTarget = 'owner:malformed'
 // Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
 // like UriStore does for watched files) so that projectRoots, watcher entries, and
 // assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
@@ -27,6 +28,12 @@ const RuntimeFiles = {
 	helper: core.normalizeUri(
 		new URL(
 			'./runtime/private-project/data/owner/functions/helper.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	malformedTarget: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/owner/functions/malformed.mcfunction',
 			import.meta.url,
 		).toString(),
 	),
@@ -48,6 +55,12 @@ const RuntimeFiles = {
 			import.meta.url,
 		).toString(),
 	),
+	malformedCaller: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/external/functions/malformed_caller.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
 	noHeader: core.normalizeUri(
 		new URL(
 			'./runtime/private-project/data/no_header/functions/caller.mcfunction',
@@ -59,9 +72,11 @@ const RuntimeFiles = {
 const FunctionIds = {
 	index: 'owner:_index.d',
 	helper: 'owner:helper',
+	malformedTarget: MalformedTarget,
 	main: 'owner:main',
 	external: 'external:caller',
 	denied: 'other:denied',
+	malformedCaller: 'external:malformed_caller',
 	noHeader: 'no_header:caller',
 } as const
 
@@ -191,18 +206,19 @@ function completionKey(item: core.CompletionItem): string {
 function assertSingleViolation(
 	state: RuntimeState,
 	caller: string,
+	target = Target,
 ): void {
 	const errors = state.node.linterErrors ?? []
 	assert.equal(errors.length, 1)
 
-	const targetStart = state.content.lastIndexOf(Target)
+	const targetStart = state.content.lastIndexOf(target)
 	assert.notEqual(targetStart, -1)
 	assert.deepEqual(
 		errors[0].range,
-		core.Range.create(targetStart, targetStart + Target.length),
+		core.Range.create(targetStart, targetStart + target.length),
 	)
 	assert.match(errors[0].message, /impDocPrivate/)
-	assert.match(errors[0].message, new RegExp(Target))
+	assert.match(errors[0].message, new RegExp(target))
 	assert.match(errors[0].message, new RegExp(caller))
 }
 
@@ -246,9 +262,11 @@ describe('IMP-Doc private visibility runtime', () => {
 			const file of [
 				'index',
 				'helper',
+				'malformedTarget',
 				'main',
 				'external',
 				'denied',
+				'malformedCaller',
 			] as const
 		) {
 			const uri = RuntimeFiles[file]
@@ -317,6 +335,7 @@ describe('IMP-Doc private visibility runtime', () => {
 		assert.deepEqual(helperData?.visibility, {
 			type: 'within',
 			owner: Target,
+			includeOwner: true,
 			patterns: [{
 				raw: 'owner:main',
 				targetType: 'function',
@@ -327,6 +346,21 @@ describe('IMP-Doc private visibility runtime', () => {
 			project.symbols.query(helper.doc, 'function', Target).symbol,
 			undefined,
 		)
+	})
+
+	it('stamps malformed visibility as denied even when @public is present', () => {
+		assert.ok(project)
+		const symbol = project.symbols.lookup(
+			'function',
+			[MalformedTarget],
+		).symbol
+		assert.ok(symbol)
+		assert.deepEqual(getImpDocSymbolData(symbol.data)?.visibility, {
+			type: 'denied',
+			owner: MalformedTarget,
+		})
+		assert.equal(symbol.visibility, 3)
+		assert.match(symbol.desc ?? '', /Visibility:\*\* denied/)
 	})
 
 	it('registers #declare storage symbols through the impDoc:declaration binder', () => {
@@ -463,6 +497,16 @@ describe('IMP-Doc private visibility runtime', () => {
 			0,
 			'external caller must not receive owner:helper',
 		)
+
+		const malformedDenied = completeFunctionCall(
+			project,
+			getState(states, 'malformedCaller'),
+		)
+		assert.equal(
+			malformedDenied.filter(item => item.label === MalformedTarget).length,
+			0,
+			'external caller must not receive a malformed visibility target',
+		)
 	})
 
 	it('reports exactly one external private call', () => {
@@ -476,6 +520,14 @@ describe('IMP-Doc private visibility runtime', () => {
 		assertSingleViolation(
 			getState(states, 'denied'),
 			'other:denied',
+		)
+	})
+
+	it('reports exactly one external call to a denied malformed target', () => {
+		assertSingleViolation(
+			getState(states, 'malformedCaller'),
+			FunctionIds.malformedCaller,
+			MalformedTarget,
 		)
 	})
 
@@ -519,6 +571,7 @@ describe('IMP-Doc private visibility runtime', () => {
 			{
 				type: 'within',
 				owner: Target,
+				includeOwner: true,
 				patterns: [{
 					raw: 'owner:main',
 					targetType: 'function',

@@ -131,32 +131,26 @@ function buildPreparedRegExp(
 
 /**
  * Legacy IMP-Doc の path pattern を anchored regex source に変換する。
- * v3 の置換順 (`?`, double-star + slash, `**`, `*`) を single-pass lookahead で再現する。
+ * literal regex 文字を先に escape し、 wildcard 自体は v3 と同じ4段階
+ * (`?` -> double-star + slash -> `**` -> `*`) で前段の結果へ逐次適用する。
  * separator は resource ID の namespace/path を区切る `:` と `/` の双方。
  */
 export function legacyGlobToRegex(pattern: string): string {
-	let ans = '^'
-	for (let i = 0; i < pattern.length; i++) {
-		const char = pattern[i]
-		if (char === '?') {
-			ans += '[^:/]'
-		} else if (
-			char === '*'
-			&& pattern[i + 1] === '*'
-			&& pattern[i + 2] === '/'
-		) {
-			ans += '.{0,}'
-			i += 2
-		} else if (char === '*' && pattern[i + 1] === '*') {
-			ans += '.{0,}'
-			i++
-		} else if (char === '*') {
-			ans += '[^:/]{0,}'
+	let escaped = ''
+	for (const char of pattern) {
+		if (char === '?' || char === '*') {
+			escaped += char
 		} else {
-			ans += RegexSpecials.has(char) ? `\\${char}` : char
+			escaped += RegexSpecials.has(char) ? `\\${char}` : char
 		}
 	}
-	return `${ans}$`
+
+	const translated = escaped
+		.replace(/\?/g, '[^:/]')
+		.replace(/\*\*\//g, '.{0,}')
+		.replace(/\*\*/g, '.{0,}')
+		.replace(/\*/g, '[^:/]{0,}')
+	return `^${translated}$`
 }
 
 function parseWithin(
@@ -265,6 +259,7 @@ export function parseVisibility(
 	let isPublic = false
 	let isPrivate = false
 	let isInternal = false
+	let malformedVisibilityAnnotation: ImpDocValue | undefined
 	const patterns: WithinPattern[] = []
 
 	for (const values of ImpDocNode.flattenAnnotations(annotations)) {
@@ -283,12 +278,30 @@ export function parseVisibility(
 				const pattern = parseWithin(values, err)
 				if (pattern) {
 					patterns.push(pattern)
+				} else {
+					malformedVisibilityAnnotation ??= values[0]
 				}
 				break
 			}
 		}
 	}
 
+	// Fork hybrid: 正常 annotation では Legacy の public 優先を維持する一方、
+	// malformed @within は annotation 群の他要素に隠させず fail closed にする。
+	if (malformedVisibilityAnnotation) {
+		if (!owner) {
+			err?.report(
+				'Cannot resolve the owner function for restricted IMP-Doc visibility',
+				malformedVisibilityAnnotation,
+			)
+			return undefined
+		}
+		err?.report(
+			'IMP-Doc visibility annotation is malformed; falling back to deny state',
+			malformedVisibilityAnnotation,
+		)
+		return { type: 'denied', owner }
+	}
 	if (isPublic) {
 		return { type: 'public' }
 	}
@@ -308,6 +321,7 @@ export function parseVisibility(
 		return {
 			type: 'within',
 			owner,
+			includeOwner: isPrivate,
 			patterns: isInternal
 				? [...getInternalWithinPatterns(owner), ...patterns]
 				: patterns,
@@ -347,8 +361,8 @@ function getPreparedInternalRegExps(
 /**
  * caller (= function identifier) が visibility の許可条件を満たすか判定。
  * public / undefined は defensive に許可、 private / denied は owner exact、 internal
- * は namespace patterns、 within は owner OR patterns。 targetType が `*` なら caller
- * の kind を問わず match。
+ * は namespace patterns、 within は明示 `@private` 時のみ owner、それ以外は patterns。
+ * targetType が `*` なら caller の kind を問わず match。
  * within の patterns は `preparedVisibilityCache` (Option B) の unified regex で 1 回の
  * `test()` に畳む。 fallback 発火時は `compiledPatternCache` (Option A) の per-pattern
  * 評価に降ろす。
@@ -369,7 +383,7 @@ export function matchesVisibility(
 			return getPreparedInternalRegExps(visibility)
 				.some(regexp => testCallerForms(regexp, caller))
 		case 'within': {
-			if (caller === visibility.owner) {
+			if (visibility.includeOwner && caller === visibility.owner) {
 				return true
 			}
 			// linter は StateProxy 経由で visibility を渡すため handler ごとに identity が異なる。
@@ -420,7 +434,9 @@ export function visibilityRestrictions(
 			return getInternalPatternRaws(visibility.owner).map(legacyGlobToRegex)
 		case 'within':
 			return [
-				legacyGlobToRegex(visibility.owner),
+				...(visibility.includeOwner
+					? [legacyGlobToRegex(visibility.owner)]
+					: []),
 				...visibility.patterns
 					.filter(p => p.targetType === '*' || p.targetType === 'function')
 					.map(p => p.regex),

@@ -162,6 +162,8 @@ export type ImpDocVisibility =
 	| {
 		readonly type: 'within'
 		readonly owner: string
+		/** `@private` が明示され、 owner 自身も許可対象に含むか。 */
+		readonly includeOwner: boolean
 		readonly patterns: readonly WithinPattern[]
 	}
 

@@ -83,7 +83,10 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			return
 		}
 
-		const owner = ownerForDocument(ctx) ?? doc.functionID?.raw
+		const owner = ownerForDocument(ctx)
+			?? (doc.functionID
+				? core.ResourceLocation.lengthen(doc.functionID.raw)
+				: undefined)
 		if (!owner) {
 			ctx.err.report(
 				'Cannot resolve #declare owner function',

@@ -24,6 +24,8 @@ const RuntimeFileUris = [
 	'./runtime/private-project/data/other/functions/denied.mcfunction',
 	'./runtime/private-project/data/contract/functions/target.mcfunction',
 	'./runtime/private-project/data/contract/functions/caller.mcfunction',
+	'./runtime/private-project/data/owner/functions/malformed.mcfunction',
+	'./runtime/private-project/data/external/functions/malformed_caller.mcfunction',
 ].map(path => core.normalizeUri(new URL(path, import.meta.url).toString()))
 
 const PackMcmetaUri = core.normalizeUri(

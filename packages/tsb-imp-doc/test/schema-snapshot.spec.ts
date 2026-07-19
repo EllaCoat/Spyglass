@@ -83,6 +83,7 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 			withinDeclaration: stamp({
 				type: 'within',
 				owner: 'example:owner',
+				includeOwner: true,
 				patterns: [{
 					raw: 'example:allowed/**',
 					targetType: 'function',

@@ -66,7 +66,7 @@ function buildVisibility(patternCount) {
 			regex: `^allowed:ns${i}/.{0,}$`,
 		})
 	}
-	return { type: 'within', owner: 'owner:helper', patterns }
+	return { type: 'within', owner: 'owner:helper', includeOwner: true, patterns }
 }
 
 /**

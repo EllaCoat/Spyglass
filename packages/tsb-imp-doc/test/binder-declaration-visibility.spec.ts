@@ -38,7 +38,10 @@ function annotation(...tokens: string[]): ImpDocAnnotation {
 	return node
 }
 
-function bindStorage(tokens?: readonly string[]): {
+function bindStorage(
+	tokens?: readonly string[],
+	options: { functionID?: string; registerOwner?: boolean } = {},
+): {
 	err: core.ErrorReporter
 	node: ImpDocDeclarationNode
 	symbol: core.Symbol
@@ -64,14 +67,18 @@ function bindStorage(tokens?: readonly string[]): {
 		plainText: 'Declaration fixture',
 		range: { start: 0, end: 80 },
 		raw: '',
+		...(options.functionID ? { functionID: value(options.functionID) } : {}),
 	}
 	core.AstNode.setParents(doc)
 
-	const symbols = new core.SymbolUtil(core.SymbolTable.link({
-		function: {
-			[Owner]: { definition: [{ uri: Uri }] },
-		},
-	} as core.UnlinkedSymbolTable))
+	const table = options.registerOwner === false
+		? {} as core.UnlinkedSymbolTable
+		: {
+			function: {
+				[Owner]: { definition: [{ uri: Uri }] },
+			},
+		} as core.UnlinkedSymbolTable
+	const symbols = new core.SymbolUtil(core.SymbolTable.link(table))
 	symbols.buildCache()
 	const err = new core.ErrorReporter()
 	const ctx = {
@@ -129,6 +136,22 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 		})
 		assert.equal(getImpDocSymbolData(denied.data)?.privateOwner, Owner)
 		assert.deepEqual(denied.visibilityRestriction, ['^owner:_index\\.d$'])
+	})
+
+	it('canonicalizes a short header used as the declaration owner fallback', () => {
+		const { err, symbol } = bindStorage(
+			['@private'],
+			{ functionID: 'foo', registerOwner: false },
+		)
+		assert.deepEqual(getImpDocSymbolData(symbol.data)?.visibility, {
+			type: 'private',
+			owner: 'minecraft:foo',
+		})
+		assert.equal(
+			getImpDocSymbolData(symbol.data)?.declaration?.owner,
+			'minecraft:foo',
+		)
+		assert.deepEqual(err.errors, [])
 	})
 
 	it('fails closed for all malformed @within shapes', () => {

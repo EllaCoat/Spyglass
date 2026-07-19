@@ -7,12 +7,16 @@ import { getImpDocSymbolData, impDoc as parseImpDoc, type ImpDocNode } from '../
 const Owner = 'owner:target'
 const Uri = 'file:///data/owner/functions/target.mcfunction'
 
-async function bindHeader(annotation?: string): Promise<{
+async function bindHeader(
+	annotation?: string,
+	headerID = Owner,
+	symbolID = core.ResourceLocation.lengthen(headerID),
+): Promise<{
 	err: core.ErrorReporter
 	node: ImpDocNode
 	symbol: core.Symbol
 }> {
-	const content = `#> ${Owner}\n${
+	const content = `#> ${headerID}\n${
 		annotation ? `# ${annotation}\n` : '# Header without annotations\n'
 	}\n`
 	const parseErrors = new core.ErrorReporter()
@@ -27,7 +31,7 @@ async function bindHeader(annotation?: string): Promise<{
 
 	const table = core.SymbolTable.link({
 		function: {
-			[Owner]: { definition: [{ uri: Uri }] },
+			[symbolID]: { definition: [{ uri: Uri }] },
 		},
 	} as core.UnlinkedSymbolTable)
 	const symbols = new core.SymbolUtil(table)
@@ -39,7 +43,7 @@ async function bindHeader(annotation?: string): Promise<{
 		meta: { hasBinder: () => false },
 		symbols,
 	} as unknown as core.BinderContext)
-	const symbol = symbols.lookup('function', [Owner]).symbol
+	const symbol = symbols.lookup('function', [symbolID]).symbol
 	assert.ok(symbol)
 	return { err, node, symbol }
 }
@@ -56,6 +60,7 @@ describe('IMP-Doc function binder visibility fallback', () => {
 					{
 						type: 'within',
 						owner: Owner,
+						includeOwner: false,
 						patterns: [{
 							raw: 'owner:allowed',
 							targetType: 'function',
@@ -81,6 +86,7 @@ describe('IMP-Doc function binder visibility fallback', () => {
 				'@within unknown_type allowed:path',
 				'@within',
 				'@within function tag1 tag2',
+				'@public\n# @within unknown_type allowed:path',
 			]
 		) {
 			const { err, node, symbol } = await bindHeader(annotation)
@@ -95,6 +101,27 @@ describe('IMP-Doc function binder visibility fallback', () => {
 					'IMP-Doc visibility annotation is malformed; falling back to deny state',
 				)
 			))
+		}
+	})
+
+	it('canonicalizes short and full default-namespace headers identically', async () => {
+		for (const headerID of ['foo', 'minecraft:foo']) {
+			const { err, node, symbol } = await bindHeader(
+				'@private',
+				headerID,
+				'minecraft:foo',
+			)
+			assert.equal(node.functionID?.raw, headerID)
+			assert.deepEqual(node.visibility, {
+				type: 'private',
+				owner: 'minecraft:foo',
+			})
+			assert.deepEqual(getImpDocSymbolData(symbol.data)?.visibility, {
+				type: 'private',
+				owner: 'minecraft:foo',
+			})
+			assert.equal(symbol.visibility, 3)
+			assert.deepEqual(err.errors, [])
 		}
 	})
 

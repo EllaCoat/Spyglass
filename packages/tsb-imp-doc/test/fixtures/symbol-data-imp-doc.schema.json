@@ -1,5 +1,5 @@
 {
-  "impDocVersion": "0.0.5-visibility-parity.0",
+  "impDocVersion": "0.0.5-visibility-parity.1",
   "public": {
     "visibility": {
       "type": "public"
@@ -30,6 +30,7 @@
     "visibility": {
       "type": "within",
       "owner": "example:owner",
+      "includeOwner": true,
       "patterns": [
         {
           "raw": "example:allowed/**",
