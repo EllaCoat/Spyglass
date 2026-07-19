@@ -2,7 +2,7 @@ import * as core from '@spyglassmc/core'
 import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import * as je from '@spyglassmc/java-edition'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
@@ -176,6 +176,13 @@ function createArchiveFixtureFileService(
 	return fs
 }
 
+async function createCanonicalTempDir(prefix: string): Promise<string> {
+	// Resolve Windows 8.3 short names before converting fixture paths to URIs.
+	// Otherwise pathToFileURL encodes `~` as `%7E`, while UriStore rebuilds the
+	// watched URI with a literal `~`, splitting cache and symbol keys in two.
+	return realpath(await mkdtemp(prefix))
+}
+
 async function writeRuntimeFixtureFile(
 	projectRoot: string,
 	relativePath: string,
@@ -196,7 +203,7 @@ describe('IMP-Doc declaration union runtime (P4-2b v3 parity)', () => {
 	let cacheDir: string | undefined
 
 	before(async () => {
-		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-union-'))
+		cacheDir = await createCanonicalTempDir(join(tmpdir(), 'spyglass-imp-doc-union-'))
 		const watcher = new FixtureWatcher([
 			PackMcmetaUri,
 			...Object.values(FileUris),
@@ -280,8 +287,12 @@ describe('IMP-Doc declaration union runtime (P4-2b v3 parity)', () => {
 
 describe('IMP-Doc conflict owner implicit lint', () => {
 	it('publishes and clears a canonical-owner warning while that owner remains unopened', async () => {
-		const projectRoot = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-conflict-project-'))
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-conflict-cache-'))
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-conflict-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-conflict-cache-'),
+		)
 		let project: core.Project | undefined
 		try {
 			const pack = await writeRuntimeFixtureFile(
@@ -336,8 +347,10 @@ describe('IMP-Doc conflict owner implicit lint', () => {
 
 describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 	it('removes the final declaration entries after their source document changes', async () => {
-		const projectRoot = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-union-project-'))
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-union-cache-'))
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-union-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(join(tmpdir(), 'spyglass-imp-doc-union-cache-'))
 		let first: core.Project | undefined
 		let second: core.Project | undefined
 		try {
@@ -425,10 +438,12 @@ describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 
 describe('IMP-Doc function header purge on file deletion', () => {
 	it('purges a deleted header and settles its new owner before warm READY', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-header-purge-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-header-purge-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-header-purge-cache-'),
+		)
 		let first: core.Project | undefined
 		let second: core.Project | undefined
 		try {
@@ -559,10 +574,12 @@ describe('IMP-Doc function header purge on file deletion', () => {
 
 describe('IMP-Doc implicit owner lint stage preservation', () => {
 	it('keeps binder diagnostics when a conflict republishes an unopened owner', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-implicit-stage-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-implicit-stage-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-implicit-stage-cache-'),
+		)
 		let project: core.Project | undefined
 		try {
 			const pack = await writeRuntimeFixtureFile(
@@ -618,10 +635,12 @@ describe('IMP-Doc implicit owner lint stage preservation', () => {
 
 describe('IMP-Doc warm start queued lint vs staged diagnostics ordering', () => {
 	it('does not roll queued owner diagnostics back to stale cache errors', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-warm-order-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-warm-order-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-warm-order-cache-'),
+		)
 		let first: core.Project | undefined
 		let second: core.Project | undefined
 		try {
@@ -688,10 +707,12 @@ describe('IMP-Doc warm start queued lint vs staged diagnostics ordering', () => 
 
 describe('IMP-Doc conflict ownership handoff on header file deletion', () => {
 	it('queues the surviving declaration owner and publishes the conflict there', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-owner-handoff-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-owner-handoff-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-owner-handoff-cache-'),
+		)
 		let project: core.Project | undefined
 		try {
 			const pack = await writeRuntimeFixtureFile(
@@ -760,7 +781,9 @@ describe('IMP-Doc conflict ownership handoff on header file deletion', () => {
 
 describe('IMP-Doc implicit lint checker preservation for closed cache documents', () => {
 	it('keeps checker diagnostics when a queued lint republishes a closed cache document', async () => {
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-checked-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-checked-cache-'),
+		)
 		// Place the project inside the cache root so its documents take the
 		// cache-URI restore path (bind + check) in onDidClose.
 		const projectRoot = join(cacheDir, 'project')
@@ -825,7 +848,9 @@ describe('IMP-Doc implicit lint checker preservation for closed cache documents'
 	})
 
 	it('restores checker preservation from a persisted warm cache', async () => {
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-checked-warm-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-checked-warm-cache-'),
+		)
 		const projectRoot = join(cacheDir, 'project')
 		await mkdir(projectRoot, { recursive: true })
 		let first: core.Project | undefined
@@ -898,7 +923,9 @@ describe('IMP-Doc implicit lint checker preservation for closed cache documents'
 	})
 
 	it('restores checker preservation for an archive document from a warm cache', async () => {
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-checked-archive-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-checked-archive-cache-'),
+		)
 		const projectRoot = join(cacheDir, 'project')
 		await mkdir(projectRoot, { recursive: true })
 		let first: core.Project | undefined
@@ -985,7 +1012,7 @@ describe('IMP-Doc implicit lint checker preservation for closed cache documents'
 	})
 
 	it('restores checker preservation when a rebuild transaction rolls back', async () => {
-		const cacheDir = await mkdtemp(
+		const cacheDir = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-checked-rollback-cache-'),
 		)
 		const projectRoot = join(cacheDir, 'project')
@@ -1074,10 +1101,12 @@ describe('IMP-Doc implicit lint checker preservation for closed cache documents'
 
 describe('IMP-Doc ready event vs queued lint flush ordering', () => {
 	it('emits ready only after queued warm-start lints have settled', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-ready-order-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-ready-order-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-ready-order-cache-'),
+		)
 		let first: core.Project | undefined
 		let second: core.Project | undefined
 		try {
@@ -1149,10 +1178,12 @@ describe('IMP-Doc ready event vs queued lint flush ordering', () => {
 
 describe('IMP-Doc warm start changed file staged diagnostics rollback', () => {
 	it('does not republish stale cached errors over a changed file fresh scan', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-changed-file-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-changed-file-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-changed-file-cache-'),
+		)
 		let first: core.Project | undefined
 		let second: core.Project | undefined
 		try {
@@ -1204,10 +1235,12 @@ describe('IMP-Doc warm start changed file staged diagnostics rollback', () => {
 
 describe('IMP-Doc header desc priority over declaration desc', () => {
 	it('keeps the header hover desc regardless of bind order and declaration removal', async () => {
-		const projectRoot = await mkdtemp(
+		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-desc-priority-project-'),
 		)
-		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-desc-priority-cache-'))
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-desc-priority-cache-'),
+		)
 		let project: core.Project | undefined
 		try {
 			const pack = await writeRuntimeFixtureFile(
