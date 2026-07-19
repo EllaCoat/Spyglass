@@ -624,6 +624,7 @@ export class Project extends EventDispatcher<{
 			throw e
 		}
 		await this.publishRebuildEvents(diagnostics)
+		await this.flushQueuedLints()
 		this.emit('reinitialized', { contextChanged: true })
 		return true
 	}
@@ -849,10 +850,15 @@ export class Project extends EventDispatcher<{
 
 		await this.rebindAndCheckClientManaged(propagateProcessorErrors)
 		this.#isReady = true
-		await this.flushQueuedLints()
 		__profiler.finalize()
+		// Queued lints republish per-URI diagnostics, so they must flush after
+		// the staged (possibly stale) cache diagnostics have been published:
+		// flushing first would let the old staged entries roll the fresh results
+		// back. On the staged path the caller publishes after this method
+		// settles and is responsible for flushing the queue afterwards.
 		if (shouldPublishEvents) {
 			await this.publishRebuildEvents(stagedDiagnostics)
+			await this.flushQueuedLints()
 		}
 
 		return this
@@ -963,6 +969,7 @@ export class Project extends EventDispatcher<{
 			throw e
 		}
 		await this.publishRebuildEvents(diagnostics)
+		await this.flushQueuedLints()
 	}
 
 	private async rebuildProjectFromEmptyCache(): Promise<ProjectDiagnosticsEvent[]> {
@@ -1316,6 +1323,12 @@ export class Project extends EventDispatcher<{
 						continue
 					}
 					const node = this.parse(doc)
+					// Republishing replaces this URI's diagnostics wholesale, so bind
+					// before linting: a lint-only pass on a fresh AST would drop the
+					// binder diagnostics published for this document earlier. Checkers
+					// only run for client-managed documents, so no checker stage is
+					// needed to reproduce the published superset.
+					await this.bind(doc, node)
 					this.lint(doc, node)
 					await this.emitAsync('documentUpdated', { doc, node })
 				}

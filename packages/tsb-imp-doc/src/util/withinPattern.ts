@@ -23,9 +23,9 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 /**
  * `symbol.data` is outside core's SymbolLocation lifecycle, so retain a
- * per-SymbolUtil reverse index for declaration visibility entries. The first
- * access reconstructs it from a loaded symbol cache; later declaration binds
- * update it incrementally.
+ * per-SymbolUtil reverse index for declaration visibility entries and
+ * header-stamping documents. The first access reconstructs it from a loaded
+ * symbol cache; later declaration / header binds update it incrementally.
  */
 type DeclarationVisibilityIndex = Map<string, Set<CoreSymbol>>
 const declarationVisibilityIndexes = new WeakMap<SymbolUtil, DeclarationVisibilityIndex>()
@@ -51,8 +51,12 @@ function getDeclarationVisibilityIndex(symbols: SymbolUtil): DeclarationVisibili
 
 	index = new Map()
 	SymbolUtil.forEachSymbol(symbols.global, (symbol) => {
-		for (const entry of getImpDocSymbolData(symbol.data)?.declarations ?? []) {
+		const data = getImpDocSymbolData(symbol.data)
+		for (const entry of data?.declarations ?? []) {
 			addToDeclarationVisibilityIndex(index!, symbol, entry.uri)
+		}
+		if (data?.headerUri !== undefined) {
+			addToDeclarationVisibilityIndex(index!, symbol, data.headerUri)
 		}
 	})
 	declarationVisibilityIndexes.set(symbols, index)
@@ -603,6 +607,26 @@ export function stampVisibility(
 }
 
 /**
+ * Restore `Symbol.desc` from the canonical (= (uri, range) 昇順先頭) remaining
+ * declaration entry, or drop it when no declaration description is left. Called
+ * whenever header-side metadata or the canonical declaration entry is removed,
+ * so a headerless target keeps its cross-document `#declare` hover regardless
+ * of bind order (Terra r3 WANT-1).
+ */
+function restoreCanonicalDeclarationDesc(
+	symbol: CoreSymbol,
+	impDoc: ImpDocSymbolData,
+): void {
+	const description = [...impDoc.declarations ?? []]
+		.sort(compareDeclarationSource)[0]?.description
+	if (description === undefined) {
+		delete symbol.desc
+	} else {
+		symbol.desc = description
+	}
+}
+
+/**
  * 指定 URI が contribute した declaration visibility entry を全て除去する。
  * 再 bind 時、 その URI の最初の declaration が stamp される前に呼び、 編集で
  * 範囲が変わった / 消えた stale entry を掃除する (core の `clear()` が消すのは
@@ -628,12 +652,7 @@ export function clearDeclarationVisibilities(
 		delete impDoc.declarations
 	}
 	if (removedCanonical) {
-		const description = remaining[0]?.description
-		if (description === undefined) {
-			delete symbol.desc
-		} else {
-			symbol.desc = description
-		}
+		restoreCanonicalDeclarationDesc(symbol, impDoc)
 	}
 	// derived shortcut は一旦落とす (restricted entry が残れば refresh が再設定)。
 	delete impDoc.privateOwner
@@ -652,12 +671,48 @@ export function clearDeclarationVisibilities(
 }
 
 /**
- * Clear all declaration visibility metadata contributed by one document. Core
- * clears SymbolLocations before a rebind or a file removal, but the IMP-Doc
- * payload is stored in `symbol.data` and therefore needs this matching URI
- * lifecycle step. The index is rebuilt from warm-cache data on first use.
+ * Remove header-side metadata (`visibility` / `contract` / `Symbol.desc`) when
+ * the document that stamped it is cleared. Declaration entries contributed by
+ * other documents survive and the canonical `#declare` description is restored,
+ * so deleting an `@public` header no longer outlives a restricted `#declare`
+ * union elsewhere (Terra r3 MUST-1).
  */
-export function clearDeclarationVisibilitiesForUri(
+function clearHeaderMetadataForUri(symbol: CoreSymbol, uri: string): void {
+	const root = asRecord(symbol.data)
+	const previous = getImpDocSymbolData(symbol.data)
+	if (previous?.headerUri !== uri) {
+		return
+	}
+
+	const impDoc: ImpDocSymbolData = { ...previous }
+	delete impDoc.visibility
+	delete impDoc.contract
+	delete impDoc.privateOwner
+	delete impDoc.headerUri
+	restoreCanonicalDeclarationDesc(symbol, impDoc)
+
+	if (Object.keys(impDoc).length === 0) {
+		delete root['impDoc']
+		symbol.data = root
+		// SymbolVisibility.Public = 2 (const enum; use the runtime numeric value).
+		symbol.visibility = 2
+		delete symbol.visibilityRestriction
+		return
+	}
+
+	refreshAggregateVisibility(symbol, impDoc)
+	symbol.data = { ...root, impDoc }
+}
+
+/**
+ * Clear all IMP-Doc metadata contributed by one document: declaration
+ * visibility entries and, when this document stamped them, the header-side
+ * visibility / contract / desc. Core clears SymbolLocations before a rebind or
+ * a file removal, but the IMP-Doc payload is stored in `symbol.data` and
+ * therefore needs this matching URI lifecycle step. The index is rebuilt from
+ * warm-cache data on first use.
+ */
+export function clearImpDocMetadataForUri(
 	symbols: SymbolUtil,
 	uri: string,
 	queueLint?: (this: void, uri: string) => void,
@@ -669,7 +724,8 @@ export function clearDeclarationVisibilitiesForUri(
 	}
 
 	// Drop the URI first: current bind will repopulate it through
-	// `trackDeclarationVisibility`, while a fully removed URI stays absent.
+	// `trackDeclarationVisibility` / `trackHeaderVisibility`, while a fully
+	// removed URI stays absent.
 	index.delete(uri)
 	for (const symbol of affected) {
 		const before = getImpDocSymbolData(symbol.data)
@@ -677,6 +733,7 @@ export function clearDeclarationVisibilitiesForUri(
 			.sort(compareDeclarationSource)
 		const previousOwner = getCanonicalDeclarationOwnerUri(symbol, beforeDeclarations)
 		clearDeclarationVisibilities(symbol, uri)
+		clearHeaderMetadataForUri(symbol, uri)
 		const after = getImpDocSymbolData(symbol.data)
 		const afterDeclarations = [...after?.declarations ?? []]
 			.sort(compareDeclarationSource)
@@ -699,9 +756,31 @@ export function trackDeclarationVisibility(
 }
 
 /**
+ * Record which document's IMP-Doc function header stamped the definition-side
+ * metadata. `headerUri` is persisted in `symbol.data` so the URI purge index
+ * can be rebuilt from a warm cache, and the reverse index entry covers the
+ * current session.
+ */
+export function trackHeaderVisibility(
+	symbols: SymbolUtil,
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	const root = asRecord(symbol.data)
+	const impDoc: ImpDocSymbolData = {
+		...getImpDocSymbolData(symbol.data),
+		headerUri: uri,
+	}
+	symbol.data = { ...root, impDoc }
+	addToDeclarationVisibilityIndex(getDeclarationVisibilityIndex(symbols), symbol, uri)
+}
+
+/**
  * Remove visibility metadata previously contributed by an IMP-Doc function
  * header. Declaration-side visibility entries and other symbol data are
- * preserved, and the aggregate is recomputed from the remaining entries.
+ * preserved, the canonical `#declare` description (if any) replaces the
+ * header-derived desc, and the aggregate is recomputed from the remaining
+ * entries.
  */
 export function clearVisibility(symbol: CoreSymbol): void {
 	const root = asRecord(symbol.data)
@@ -713,7 +792,8 @@ export function clearVisibility(symbol: CoreSymbol): void {
 	const impDoc: ImpDocSymbolData = { ...previous }
 	delete impDoc.visibility
 	delete impDoc.privateOwner
-	delete symbol.desc
+	delete impDoc.headerUri
+	restoreCanonicalDeclarationDesc(symbol, impDoc)
 
 	if (Object.keys(impDoc).length === 0) {
 		delete root['impDoc']

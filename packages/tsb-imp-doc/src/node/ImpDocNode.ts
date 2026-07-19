@@ -255,6 +255,13 @@ export interface ImpDocSymbolData {
 	 * legacy-v3 `ClientCache.getCacheForID`).
 	 */
 	declarations?: ImpDocDeclarationVisibility[]
+	/**
+	 * URI of the document whose IMP-Doc function header stamped the
+	 * definition-side metadata (`visibility` / `contract` / `Symbol.desc`).
+	 * Persisted so the URI clear hook can purge header metadata when that
+	 * document is deleted or rebound, including after a warm cache reload.
+	 */
+	headerUri?: string
 	/** Serializable function contract copied from the bound IMP-Doc header. */
 	contract?: ImpDocContract
 	/** Serializable alias payload retained across symbol-cache reloads. */

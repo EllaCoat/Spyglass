@@ -12,6 +12,7 @@ import {
 	type ImpDocVisibility,
 	stampContract,
 	stampVisibility,
+	trackHeaderVisibility,
 } from '../lib/index.js'
 
 const EmptyContract: ImpDocContract = {
@@ -76,6 +77,16 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 				'@e[type=#example:hostile, distance=..16]',
 			),
 			public: stamp({ type: 'public' }, undefined, EmptyContract),
+			header: (() => {
+				const symbol = emptySymbol()
+				stampVisibility(symbol, { type: 'public' })
+				trackHeaderVisibility(
+					new core.SymbolUtil({}),
+					symbol,
+					'file:///fixture/header.mcfunction',
+				)
+				return getImpDocSymbolData(symbol.data)
+			})(),
 			private: stamp(
 				{ type: 'private', owner: 'example:owner' },
 				undefined,

@@ -1,5 +1,5 @@
 {
-  "impDocVersion": "0.0.7-declaration-union.2",
+  "impDocVersion": "0.0.7-declaration-union.3",
   "alias": {
     "alias": {
       "kind": "selectorTemplate",
@@ -10,6 +10,12 @@
     "visibility": {
       "type": "public"
     }
+  },
+  "header": {
+    "visibility": {
+      "type": "public"
+    },
+    "headerUri": "file:///fixture/header.mcfunction"
   },
   "private": {
     "visibility": {

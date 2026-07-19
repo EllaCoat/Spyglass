@@ -1,16 +1,20 @@
 import { ErrorReporter, StateProxy } from '@spyglassmc/core'
+import type { Symbol as CoreSymbol } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import type { ImpDocAnnotation, ImpDocValue } from '../lib/index.js'
+import { getImpDocSymbolData } from '../lib/index.js'
+import type { ImpDocAnnotation, ImpDocDeclarationSource, ImpDocValue } from '../lib/index.js'
 import {
 	LEGACY_FILE_TYPE_IDS,
 	LEGACY_MISC_TYPES,
 	LEGACY_WITHIN_TARGET_IDS,
 } from '../lib/legacy/categories.js'
 import {
+	clearVisibility,
 	legacyGlobToRegex,
 	matchesVisibility,
 	parseVisibility,
+	stampVisibility,
 	toShortestString,
 	visibilityRestrictions,
 } from '../lib/util/withinPattern.js'
@@ -828,5 +832,59 @@ describe('visibilityRestrictions', () => {
 			}),
 			['^owner:main$'],
 		)
+	})
+})
+
+describe('clearVisibility', () => {
+	const declaration: ImpDocDeclarationSource = {
+		uri: 'file:///fixture/_index.d.mcfunction',
+		range: { start: 10, end: 20 },
+		owner: 'example:owner',
+		description: 'Canonical declaration description',
+	}
+
+	it('restores the canonical #declare description for a headerless symbol', () => {
+		const symbol = { data: {} } as CoreSymbol
+		stampVisibility(
+			symbol,
+			{ type: 'private', owner: 'example:owner' },
+			declaration,
+		)
+		symbol.desc = 'Stale header-derived description'
+
+		clearVisibility(symbol)
+
+		assert.equal(symbol.desc, 'Canonical declaration description')
+		assert.deepEqual(
+			getImpDocSymbolData(symbol.data)?.declarations?.map(entry => entry.uri),
+			[declaration.uri],
+		)
+	})
+
+	it('replaces a removed header description with the canonical #declare description', () => {
+		const symbol = { data: {} } as CoreSymbol
+		stampVisibility(symbol, { type: 'public' })
+		stampVisibility(
+			symbol,
+			{ type: 'private', owner: 'example:owner' },
+			declaration,
+		)
+		symbol.desc = 'Header description'
+
+		clearVisibility(symbol)
+
+		assert.equal(symbol.desc, 'Canonical declaration description')
+		assert.equal(getImpDocSymbolData(symbol.data)?.visibility, undefined)
+	})
+
+	it('still drops the description when no declaration entry remains', () => {
+		const symbol = { data: {} } as CoreSymbol
+		stampVisibility(symbol, { type: 'public' })
+		symbol.desc = 'Header description'
+
+		clearVisibility(symbol)
+
+		assert.equal(symbol.desc, undefined)
+		assert.equal(getImpDocSymbolData(symbol.data), undefined)
 	})
 })

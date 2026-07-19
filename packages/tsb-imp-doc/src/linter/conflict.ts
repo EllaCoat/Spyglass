@@ -118,20 +118,27 @@ function getConflictOwnerRange(
 		?? { start: 0, end: 0 }
 }
 
+function hasLocationAtUri(symbol: CoreSymbol, uri: string): boolean {
+	return (symbol.definition?.some(location => location.uri === uri) ?? false)
+		|| (symbol.declaration?.some(location => location.uri === uri) ?? false)
+}
+
 function getSymbolsForDocument(ctx: LinterContext): CoreSymbol[] {
 	const candidates = ctx.symbols.getSymbolCandidatesAtUri(ctx.doc.uri)
 	if (candidates.length > 0) {
-		return candidates
+		// The reverse URI cache returns a stale superset (entries are never
+		// removed with their locations, see `getSymbolCandidatesAtUri`), so
+		// re-verify that each candidate still has a location in this document.
+		// Otherwise documents with removed declarations keep queueing unrelated
+		// conflict owners for implicit lint passes.
+		return candidates.filter(symbol => hasLocationAtUri(symbol, ctx.doc.uri))
 	}
 
 	// Direct/unit contexts do not always call SymbolUtil.buildCache(). Keep the
 	// same result shape by falling back to a complete location scan in that case.
 	const symbols: CoreSymbol[] = []
 	SymbolUtil.forEachSymbol(ctx.symbols.global, (symbol) => {
-		if (
-			symbol.definition?.some(location => location.uri === ctx.doc.uri)
-			|| symbol.declaration?.some(location => location.uri === ctx.doc.uri)
-		) {
+		if (hasLocationAtUri(symbol, ctx.doc.uri)) {
 			symbols.push(symbol)
 		}
 	})
