@@ -2,7 +2,12 @@ import * as core from '@spyglassmc/core'
 import { formatContractHoverDescription } from '../hover/contract.js'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
 import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { fallbackVisibility, parseVisibility, stampVisibility } from '../util/withinPattern.js'
+import {
+	fallbackVisibility,
+	parseVisibility,
+	stampVisibility,
+	trackHeaderVisibility,
+} from '../util/withinPattern.js'
 import { bindContract, getCurrentFunctionSymbol } from './contract.js'
 
 /**
@@ -38,6 +43,10 @@ export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
 				node.contract,
 				ImpDocNodeUtil.getDescription(node),
 			)
+			// Record the stamping document so the URI clear hook can purge the
+			// header metadata (visibility / contract / desc) when this document
+			// is deleted or rebound.
+			trackHeaderVisibility(ctx.symbols, symbol, ctx.doc.uri)
 		}
 	}
 

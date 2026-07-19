@@ -370,15 +370,18 @@ describe('IMP-Doc private visibility runtime', () => {
 			.symbol
 		assert.ok(storageSymbol)
 		const data = getImpDocSymbolData(storageSymbol.data)
-		// _index.d の declaration doc は @public、 storage 側の visibility も public。
-		assert.deepEqual(data?.visibility, { type: 'public' })
-		assert.equal(data?.declaration?.owner, 'owner:_index.d')
-		assert.equal(data?.declaration?.uri, RuntimeFiles.index)
+		// _index.d の declaration doc は @public。 v3 union parity で visibility は
+		// declaration entry 側に載り、 definition-side (`data.visibility`) は空。
+		assert.equal(data?.visibility, undefined)
+		assert.equal(data?.declarations?.length, 1)
+		assert.deepEqual(data?.declarations?.[0]?.visibility, { type: 'public' })
+		assert.equal(data?.declarations?.[0]?.owner, 'owner:_index.d')
+		assert.equal(data?.declarations?.[0]?.uri, RuntimeFiles.index)
 		// SymbolVisibility.Public = 2 (const enum、 数値照合)。
 		assert.equal(storageSymbol.visibility, 2)
 	})
 
-	it('re-stamps a canonical declaration edited in the same URI', async () => {
+	it('re-stamps a declaration visibility edited in the same URI', async () => {
 		assert.ok(project)
 		const original = getState(states, 'index').content
 		const restricted = original.replace('# @public', '# @private')
@@ -389,8 +392,10 @@ describe('IMP-Doc private visibility runtime', () => {
 			.lookup('storage', ['owner:runtime'])
 			.symbol
 		assert.ok(storageSymbol)
+		let data = getImpDocSymbolData(storageSymbol.data)
+		assert.equal(data?.declarations?.length, 1)
 		assert.deepEqual(
-			getImpDocSymbolData(storageSymbol.data)?.visibility,
+			data?.declarations?.[0]?.visibility,
 			{ type: 'private', owner: FunctionIds.index },
 		)
 		assert.equal(storageSymbol.visibility, 3)
@@ -400,8 +405,10 @@ describe('IMP-Doc private visibility runtime', () => {
 			.lookup('storage', ['owner:runtime'])
 			.symbol
 		assert.ok(storageSymbol)
+		data = getImpDocSymbolData(storageSymbol.data)
+		assert.equal(data?.declarations?.length, 1)
 		assert.deepEqual(
-			getImpDocSymbolData(storageSymbol.data)?.visibility,
+			data?.declarations?.[0]?.visibility,
 			{ type: 'public' },
 		)
 		assert.equal(storageSymbol.visibility, 2)
@@ -432,7 +439,7 @@ describe('IMP-Doc private visibility runtime', () => {
 		const storageSymbol = project.symbols.lookup('storage', ['cli:data']).symbol
 		assert.ok(storageSymbol)
 		assert.equal(
-			getImpDocSymbolData(storageSymbol.data)?.declaration?.owner,
+			getImpDocSymbolData(storageSymbol.data)?.declarations?.[0]?.owner,
 			owner,
 		)
 		await project.onDidClose(uri)

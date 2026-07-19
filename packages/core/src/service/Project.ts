@@ -202,6 +202,21 @@ export class Project extends EventDispatcher<{
 	readonly #clientManagedUriMap = new TwoWayMap<string, string>()
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
+	readonly #queuedLintUris = new Set<string>()
+	#queuedLintFlushPromise: Promise<void> | undefined
+	/**
+	 * Non-client-managed cache URIs whose published diagnostics include checker
+	 * results (produced by the `onDidClose` restore path). Implicit lint passes
+	 * must re-run the checker for them, or republishing would drop the checker
+	 * errors from the published superset. Persisted diagnostics do not retain
+	 * stage provenance, so warm cache/archive documents are restored here
+	 * conservatively as checker candidates.
+	 */
+	readonly #checkedCacheDocUris = new Set<string>()
+	/** File-deletion events whose core cleanup is run inline by `#ready`. */
+	readonly #inlineFileDeletedUris = new Set<string>()
+	/** File-deletion URIs processed inline by the active `#ready` generation. */
+	#readyFileDeletedUris: Set<string> | undefined
 	readonly #initializers: readonly ProjectInitializer[]
 	#reinitializationPredicates = new Set<ProjectChangePredicate>()
 	#reinitializationGeneration = 0
@@ -387,6 +402,7 @@ export class Project extends EventDispatcher<{
 				if (this.isOnlyWatched(uri)) {
 					await this.ensureBindingStarted(uri)
 				}
+				await this.flushQueuedLints()
 			}
 			if (this.shouldReinitializeFor(uri)) {
 				this.requestReinitialization(uri, process)
@@ -394,13 +410,18 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
-			const process = () => {
-				if (uri.endsWith(Project.RootSuffix)) {
-					this.updateRoots()
+			const readyFileDeletedUris = this.#readyFileDeletedUris
+			const process = () =>
+				readyFileDeletedUris?.has(uri)
+					? undefined
+					: this.processFileDeleted(uri)
+			if (this.#inlineFileDeletedUris.has(uri)) {
+				// `#ready` has already taken responsibility for the cleanup, but a
+				// removed pack/config file must retain its reinitialization trigger.
+				if (this.shouldReinitializeFor(uri)) {
+					this.requestReinitialization(uri, () => {})
 				}
-				this.#symbolUpToDateUris.delete(uri)
-				this.symbols.clear({ uri })
-				this.tryClearingCache(uri)
+				return
 			}
 			if (this.shouldReinitializeFor(uri)) {
 				this.requestReinitialization(uri, process)
@@ -408,6 +429,22 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileDeleted] ${uri}`)
 		})
+	}
+
+	private async processFileDeleted(uri: string, forceDocumentRemoval = false): Promise<void> {
+		if (uri.endsWith(Project.RootSuffix)) {
+			this.updateRoots()
+		}
+		this.#symbolUpToDateUris.delete(uri)
+		this.#checkedCacheDocUris.delete(uri)
+		this.clearUriSymbolLocations(uri)
+		if (forceDocumentRemoval) {
+			this.removeCachedTextDocument(uri)
+			this.emit('documentRemoved', { uri })
+		} else {
+			this.tryClearingCache(uri)
+		}
+		await this.flushQueuedLints()
 	}
 
 	/**
@@ -437,6 +474,15 @@ export class Project extends EventDispatcher<{
 		})
 		this.symbols = new SymbolUtil(symbols)
 		this.symbols.buildCache()
+		// Cache JSON stores the combined diagnostics but not their processing
+		// stage. Only physical cache-root documents and logical archive documents
+		// can have entered the checked onDidClose path, so conservatively re-check
+		// that bounded set if a later implicit lint republishes one of them.
+		for (const uri of Object.keys(this.cacheService.errors)) {
+			if (this.isCacheUri(uri) || uri.startsWith(ArchiveUriSupporter.Protocol)) {
+				this.#checkedCacheDocUris.add(uri)
+			}
+		}
 		__profiler.task('Activate Cache').finalize()
 
 		this.#isInitialized = true
@@ -491,6 +537,7 @@ export class Project extends EventDispatcher<{
 	private beginProjectRebuildTransaction(): ProjectRebuildTransaction {
 		const snapshot = {
 			bindingInProgressUris: new Set(this.#bindingInProgressUris),
+			checkedCacheDocUris: new Set(this.#checkedCacheDocUris),
 			clientManagedDocAndNodes: new Map(this.#clientManagedDocAndNodes),
 			ctx: this.#ctx,
 			dependencyFiles: this.#dependencyFiles,
@@ -521,6 +568,8 @@ export class Project extends EventDispatcher<{
 				cacheTransaction.rollback()
 				this.#bindingInProgressUris.clear()
 				snapshot.bindingInProgressUris.forEach(uri => this.#bindingInProgressUris.add(uri))
+				this.#checkedCacheDocUris.clear()
+				snapshot.checkedCacheDocUris.forEach(uri => this.#checkedCacheDocUris.add(uri))
 				this.#clientManagedDocAndNodes.clear()
 				snapshot.clientManagedDocAndNodes.forEach((value, uri) =>
 					this.#clientManagedDocAndNodes.set(uri, value)
@@ -668,13 +717,35 @@ export class Project extends EventDispatcher<{
 	 * Finish the initial run of parsing, binding, and checking the entire project.
 	 */
 	async ready(options: ProjectReadyOptions = {}): Promise<this> {
-		return (this.#readyPromise ??= this.enqueueLifecycle(() => this.#ready(options)))
+		return (this.#readyPromise ??= this.enqueueLifecycle(() => this.runReady(options)))
+	}
+
+	private async runReady(
+		options: ProjectReadyOptions = {},
+		diagnostics?: ProjectDiagnosticsEvent[],
+		propagateProcessorErrors = false,
+	): Promise<this> {
+		const readyFileDeletedUris = new Set<string>()
+		this.#readyFileDeletedUris = readyFileDeletedUris
+		try {
+			return await this.#ready(
+				options,
+				diagnostics,
+				propagateProcessorErrors,
+				readyFileDeletedUris,
+			)
+		} finally {
+			if (this.#readyFileDeletedUris === readyFileDeletedUris) {
+				this.#readyFileDeletedUris = undefined
+			}
+		}
 	}
 
 	async #ready(
 		{ projectRootsWatcher }: ProjectReadyOptions = {},
 		diagnostics?: ProjectDiagnosticsEvent[],
 		propagateProcessorErrors = false,
+		readyFileDeletedUris = new Set<string>(),
 	): Promise<this> {
 		if (!this.#isInitialized) {
 			throw new Error('Project.ready() must be called after Project.init() resolves')
@@ -803,8 +874,21 @@ export class Project extends EventDispatcher<{
 		this.logger.info(
 			`[Project#ready] Files added/changed/removed: ${addedFiles.length}/${changedFiles.length}/${removedFiles.length}`,
 		)
+		const freshlyPublishedUris = new Set<string>()
 		for (const uri of removedFiles) {
-			this.emit('fileDeleted', { uri })
+			// A queued fileDeleted lifecycle task would run only after the current
+			// ready operation. Perform the same cleanup now so READY cannot expose
+			// deleted symbols or cached diagnostics; still dispatch the public event
+			// for cache/config listeners while suppressing only our queued duplicate.
+			this.#inlineFileDeletedUris.add(uri)
+			try {
+				this.emit('fileDeleted', { uri })
+			} finally {
+				this.#inlineFileDeletedUris.delete(uri)
+			}
+			await this.processFileDeleted(uri, true)
+			readyFileDeletedUris.add(uri)
+			freshlyPublishedUris.add(uri)
 		}
 		__profiler.task('Validate Cache')
 
@@ -837,6 +921,7 @@ export class Project extends EventDispatcher<{
 				__bindProfiler,
 				shouldPublishEvents ? undefined : stagedDiagnostics,
 				propagateProcessorErrors,
+				freshlyPublishedUris,
 			)
 		}
 		__parseProfiler.finalize()
@@ -846,8 +931,15 @@ export class Project extends EventDispatcher<{
 		await this.rebindAndCheckClientManaged(propagateProcessorErrors)
 		this.#isReady = true
 		__profiler.finalize()
+		// `publishRebuildEvents` publishes the staged (possibly stale) cache
+		// diagnostics, drains the queued lints on top of them, and only then
+		// emits READY. On the staged path the caller runs it after this method
+		// settles. Re-scanned files already published fresh diagnostics during
+		// the scan above, so their pre-scan staged entries are dropped here:
+		// republishing them would roll the fresh results back to stale ones.
 		if (shouldPublishEvents) {
-			await this.publishRebuildEvents(stagedDiagnostics)
+			const staged = stagedDiagnostics.filter(event => !freshlyPublishedUris.has(event.data.uri))
+			await this.publishRebuildEvents(staged)
 		}
 
 		return this
@@ -876,7 +968,7 @@ export class Project extends EventDispatcher<{
 	async restart(): Promise<void> {
 		this.#bindingInProgressUris.clear()
 		this.#symbolUpToDateUris.clear()
-		const readyPromise = this.#ready({ projectRootsWatcher: this.#watcher })
+		const readyPromise = this.runReady({ projectRootsWatcher: this.#watcher })
 		this.#readyPromise = readyPromise
 		await readyPromise
 	}
@@ -884,7 +976,7 @@ export class Project extends EventDispatcher<{
 	private async restartForRebuild(diagnostics: ProjectDiagnosticsEvent[]): Promise<void> {
 		this.#bindingInProgressUris.clear()
 		this.#symbolUpToDateUris.clear()
-		const readyPromise = this.#ready(
+		const readyPromise = this.runReady(
 			{ projectRootsWatcher: this.#watcher },
 			diagnostics,
 			true,
@@ -964,6 +1056,9 @@ export class Project extends EventDispatcher<{
 		this.logger.info('[Project#resetCache] Initiated...')
 		this.#isReady = false
 		this.reparseClientManaged()
+		// The rebuild republishes every non-client-managed document from a fresh
+		// bind-only scan, so no closed document keeps checker diagnostics.
+		this.#checkedCacheDocUris.clear()
 		const diagnostics: ProjectDiagnosticsEvent[] = []
 
 		// Clear existing errors.
@@ -1033,6 +1128,11 @@ export class Project extends EventDispatcher<{
 		for (const value of this.#clientManagedDocAndNodes.values()) {
 			await this.emitAsync('documentUpdated', value)
 		}
+		// Queued lints republish per-URI diagnostics, so they must drain after the
+		// staged (possibly stale) diagnostics above — flushing first would let the
+		// old staged entries roll the fresh results back — and before READY is
+		// emitted, so `ready` listeners never observe stale staged diagnostics.
+		await this.flushQueuedLints()
 		await this.emitAsync('ready', {})
 	}
 
@@ -1171,7 +1271,7 @@ export class Project extends EventDispatcher<{
 		try {
 			const binder = this.meta.getBinder(node.type)
 			const ctx = BinderContext.create(this, { doc })
-			ctx.symbols.clear({ contributor: 'binder', uri: doc.uri })
+			this.clearUriSymbolLocations(doc.uri, 'binder')
 			await ctx.symbols.contributeAsAsync('binder', async () => {
 				const proxy = StateProxy.create(node)
 				await binder(proxy, ctx)
@@ -1191,6 +1291,27 @@ export class Project extends EventDispatcher<{
 
 	@SingletonPromise()
 	private async check(
+		doc: TextDocument,
+		node: FileNode<AstNode>,
+		propagateErrors = false,
+	): Promise<void> {
+		await this.checkWithoutLintFlush(doc, node, propagateErrors)
+		try {
+			await this.flushQueuedLints()
+		} catch (e) {
+			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
+			if (propagateErrors) {
+				throw e
+			}
+		}
+	}
+
+	/**
+	 * Checker + linter stages without the trailing queued-lint flush. The
+	 * implicit lint drain calls this directly: flushing there would await the
+	 * drain's own promise and deadlock. {@link check} wraps this and flushes.
+	 */
+	private async checkWithoutLintFlush(
 		doc: TextDocument,
 		node: FileNode<AstNode>,
 		propagateErrors = false,
@@ -1248,6 +1369,7 @@ export class Project extends EventDispatcher<{
 				const ctx = LinterContext.create(this, {
 					doc,
 					err: new LinterErrorReporter(ruleName, ruleSeverity, this.ctx['errorSource']),
+					queueLint: uri => this.queueLint(uri),
 					ruleName,
 					ruleValue,
 				})
@@ -1262,6 +1384,80 @@ export class Project extends EventDispatcher<{
 			}
 		} catch (e) {
 			this.logger.error(`[Project] [lint] Failed for ${doc.uri} # ${doc.version}`, e)
+		}
+	}
+
+	/** Queue a non-client-managed document for a post-processing lint pass. */
+	private queueLint(uri: string): void {
+		this.#queuedLintUris.add(this.normalizeUri(uri))
+	}
+
+	/**
+	 * Lint documents requested by processors without retaining them as
+	 * client-managed editor documents. A single drain deduplicates cycles among
+	 * cross-document lint rules and republishes the target's diagnostics.
+	 */
+	private async flushQueuedLints(): Promise<void> {
+		if (!this.#isReady || this.#queuedLintUris.size === 0) {
+			return
+		}
+		if (this.#queuedLintFlushPromise) {
+			await this.#queuedLintFlushPromise
+			return
+		}
+
+		const drain = async () => {
+			const processed = new Set<string>()
+			while (this.#queuedLintUris.size > 0) {
+				const uris = [...this.#queuedLintUris]
+				this.#queuedLintUris.clear()
+				for (const uri of uris) {
+					if (processed.has(uri)) {
+						continue
+					}
+					processed.add(uri)
+
+					const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+					if (clientManaged) {
+						delete clientManaged.node.linterErrors
+						this.lint(clientManaged.doc, clientManaged.node)
+						await this.emitAsync('documentUpdated', clientManaged)
+						continue
+					}
+
+					const doc = await this.read(uri)
+					if (!doc) {
+						this.#checkedCacheDocUris.delete(uri)
+						await this.emitAsync('documentErrored', { errors: [], uri })
+						continue
+					}
+					const node = this.parse(doc)
+					// Republishing replaces this URI's diagnostics wholesale, so bind
+					// before linting: a lint-only pass on a fresh AST would drop the
+					// binder diagnostics published for this document earlier. Checkers
+					// normally run only for client-managed documents, but a cache URI
+					// document closed in the editor keeps its checker diagnostics
+					// published (see `onDidCloseOnce`), so reproduce that superset
+					// with the flush-free check path (flushing here would await this
+					// drain from inside itself).
+					await this.bind(doc, node)
+					if (this.#checkedCacheDocUris.has(uri)) {
+						await this.checkWithoutLintFlush(doc, node)
+					} else {
+						this.lint(doc, node)
+					}
+					await this.emitAsync('documentUpdated', { doc, node })
+				}
+			}
+		}
+		const promise = drain()
+		this.#queuedLintFlushPromise = promise
+		try {
+			await promise
+		} finally {
+			if (this.#queuedLintFlushPromise === promise) {
+				this.#queuedLintFlushPromise = undefined
+			}
 		}
 	}
 
@@ -1293,6 +1489,7 @@ export class Project extends EventDispatcher<{
 		bindProfiler: Profiler,
 		diagnostics: ProjectDiagnosticsEvent[] | undefined,
 		propagateProcessorErrors: boolean,
+		publishedUris: Set<string>,
 	): Promise<void> {
 		uri = this.normalizeUri(uri)
 		if (this.#symbolUpToDateUris.has(uri) || this.#bindingInProgressUris.has(uri)) {
@@ -1320,6 +1517,7 @@ export class Project extends EventDispatcher<{
 				// Initial scans have no rollback boundary, so preserve per-file streaming and let the
 				// document/AST become collectible before processing the next file.
 				await this.emitAsync('documentUpdated', { doc, node })
+				publishedUris.add(uri)
 			}
 		} finally {
 			this.#bindingInProgressUris.delete(uri)
@@ -1342,6 +1540,25 @@ export class Project extends EventDispatcher<{
 		} finally {
 			endCacheMutation()
 		}
+	}
+
+	/**
+	 * Clear core locations for one URI and first give plugins a chance to remove
+	 * metadata that is keyed by that URI rather than represented as a location.
+	 * Checker contributions are intentionally excluded: they are cleared after
+	 * every check and must not invalidate binder-owned metadata.
+	 */
+	private clearUriSymbolLocations(
+		uri: string,
+		contributor: 'binder' | undefined = undefined,
+	): void {
+		const ctx = UriBinderContext.create(this, {
+			queueLint: target => this.queueLint(target),
+		})
+		for (const clearer of this.meta.uriSymbolClearers) {
+			clearer(uri, ctx)
+		}
+		this.symbols.clear({ contributor, uri })
 	}
 
 	/**
@@ -1374,6 +1591,10 @@ export class Project extends EventDispatcher<{
 		const doc = TextDocument.create(uri, languageID, version, content)
 		const node = this.parse(doc)
 		this.#clientManagedUris.add(uri)
+		// While the document is client-managed its diagnostics are maintained
+		// through the client path; the closed-document marker is re-added by
+		// `onDidCloseOnce` when applicable.
+		this.#checkedCacheDocUris.delete(uri)
 		this.#clientManagedDocAndNodes.set(uri, { doc, node })
 		this.#clientManagedUriMap.delete(uri)
 		this.#clientManagedUriMap.set(uri, clientUri)
@@ -1453,10 +1674,13 @@ export class Project extends EventDispatcher<{
 				const node = this.parse(doc)
 				await this.bind(doc, node)
 				await this.check(doc, node)
+				// The published diagnostics for this closed document now include
+				// checker results; implicit lint passes must keep that superset.
+				this.#checkedCacheDocUris.add(uri)
 				restored = { doc, node }
 			} else {
 				// Reading the archive source failed; stale client contributions must not survive.
-				this.symbols.clear({ uri })
+				this.clearUriSymbolLocations(uri)
 			}
 		}
 
@@ -1465,6 +1689,7 @@ export class Project extends EventDispatcher<{
 			this.emit('documentUpdated', restored)
 		}
 		this.tryClearingCache(uri)
+		await this.flushQueuedLints()
 	}
 
 	@SingletonPromise()

@@ -5,7 +5,12 @@ import type {
 	ImpDocNode,
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { fallbackVisibility, parseVisibility, stampVisibility } from '../util/withinPattern.js'
+import {
+	fallbackVisibility,
+	parseVisibility,
+	stampVisibility,
+	trackDeclarationVisibility,
+} from '../util/withinPattern.js'
 
 function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
 	let parent = node.parent
@@ -48,33 +53,6 @@ function ownerForDocument(
 	return declaredOwner
 }
 
-function compareSource(
-	a: ImpDocDeclarationSource,
-	b: ImpDocDeclarationSource,
-): number {
-	if (a.uri !== b.uri) {
-		return a.uri < b.uri ? -1 : 1
-	}
-	return a.range.start - b.range.start || a.range.end - b.range.end
-}
-
-function isFirstReboundDeclaration(
-	symbol: core.Symbol,
-	candidate: ImpDocDeclarationSource,
-): boolean {
-	return !symbol.declaration?.some(location =>
-		location.uri === candidate.uri
-		&& location.range !== undefined
-		&& (
-			location.range.start < candidate.range.start
-			|| (
-				location.range.start === candidate.range.start
-				&& location.range.end < candidate.range.end
-			)
-		)
-	)
-}
-
 export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 	(node, ctx) => {
 		const doc = enclosingImpDoc(node)
@@ -104,14 +82,8 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			uri: ctx.doc.uri,
 			range: node.name.range,
 			owner,
+			description: ImpDocNodeUtil.getDescription(doc),
 		}
-
-		const before = ctx.symbols.lookup(
-			node.category,
-			[node.name.raw],
-			node,
-		).symbol
-		const previous = getImpDocSymbolData(before?.data)?.declaration
 
 		ctx.symbols.query(
 			ctx.doc,
@@ -136,20 +108,26 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 
 		node.symbol = symbol
 
-		// URI/range の辞書順で canonical metadata を決定 (= 重複宣言時の
-		// 先頭を canonical とし、 再解析で metadata が非決定的に変わることを防ぐ)。
+		// URI 単位の stale purge は Project の binder/release lifecycle hook が
+		// declaration binder より先に済ませる。ここでは今回 bind した位置を
+		// v3 union entry として記録するだけにする。
+		stampVisibility(symbol, visibility, candidate)
+		trackDeclarationVisibility(ctx.symbols, symbol, candidate.uri)
+
+		// desc は (uri, range) 辞書順先頭の declaration entry が担う (= 再解析で
+		// 非決定的に変わることを防ぐ、 canonical 1 本時代からの determinism 維持)。
+		// ただし function header が生きている間 (`headerUri` あり) は header 側
+		// desc が優先。 bind 順序依存の last-bind-wins を避ける。
+		const data = getImpDocSymbolData(symbol.data)
+		const first = data?.declarations?.[0]
 		if (
-			!previous
-			|| (
-				previous.uri === candidate.uri
-				&& isFirstReboundDeclaration(symbol, candidate)
-			)
-			|| compareSource(candidate, previous) < 0
+			data?.headerUri === undefined
+			&& first
+			&& first.uri === candidate.uri
+			&& first.range.start === candidate.range.start
+			&& first.range.end === candidate.range.end
 		) {
-			stampVisibility(symbol, visibility, candidate)
-			if (core.Range.containsRange(doc.range, node.range)) {
-				symbol.desc = ImpDocNodeUtil.getDescription(doc)
-			}
+			symbol.desc = candidate.description
 		}
 
 		// core の getDeclaredLocation() が同じ canonical を返すよう整列。

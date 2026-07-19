@@ -1,11 +1,12 @@
 // core の Symbol 型は global Symbol constructor (unique symbol 宣言で使用) と
 // 衝突するため alias で import する。
-import { StateProxy } from '@spyglassmc/core'
+import { StateProxy, SymbolUtil } from '@spyglassmc/core'
 import type { ErrorReporter, Symbol as CoreSymbol } from '@spyglassmc/core'
 import { isLegacyWithinTarget } from '../legacy/categories.js'
 import type {
 	ImpDocAnnotation,
 	ImpDocDeclarationSource,
+	ImpDocDeclarationVisibility,
 	ImpDocSymbolData,
 	ImpDocValue,
 	ImpDocVisibility,
@@ -18,6 +19,48 @@ function asRecord(value: unknown): Record<string, unknown> {
 	return value && typeof value === 'object' && !Array.isArray(value)
 		? value as Record<string, unknown>
 		: {}
+}
+
+/**
+ * `symbol.data` is outside core's SymbolLocation lifecycle, so retain a
+ * per-SymbolUtil reverse index for declaration visibility entries and
+ * header-stamping documents. The first access reconstructs it from a loaded
+ * symbol cache; later declaration / header binds update it incrementally.
+ */
+type DeclarationVisibilityIndex = Map<string, Set<CoreSymbol>>
+const declarationVisibilityIndexes = new WeakMap<SymbolUtil, DeclarationVisibilityIndex>()
+
+function addToDeclarationVisibilityIndex(
+	index: DeclarationVisibilityIndex,
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	let symbols = index.get(uri)
+	if (!symbols) {
+		symbols = new Set()
+		index.set(uri, symbols)
+	}
+	symbols.add(symbol)
+}
+
+function getDeclarationVisibilityIndex(symbols: SymbolUtil): DeclarationVisibilityIndex {
+	let index = declarationVisibilityIndexes.get(symbols)
+	if (index) {
+		return index
+	}
+
+	index = new Map()
+	SymbolUtil.forEachSymbol(symbols.global, (symbol) => {
+		const data = getImpDocSymbolData(symbol.data)
+		for (const entry of data?.declarations ?? []) {
+			addToDeclarationVisibilityIndex(index!, symbol, entry.uri)
+		}
+		if (data?.headerUri !== undefined) {
+			addToDeclarationVisibilityIndex(index!, symbol, data.headerUri)
+		}
+	})
+	declarationVisibilityIndexes.set(symbols, index)
+	return index
 }
 
 const RegexSpecials = new Set([
@@ -444,10 +487,107 @@ export function visibilityRestrictions(
 	}
 }
 
+export function compareDeclarationSource(
+	a: ImpDocDeclarationSource,
+	b: ImpDocDeclarationSource,
+): number {
+	if (a.uri !== b.uri) {
+		return a.uri < b.uri ? -1 : 1
+	}
+	return a.range.start - b.range.start || a.range.end - b.range.end
+}
+
 /**
- * symbol.data.impDoc に visibility metadata を stamp する。 public は
- * `privateOwner` を削除、 restricted は owner を反映 (`denied` は private 相当)。
- * declaration source を渡された場合 canonical location として保存。
+ * The canonical document for metadata that belongs to one declaration union.
+ * Functions prefer their defining document; declaration-only symbols use the
+ * first declaration source in the already-sorted union. `excludeUri` computes
+ * the owner as if that document were already gone: the URI clear hook runs
+ * before core removes the document's SymbolLocations, so without the
+ * exclusion a deleted definition URI would still look like the owner.
+ */
+export function getCanonicalDeclarationOwnerUri(
+	symbol: CoreSymbol,
+	declarations: readonly ImpDocDeclarationVisibility[],
+	excludeUri?: string,
+): string | undefined {
+	if (symbol.category === 'function') {
+		const definitionUri = [
+			...new Set(
+				symbol.definition
+					?.map(location => location.uri)
+					.filter(definition => definition !== excludeUri)
+					?? [],
+			),
+		].sort()[0]
+		if (definitionUri) {
+			return definitionUri
+		}
+	}
+	return declarations[0]?.uri
+}
+
+/**
+ * v3 union parity: 同一 symbol の visibility は「definition (= function header)
+ * 1 本 + declaration (= #declare) 位置ごとの list」 を全て列挙する。 参照可否は
+ * この entry 群の OR で判定する (legacy-v3 `ClientCache.getCacheForID` の
+ * any-position 残存と同挙動)。
+ */
+export function getVisibilityEntries(
+	data: ImpDocSymbolData | undefined,
+): ImpDocVisibility[] {
+	return [
+		...(data?.visibility ? [data.visibility] : []),
+		...(data?.declarations ?? []).map(entry => entry.visibility),
+	]
+}
+
+/** caller が definition / declaration いずれかの visibility を満たすか (any-match)。 */
+export function matchesAnyVisibility(
+	data: ImpDocSymbolData | undefined,
+	caller: string,
+	callerType: WithinTargetType = 'function',
+): boolean {
+	const entries = getVisibilityEntries(data)
+	return entries.length === 0
+		|| entries.some(entry => matchesVisibility(entry, caller, callerType))
+}
+
+/**
+ * definition + declaration 全 entry から core 側 aggregate (`symbol.visibility` /
+ * `visibilityRestriction` / `privateOwner` 互換 field) を再計算する。 1 entry でも
+ * public なら OR 意味論で全体 public、 全 entry restricted なら restriction を
+ * 連結する (= core 側 Restricted 評価も正規表現列の OR)。
+ */
+function refreshAggregateVisibility(
+	symbol: CoreSymbol,
+	impDoc: ImpDocSymbolData,
+): void {
+	const entries = getVisibilityEntries(impDoc)
+	const restricted = entries.filter(
+		(entry): entry is Exclude<ImpDocVisibility, { type: 'public' }> => entry.type !== 'public',
+	)
+	// SymbolVisibility.Public = 2、 Restricted = 3 (const enum、 strip-types loader
+	// では inline されないため数値を直接使用)。
+	if (entries.length === 0 || restricted.length < entries.length) {
+		delete impDoc.privateOwner
+		symbol.visibility = 2
+		symbol.visibilityRestriction = undefined
+		return
+	}
+	// entries 順 (= definition 優先、 次いで (uri, range) 昇順) の先頭 owner を
+	// 互換 shortcut に反映する。
+	impDoc.privateOwner = restricted[0]!.owner
+	symbol.visibility = 3
+	symbol.visibilityRestriction = [
+		...new Set(restricted.flatMap(entry => visibilityRestrictions(entry) ?? [])),
+	]
+}
+
+/**
+ * symbol.data.impDoc に visibility metadata を stamp する。 declaration source を
+ * 渡された場合は declaration entry list へ upsert (同一 uri/range を置換) し、
+ * source 無し (= function header) は definition-side visibility を上書きする。
+ * aggregate (`symbol.visibility` 等) は全 entry の union から再計算する。
  */
 export function stampVisibility(
 	symbol: CoreSymbol,
@@ -456,28 +596,214 @@ export function stampVisibility(
 ): void {
 	const root = asRecord(symbol.data)
 	const previous = getImpDocSymbolData(symbol.data)
-	const impDoc: ImpDocSymbolData = {
-		...previous,
-		visibility,
-		...(declaration ? { declaration } : {}),
-	}
+	const impDoc: ImpDocSymbolData = { ...previous }
 
-	if (visibility.type === 'public') {
-		delete impDoc.privateOwner
+	if (declaration) {
+		const entry: ImpDocDeclarationVisibility = { ...declaration, visibility }
+		impDoc.declarations = [
+			...(previous?.declarations ?? []).filter(existing =>
+				existing.uri !== declaration.uri
+				|| existing.range.start !== declaration.range.start
+				|| existing.range.end !== declaration.range.end
+			),
+			entry,
+		].sort(compareDeclarationSource)
 	} else {
-		impDoc.privateOwner = visibility.owner
+		impDoc.visibility = visibility
 	}
 
+	refreshAggregateVisibility(symbol, impDoc)
 	symbol.data = { ...root, impDoc }
-	// SymbolVisibility.Public = 2、 Restricted = 3 (const enum、 strip-types loader
-	// では inline されないため数値を直接使用)。
-	symbol.visibility = visibility.type === 'public' ? 2 : 3
-	symbol.visibilityRestriction = visibilityRestrictions(visibility)
+}
+
+/**
+ * Restore `Symbol.desc` from the canonical (= (uri, range) 昇順先頭) remaining
+ * declaration entry, or drop it when no declaration description is left. Called
+ * whenever header-side metadata or the canonical declaration entry is removed,
+ * so a headerless target keeps its cross-document `#declare` hover regardless
+ * of bind order (Terra r3 WANT-1).
+ *
+ * Desc priority is bind-order independent: while a function header is alive
+ * (`headerUri` present) its formatted desc owns `Symbol.desc`, and the
+ * canonical declaration desc only takes over once the header is gone. Callers
+ * that purge the header delete `headerUri` before calling this.
+ */
+function restoreCanonicalDeclarationDesc(
+	symbol: CoreSymbol,
+	impDoc: ImpDocSymbolData,
+): void {
+	if (impDoc.headerUri !== undefined) {
+		return
+	}
+	const description = [...impDoc.declarations ?? []]
+		.sort(compareDeclarationSource)[0]?.description
+	if (description === undefined) {
+		delete symbol.desc
+	} else {
+		symbol.desc = description
+	}
+}
+
+/**
+ * 指定 URI が contribute した declaration visibility entry を全て除去する。
+ * 再 bind 時、 その URI の最初の declaration が stamp される前に呼び、 編集で
+ * 範囲が変わった / 消えた stale entry を掃除する (core の `clear()` が消すのは
+ * symbol location のみで `symbol.data` は残るため)。
+ */
+export function clearDeclarationVisibilities(
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	const root = asRecord(symbol.data)
+	const previous = getImpDocSymbolData(symbol.data)
+	if (!previous?.declarations?.some(entry => entry.uri === uri)) {
+		return
+	}
+
+	const impDoc: ImpDocSymbolData = { ...previous }
+	const declarations = [...previous.declarations].sort(compareDeclarationSource)
+	const removedCanonical = declarations[0]?.uri === uri
+	const remaining = declarations.filter(entry => entry.uri !== uri)
+	if (remaining.length) {
+		impDoc.declarations = remaining
+	} else {
+		delete impDoc.declarations
+	}
+	if (removedCanonical) {
+		restoreCanonicalDeclarationDesc(symbol, impDoc)
+	}
+	// derived shortcut は一旦落とす (restricted entry が残れば refresh が再設定)。
+	delete impDoc.privateOwner
+
+	if (Object.keys(impDoc).length === 0) {
+		delete root['impDoc']
+		symbol.data = root
+		// SymbolVisibility.Public = 2 (const enum; use the runtime numeric value).
+		symbol.visibility = 2
+		delete symbol.visibilityRestriction
+		return
+	}
+
+	refreshAggregateVisibility(symbol, impDoc)
+	symbol.data = { ...root, impDoc }
+}
+
+/**
+ * Remove header-side metadata (`visibility` / `contract` / `Symbol.desc`) when
+ * the document that stamped it is cleared. Declaration entries contributed by
+ * other documents survive and the canonical `#declare` description is restored,
+ * so deleting an `@public` header no longer outlives a restricted `#declare`
+ * union elsewhere (Terra r3 MUST-1).
+ */
+function clearHeaderMetadataForUri(symbol: CoreSymbol, uri: string): void {
+	const root = asRecord(symbol.data)
+	const previous = getImpDocSymbolData(symbol.data)
+	if (previous?.headerUri !== uri) {
+		return
+	}
+
+	const impDoc: ImpDocSymbolData = { ...previous }
+	delete impDoc.visibility
+	delete impDoc.contract
+	delete impDoc.privateOwner
+	delete impDoc.headerUri
+	restoreCanonicalDeclarationDesc(symbol, impDoc)
+
+	if (Object.keys(impDoc).length === 0) {
+		delete root['impDoc']
+		symbol.data = root
+		// SymbolVisibility.Public = 2 (const enum; use the runtime numeric value).
+		symbol.visibility = 2
+		delete symbol.visibilityRestriction
+		return
+	}
+
+	refreshAggregateVisibility(symbol, impDoc)
+	symbol.data = { ...root, impDoc }
+}
+
+/**
+ * Clear all IMP-Doc metadata contributed by one document: declaration
+ * visibility entries and, when this document stamped them, the header-side
+ * visibility / contract / desc. Core clears SymbolLocations before a rebind or
+ * a file removal, but the IMP-Doc payload is stored in `symbol.data` and
+ * therefore needs this matching URI lifecycle step. The index is rebuilt from
+ * warm-cache data on first use.
+ */
+export function clearImpDocMetadataForUri(
+	symbols: SymbolUtil,
+	uri: string,
+	queueLint?: (this: void, uri: string) => void,
+): void {
+	const index = getDeclarationVisibilityIndex(symbols)
+	const affected = index.get(uri)
+	if (!affected) {
+		return
+	}
+
+	// Drop the URI first: current bind will repopulate it through
+	// `trackDeclarationVisibility` / `trackHeaderVisibility`, while a fully
+	// removed URI stays absent.
+	index.delete(uri)
+	for (const symbol of affected) {
+		const before = getImpDocSymbolData(symbol.data)
+		const beforeDeclarations = [...before?.declarations ?? []]
+			.sort(compareDeclarationSource)
+		const previousOwner = getCanonicalDeclarationOwnerUri(symbol, beforeDeclarations)
+		clearDeclarationVisibilities(symbol, uri)
+		clearHeaderMetadataForUri(symbol, uri)
+		const after = getImpDocSymbolData(symbol.data)
+		const afterDeclarations = [...after?.declarations ?? []]
+			.sort(compareDeclarationSource)
+		// `symbol.definition` still contains the cleared URI at this point (core
+		// clears SymbolLocations only after this hook), so exclude it: otherwise
+		// a deleted function header URI would keep claiming ownership and the
+		// declaration document that becomes the canonical owner after the clear
+		// would never be queued for an implicit lint (Terra r4 MUST-1).
+		const nextOwner = getCanonicalDeclarationOwnerUri(symbol, afterDeclarations, uri)
+		for (const ownerUri of new Set([previousOwner, nextOwner])) {
+			if (ownerUri) {
+				queueLint?.(ownerUri)
+			}
+		}
+	}
+}
+
+/** Record a freshly bound `#declare` entry in the URI purge index. */
+export function trackDeclarationVisibility(
+	symbols: SymbolUtil,
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	addToDeclarationVisibilityIndex(getDeclarationVisibilityIndex(symbols), symbol, uri)
+}
+
+/**
+ * Record which document's IMP-Doc function header stamped the definition-side
+ * metadata. `headerUri` is persisted in `symbol.data` so the URI purge index
+ * can be rebuilt from a warm cache, and the reverse index entry covers the
+ * current session.
+ */
+export function trackHeaderVisibility(
+	symbols: SymbolUtil,
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	const root = asRecord(symbol.data)
+	const impDoc: ImpDocSymbolData = {
+		...getImpDocSymbolData(symbol.data),
+		headerUri: uri,
+	}
+	symbol.data = { ...root, impDoc }
+	addToDeclarationVisibilityIndex(getDeclarationVisibilityIndex(symbols), symbol, uri)
 }
 
 /**
  * Remove visibility metadata previously contributed by an IMP-Doc function
- * header. Other symbol data and canonical declaration metadata are preserved.
+ * header. Declaration-side visibility entries and other symbol data are
+ * preserved, the canonical `#declare` description (if any) replaces the
+ * header-derived desc, and the aggregate is recomputed from the remaining
+ * entries.
  */
 export function clearVisibility(symbol: CoreSymbol): void {
 	const root = asRecord(symbol.data)
@@ -489,16 +815,19 @@ export function clearVisibility(symbol: CoreSymbol): void {
 	const impDoc: ImpDocSymbolData = { ...previous }
 	delete impDoc.visibility
 	delete impDoc.privateOwner
+	delete impDoc.headerUri
+	restoreCanonicalDeclarationDesc(symbol, impDoc)
 
 	if (Object.keys(impDoc).length === 0) {
 		delete root['impDoc']
-	} else {
-		root['impDoc'] = impDoc
+		symbol.data = root
+		// SymbolVisibility.Public = 2 (const enum; use the runtime numeric value).
+		symbol.visibility = 2
+		delete symbol.visibilityRestriction
+		return
 	}
 
+	refreshAggregateVisibility(symbol, impDoc)
+	root['impDoc'] = impDoc
 	symbol.data = root
-	delete symbol.desc
-	// SymbolVisibility.Public = 2 (const enum; use the runtime numeric value).
-	symbol.visibility = 2
-	delete symbol.visibilityRestriction
 }

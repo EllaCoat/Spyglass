@@ -192,6 +192,13 @@ export interface ImpDocDeclarationSource {
 	uri: string
 	range: AstNode['range']
 	owner: string
+	/** Canonical hover text for this declaration source, retained across cache reloads. */
+	description?: string
+}
+
+/** One `#declare` site's visibility record (v3 `dcl` position parity). */
+export interface ImpDocDeclarationVisibility extends ImpDocDeclarationSource {
+	visibility: ImpDocVisibility
 }
 
 export interface ImpDocNode extends AstNode {
@@ -235,8 +242,26 @@ export namespace ImpDocNode {
 }
 
 export interface ImpDocSymbolData {
+	/**
+	 * Definition-side (function header IMP-Doc) visibility. Declaration-side
+	 * visibility lives in `declarations`; reference checks OR every entry
+	 * together (v3 union parity), see `matchesAnyVisibility()`.
+	 */
 	visibility?: ImpDocVisibility
-	declaration?: ImpDocDeclarationSource
+	/**
+	 * Per-`#declare` visibility entries ordered by (uri, range). v3 kept the
+	 * visibility on each cache position (`dcl`/`def`); a symbol stays
+	 * resolvable for a caller when any entry admits it (OR semantics,
+	 * legacy-v3 `ClientCache.getCacheForID`).
+	 */
+	declarations?: ImpDocDeclarationVisibility[]
+	/**
+	 * URI of the document whose IMP-Doc function header stamped the
+	 * definition-side metadata (`visibility` / `contract` / `Symbol.desc`).
+	 * Persisted so the URI clear hook can purge header metadata when that
+	 * document is deleted or rebound, including after a warm cache reload.
+	 */
+	headerUri?: string
 	/** Serializable function contract copied from the bound IMP-Doc header. */
 	contract?: ImpDocContract
 	/** Serializable alias payload retained across symbol-cache reloads. */

@@ -10,7 +10,12 @@ import type {
 	ImpDocNode,
 	ImpDocValue,
 } from '../lib/index.js'
-import { getImpDocSymbolData, impDoc, LEGACY_DECLARABLE_TYPES } from '../lib/index.js'
+import {
+	getImpDocSymbolData,
+	impDoc,
+	LEGACY_DECLARABLE_TYPES,
+	matchesAnyVisibility,
+} from '../lib/index.js'
 
 const Owner = 'owner:_index.d'
 const Uri = 'file:///data/owner/functions/_index.d.mcfunction'
@@ -24,6 +29,11 @@ const EmptyContract: ImpDocContract = {
 
 function value(raw: string): ImpDocValue {
 	return { raw, range: { start: 0, end: raw.length } }
+}
+
+/** Declaration path stores visibility per entry; read the (sorted) first one. */
+function declaredVisibility(symbol: core.Symbol) {
+	return getImpDocSymbolData(symbol.data)?.declarations?.[0]?.visibility
 }
 
 function annotation(...tokens: string[]): ImpDocAnnotation {
@@ -167,7 +177,7 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 			] as const
 		) {
 			const { err, node, symbol } = bindStorage(tokens)
-			assert.equal(getImpDocSymbolData(symbol.data)?.visibility?.type, expectedType, label)
+			assert.equal(declaredVisibility(symbol)?.type, expectedType, label)
 			assert.equal(node.symbol, symbol, label)
 			assert.deepEqual(err.errors, [], label)
 		}
@@ -266,7 +276,7 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 
 		const denied = bindStorage(['@within', 'unknown_type', 'owner:**']).symbol
 		assert.equal(denied.visibility, 3)
-		assert.deepEqual(getImpDocSymbolData(denied.data)?.visibility, {
+		assert.deepEqual(declaredVisibility(denied), {
 			type: 'denied',
 			owner: Owner,
 		})
@@ -279,14 +289,87 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 			['@private'],
 			{ functionID: 'foo', registerOwner: false },
 		)
-		assert.deepEqual(getImpDocSymbolData(symbol.data)?.visibility, {
+		assert.deepEqual(declaredVisibility(symbol), {
 			type: 'private',
 			owner: 'minecraft:foo',
 		})
 		assert.equal(
-			getImpDocSymbolData(symbol.data)?.declaration?.owner,
+			getImpDocSymbolData(symbol.data)?.declarations?.[0]?.owner,
 			'minecraft:foo',
 		)
+		assert.deepEqual(err.errors, [])
+	})
+
+	it('keeps every declaration visibility and matches callers against their union', () => {
+		const uriA = 'file:///data/a/functions/_index.d.mcfunction'
+		const uriB = 'file:///data/b/functions/_index.d.mcfunction'
+		const symbols = new core.SymbolUtil(core.SymbolTable.link({
+			function: {
+				'a:_index.d': { definition: [{ uri: uriA }] },
+				'b:_index.d': { definition: [{ uri: uriB }] },
+			},
+		} as core.UnlinkedSymbolTable))
+		symbols.buildCache()
+		const err = new core.ErrorReporter()
+
+		const bindFrom = (uri: string, pattern: string) => {
+			const node: ImpDocDeclarationNode = {
+				type: 'impDoc:declaration',
+				category: 'function',
+				categoryRange: { start: 40, end: 48 },
+				name: { raw: 'shared:target', range: { start: 49, end: 62 } },
+				range: { start: 31, end: 62 },
+			}
+			const doc: ImpDocNode = {
+				type: 'impDoc',
+				annotations: [annotation('@within', 'function', pattern)],
+				children: [node],
+				contract: EmptyContract,
+				declaration: {
+					declarations: [node],
+					aliases: [],
+					lines: [],
+					range: node.range,
+				},
+				plainText: 'Union fixture',
+				range: { start: 0, end: 80 },
+				raw: '',
+			}
+			core.AstNode.setParents(doc)
+			const ctx = {
+				doc: {
+					uri,
+					languageId: 'mcfunction',
+					version: 1,
+					lineCount: 1,
+					getText: () => '',
+					offsetAt: (position: { character: number }) => position.character,
+					positionAt: (offset: number) => ({ line: 0, character: offset }),
+				},
+				err,
+				symbols,
+			} as unknown as core.BinderContext
+			symbols.contributeAs('binder', () => bindDeclaration(node, ctx))
+		}
+
+		bindFrom(uriA, 'a:**')
+		bindFrom(uriB, 'b:**')
+
+		const symbol = symbols.lookup('function', ['shared:target']).symbol
+		assert.ok(symbol)
+		const data = getImpDocSymbolData(symbol.data)
+		assert.deepEqual(
+			data?.declarations?.map(entry => [entry.uri, entry.owner]),
+			[
+				[uriA, 'a:_index.d'],
+				[uriB, 'b:_index.d'],
+			],
+		)
+		assert.equal(symbol.visibility, 3)
+		assert.deepEqual(symbol.visibilityRestriction, ['^a:.{0,}$', '^b:.{0,}$'])
+		assert.equal(matchesAnyVisibility(data, 'a:caller'), true)
+		assert.equal(matchesAnyVisibility(data, 'b:caller'), true)
+		assert.equal(matchesAnyVisibility(data, 'c:caller'), false)
 		assert.deepEqual(err.errors, [])
 	})
 
@@ -299,7 +382,7 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 			]
 		) {
 			const { err, symbol } = bindStorage(tokens)
-			assert.equal(getImpDocSymbolData(symbol.data)?.visibility?.type, 'denied')
+			assert.equal(declaredVisibility(symbol)?.type, 'denied')
 			assert.ok(err.errors.some(error =>
 				error.message.includes(
 					'IMP-Doc visibility annotation is malformed; falling back to deny state',

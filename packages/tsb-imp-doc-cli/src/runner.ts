@@ -643,13 +643,6 @@ export async function runImpDocLint(
 	const logger = createLogger()
 	const meta = new core.MetaRegistry()
 	const symbols = new core.SymbolUtil(activated?.symbols ?? {})
-	if (activated) {
-		symbols.buildCache()
-		for (const file of affectedFiles) {
-			symbols.clear({ uri: pathToFileURL(file).toString() })
-		}
-		symbols.trim(symbols.global)
-	}
 	const config = createConfig(options.config)
 	const projectData: core.ProjectData = {
 		cacheRoot,
@@ -672,6 +665,23 @@ export async function runImpDocLint(
 		parser: cliMcfunction,
 	})
 	await impDoc.initialize({ ...projectData, reinitializeOnChange: () => {} })
+
+	// Match Project's URI lifecycle when a warm cache reprocesses a file:
+	// plugin-owned metadata must be cleared before core removes its locations.
+	// Initializing IMP-Doc first makes its declaration visibility clearer
+	// available on this standalone CLI path as well.
+	if (activated) {
+		symbols.buildCache()
+		const clearContext = core.UriBinderContext.create(projectData)
+		for (const file of affectedFiles) {
+			const uri = pathToFileURL(file).toString()
+			for (const clearer of meta.uriSymbolClearers) {
+				clearer(uri, clearContext)
+			}
+			symbols.clear({ uri })
+		}
+		symbols.trim(symbols.global)
+	}
 
 	const diagnostics = activated
 		? Object.entries(activated.cache.manifest.files)

@@ -12,6 +12,7 @@ import {
 	type ImpDocVisibility,
 	stampContract,
 	stampVisibility,
+	trackHeaderVisibility,
 } from '../lib/index.js'
 
 const EmptyContract: ImpDocContract = {
@@ -57,6 +58,7 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 			uri: 'file:///fixture/_index.d.mcfunction',
 			range: { start: 10, end: 20 },
 			owner: 'example:owner',
+			description: 'Canonical declaration description',
 		}
 		const showcaseSource = await readFile(
 			new URL('./fixtures/12-contract-showcase.mcfunction', import.meta.url),
@@ -75,6 +77,16 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 				'@e[type=#example:hostile, distance=..16]',
 			),
 			public: stamp({ type: 'public' }, undefined, EmptyContract),
+			header: (() => {
+				const symbol = emptySymbol()
+				stampVisibility(symbol, { type: 'public' })
+				trackHeaderVisibility(
+					new core.SymbolUtil({}),
+					symbol,
+					'file:///fixture/header.mcfunction',
+				)
+				return getImpDocSymbolData(symbol.data)
+			})(),
 			private: stamp(
 				{ type: 'private', owner: 'example:owner' },
 				undefined,
@@ -100,6 +112,16 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 					regex: '^example:allowed/.{0,}$',
 				}],
 			}, declaration),
+			union: (() => {
+				const symbol = emptySymbol()
+				stampVisibility(symbol, { type: 'public' })
+				stampVisibility(
+					symbol,
+					{ type: 'private', owner: 'example:owner' },
+					declaration,
+				)
+				return getImpDocSymbolData(symbol.data)
+			})(),
 			representativeContract: stamp(
 				{ type: 'public' },
 				undefined,

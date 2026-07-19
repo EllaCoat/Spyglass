@@ -1,7 +1,8 @@
 import type { AstNode, Linter, LinterContext, Logger, StateProxy } from '@spyglassmc/core'
 import { ResourceLocationNode } from '@spyglassmc/core'
+import type { ImpDocVisibility } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
-import { matchesVisibility } from '../util/withinPattern.js'
+import { getVisibilityEntries, matchesVisibility } from '../util/withinPattern.js'
 
 export function configValidator(_ruleName: string, value: unknown, logger: Logger): boolean {
 	if (typeof value === 'boolean') {
@@ -93,15 +94,23 @@ export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => 
 			return
 		}
 		const data = getImpDocSymbolData(candidate.symbol?.data)
-		const visibility = data?.visibility
+		const entries = getVisibilityEntries(data)
 
-		// metadata 無し / public は defensive に許可。
-		if (!visibility || matchesVisibility(visibility, caller, 'function')) {
+		// metadata 無しは defensive に許可。 v3 union parity: definition /
+		// declaration のどれか 1 entry でも caller を許可すれば OK (any-match)。
+		if (
+			entries.length === 0
+			|| entries.some(entry => matchesVisibility(entry, caller, 'function'))
+		) {
 			return
 		}
-		// matchesVisibility が public を先に許可済みだが、 TypeScript の
-		// narrowing が効かないため defensive check。
-		if (visibility.type === 'public') {
+		// public entry は any-match で必ず許可済みなので、 ここに残る entry は
+		// 全て restricted。 message には entries 順 (= definition 優先、 次いで
+		// (uri, range) 昇順) の先頭を代表として使う。
+		const visibility = entries.find(
+			(entry): entry is Exclude<ImpDocVisibility, { type: 'public' }> => entry.type !== 'public',
+		)
+		if (!visibility) {
 			return
 		}
 

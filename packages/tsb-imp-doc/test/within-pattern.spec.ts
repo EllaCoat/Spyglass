@@ -1,16 +1,26 @@
 import { ErrorReporter, StateProxy } from '@spyglassmc/core'
+import type { Symbol as CoreSymbol } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import type { ImpDocAnnotation, ImpDocValue } from '../lib/index.js'
+import { getImpDocSymbolData } from '../lib/index.js'
+import type {
+	ImpDocAnnotation,
+	ImpDocDeclarationSource,
+	ImpDocDeclarationVisibility,
+	ImpDocValue,
+} from '../lib/index.js'
 import {
 	LEGACY_FILE_TYPE_IDS,
 	LEGACY_MISC_TYPES,
 	LEGACY_WITHIN_TARGET_IDS,
 } from '../lib/legacy/categories.js'
 import {
+	clearVisibility,
+	getCanonicalDeclarationOwnerUri,
 	legacyGlobToRegex,
 	matchesVisibility,
 	parseVisibility,
+	stampVisibility,
 	toShortestString,
 	visibilityRestrictions,
 } from '../lib/util/withinPattern.js'
@@ -827,6 +837,95 @@ describe('visibilityRestrictions', () => {
 				}],
 			}),
 			['^owner:main$'],
+		)
+	})
+})
+
+describe('clearVisibility', () => {
+	const declaration: ImpDocDeclarationSource = {
+		uri: 'file:///fixture/_index.d.mcfunction',
+		range: { start: 10, end: 20 },
+		owner: 'example:owner',
+		description: 'Canonical declaration description',
+	}
+
+	it('restores the canonical #declare description for a headerless symbol', () => {
+		const symbol = { data: {} } as CoreSymbol
+		stampVisibility(
+			symbol,
+			{ type: 'private', owner: 'example:owner' },
+			declaration,
+		)
+		symbol.desc = 'Stale header-derived description'
+
+		clearVisibility(symbol)
+
+		assert.equal(symbol.desc, 'Canonical declaration description')
+		assert.deepEqual(
+			getImpDocSymbolData(symbol.data)?.declarations?.map(entry => entry.uri),
+			[declaration.uri],
+		)
+	})
+
+	it('replaces a removed header description with the canonical #declare description', () => {
+		const symbol = { data: {} } as CoreSymbol
+		stampVisibility(symbol, { type: 'public' })
+		stampVisibility(
+			symbol,
+			{ type: 'private', owner: 'example:owner' },
+			declaration,
+		)
+		symbol.desc = 'Header description'
+
+		clearVisibility(symbol)
+
+		assert.equal(symbol.desc, 'Canonical declaration description')
+		assert.equal(getImpDocSymbolData(symbol.data)?.visibility, undefined)
+	})
+
+	it('still drops the description when no declaration entry remains', () => {
+		const symbol = { data: {} } as CoreSymbol
+		stampVisibility(symbol, { type: 'public' })
+		symbol.desc = 'Header description'
+
+		clearVisibility(symbol)
+
+		assert.equal(symbol.desc, undefined)
+		assert.equal(getImpDocSymbolData(symbol.data), undefined)
+	})
+})
+
+describe('getCanonicalDeclarationOwnerUri', () => {
+	const definitionUri = 'file:///fixture/data/a/functions/target.mcfunction'
+	const declarationUri = 'file:///fixture/data/b/functions/decl.mcfunction'
+	const declarations: ImpDocDeclarationVisibility[] = [{
+		uri: declarationUri,
+		range: { start: 10, end: 20 },
+		owner: 'b:decl',
+		visibility: { type: 'private', owner: 'b:decl' },
+	}]
+
+	it('prefers the defining document of a function', () => {
+		const symbol = {
+			category: 'function',
+			definition: [{ uri: definitionUri }],
+		} as CoreSymbol
+		assert.equal(
+			getCanonicalDeclarationOwnerUri(symbol, declarations),
+			definitionUri,
+		)
+	})
+
+	it('falls back to the surviving declaration when the definition URI is being cleared', () => {
+		// The URI clear hook computes the post-clear owner before core removes
+		// the SymbolLocations, so the cleared URI must not claim ownership.
+		const symbol = {
+			category: 'function',
+			definition: [{ uri: definitionUri }],
+		} as CoreSymbol
+		assert.equal(
+			getCanonicalDeclarationOwnerUri(symbol, declarations, definitionUri),
+			declarationUri,
 		)
 	})
 })
