@@ -200,6 +200,28 @@ function parseResourceLocation(
 }
 
 /**
+ * Naive single-line scan that reports whether `index` sits inside an unclosed
+ * `'` / `"` quote. Backslash escapes are honoured; any nested structure beyond
+ * that is irrelevant for provenance classification.
+ */
+function isInsideQuote(line: string, index: number): boolean {
+	let quote: string | undefined
+	for (let i = 0; i < index; i++) {
+		const char = line[i]
+		if (quote === undefined) {
+			if (char === '"' || char === "'") {
+				quote = char
+			}
+		} else if (char === '\\') {
+			i++
+		} else if (char === quote) {
+			quote = undefined
+		}
+	}
+	return quote !== undefined
+}
+
+/**
  * Minimal base parser for the CI vertical slice. The IMP-Doc initializer wraps this parser and
  * replaces the emitted legacy comment nodes with its own ImpDocNode implementation.
  */
@@ -214,6 +236,7 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				range: core.Range.create(offset + leadingSpace, offset + line.length),
 			})
 		} else {
+			const isMacroLine = line[leadingSpace] === '$'
 			const dynamicPattern = /\bfunction[\t ]+\$\([^\s)]*\)?/g
 			for (const match of line.matchAll(dynamicPattern)) {
 				ctx.err.report(
@@ -226,11 +249,26 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				/\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
 			for (const match of line.matchAll(referencePattern)) {
 				const raw = match[1]
+				// A `$(` right after the static prefix means the actual target is
+				// completed by a macro substitution at runtime; the prefix alone
+				// would be a spurious reference, so no node is emitted for it.
+				if (line.startsWith('$(', match.index + match[0].length)) {
+					continue
+				}
 				const targetStart = offset + match.index + match[0].lastIndexOf(raw)
-				children.push(parseResourceLocation(
+				const ref = parseResourceLocation(
 					raw,
 					core.Range.create(targetStart, targetStart + raw.length),
-				))
+				)
+				// Macro lines are rewritten by substitution before execution and
+				// quoted payloads (usually SNBT) may never run as commands, so
+				// their references only get best-effort treatment.
+				if (isMacroLine) {
+					impDoc.setRefProvenance(ref, 'macro')
+				} else if (isInsideQuote(line, match.index)) {
+					impDoc.setRefProvenance(ref, 'nbt-string')
+				}
+				children.push(ref)
 			}
 		}
 		offset += line.length

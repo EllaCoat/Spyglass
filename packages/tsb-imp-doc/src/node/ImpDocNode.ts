@@ -280,3 +280,33 @@ export function getImpDocSymbolData(data: unknown): ImpDocSymbolData | undefined
 	const value = (data as { impDoc?: unknown }).impDoc
 	return value && typeof value === 'object' ? value as ImpDocSymbolData : undefined
 }
+
+/**
+ * Origin classification for references that a heuristic scanner extracted from
+ * contexts whose runtime semantics cannot be fully resolved statically:
+ * - `macro`: the whole line is a `$` macro line, so any reference on it may be
+ *   rewritten by macro substitution before execution.
+ * - `nbt-string`: the reference sits inside a quoted string payload (usually
+ *   SNBT), so it may never be executed as a command.
+ * - `dynamic-pattern`: a `function $(...)` call whose target is entirely
+ *   decided at runtime.
+ */
+export type ImpDocRefProvenance = 'macro' | 'nbt-string' | 'dynamic-pattern'
+
+interface ProvenanceTaggedNode extends AstNode {
+	impDocRefProvenance?: ImpDocRefProvenance
+}
+
+/**
+ * Tags a reference node with its best-effort provenance. Tagged references are
+ * skipped by the strict `impDocPrivate` rule and handled by the warning-level
+ * `impDocPrivateBestEffort` rule instead. The tag lives on the AST node only
+ * (never in `symbol.data`), so it does not affect symbol serialization.
+ */
+export function setRefProvenance(node: AstNode, provenance: ImpDocRefProvenance): void {
+	;(node as ProvenanceTaggedNode).impDocRefProvenance = provenance
+}
+
+export function getRefProvenance(node: AstNode): ImpDocRefProvenance | undefined {
+	return (node as ProvenanceTaggedNode).impDocRefProvenance
+}
