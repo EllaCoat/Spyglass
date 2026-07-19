@@ -407,6 +407,60 @@ describe('IMP-Doc parser', () => {
 		)
 	})
 
+	it('leaves an immediate command line outside the function header component', () => {
+		const content = '#> example:runner\nsay hello world\n'
+		const baseParser = (src: Source): AstNode => {
+			const children: AstNode[] = []
+			for (const match of src.string.matchAll(/^[\t ]*#/gm)) {
+				const lineStart = match.index
+				const hashStart = lineStart + match[0].length - 1
+				const lineEnd = src.string.indexOf('\n', hashStart)
+				children.push({
+					type: 'comment',
+					range: {
+						start: hashStart,
+						end: lineEnd < 0 ? src.string.length : lineEnd,
+					},
+				})
+			}
+			const sayIndex = src.string.indexOf('say ')
+			if (sayIndex >= 0) {
+				const sayEnd = src.string.indexOf('\n', sayIndex)
+				children.push({
+					type: 'command',
+					range: {
+						start: sayIndex,
+						end: sayEnd < 0 ? src.string.length : sayEnd,
+					},
+				})
+			}
+			src.cursor = src.string.length
+			return {
+				type: 'fixture:mcfunction',
+				range: { start: 0, end: src.string.length },
+				children,
+			}
+		}
+		const src = new Source(content)
+		const err = new ErrorReporter()
+		const result = extendMcfunctionParser(baseParser)(src, createParserContext(err))
+		if (result === Failure) {
+			assert.fail('adapted mcfunction parse should not be Failure')
+		}
+		const docs = result.children?.filter(ImpDocNode.is) ?? []
+		const commands = (result.children ?? []).filter(child => child.type === 'command')
+
+		assert.deepEqual(err.errors, [])
+		assert.equal(docs.length, 1)
+		assert.equal(docs[0]?.functionID?.raw, 'example:runner')
+		assert.equal(commands.length, 1, 'immediate command line must survive at sibling level')
+		assert.equal(
+			commands[0]?.range.start,
+			content.indexOf('say '),
+			'command must not be absorbed into the function header component',
+		)
+	})
+
 	it('parses the mixed Tier A fixture (tag / storage / score_holder)', async () => {
 		const content = await loadFixture('02-index-d-mixed.mcfunction')
 		const { docs, err } = parseAll(content)
