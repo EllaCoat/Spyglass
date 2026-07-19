@@ -1,9 +1,6 @@
 import * as core from '@spyglassmc/core'
 import { getLegacyCategorySpec } from './categories.js'
 
-const PlainIdentifierPattern = /^[0-9A-Za-z_.+-]+$/
-const ScoreHolderPattern = /^\$[0-9A-Za-z_.+^-]+$/
-
 /**
  * Reproduces v3 `IdentityNode.fromString(raw).toString()` for declaration IDs.
  *
@@ -23,7 +20,10 @@ export function canonicalizeLegacyNamespacedId(raw: string): string {
 		+ `${core.ResourceLocation.NamespacePathSep}${parts[1]}`
 }
 
-/** Canonical declaration key, retaining the v3 validation rules per family. */
+/**
+ * Canonical declaration key matching v3: only namespaced families are
+ * canonicalized, while every other non-empty declaration ID remains lossless.
+ */
 export function canonicalizeLegacyDeclarationName(
 	category: string,
 	raw: string,
@@ -35,14 +35,7 @@ export function canonicalizeLegacyDeclarationName(
 	if (spec.family === 'namespaced') {
 		return canonicalizeLegacyNamespacedId(raw)
 	}
-	if (spec.family === 'entity-like') {
-		return (spec.id === 'score_holder'
-				? ScoreHolderPattern
-				: PlainIdentifierPattern).test(raw)
-			? raw
-			: undefined
-	}
-	return PlainIdentifierPattern.test(raw) ? raw : undefined
+	return raw
 }
 
 export interface LegacyAliasNameParserContext {

@@ -1,10 +1,11 @@
-import { ErrorReporter, ErrorSeverity, Failure, Source } from '@spyglassmc/core'
+import { type AstNode, ErrorReporter, ErrorSeverity, Failure, Source } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import type { ImpDocAliasNode, ImpDocDeclarationNode } from '../lib/index.js'
 import {
 	canonicalizeLegacyDeclarationName,
+	extendMcfunctionParser,
 	impDoc,
 	ImpDocNode,
 	LEGACY_DECLARABLE_TYPES,
@@ -340,6 +341,69 @@ describe('IMP-Doc parser', () => {
 		assert.deepEqual(
 			typedDeclaration.name.range,
 			{ start: nameStart, end: nameStart + 'api:'.length },
+		)
+	})
+
+	it('leaves an adjacent declaration doc for the next direct parse', async () => {
+		const content = await loadFixture('18-adjacent-declaration-doc.mcfunction')
+		const { docs, err } = parseAll(content)
+
+		assert.deepEqual(err.errors, [])
+		assert.equal(docs.length, 2)
+		assert.equal(docs[0]?.functionID?.raw, 'fixture:_index.d')
+		assert.equal(docs[0]?.range.end, content.indexOf('#> private'))
+		assert.equal(docs[1]?.plainText, 'private\n')
+		assert.deepEqual(
+			declarationsOf(docs).map(node => [node.category, node.name.raw]),
+			[
+				['score_holder', 'RW.TargetModel'],
+				['entity', '@s'],
+				['tag', 'foo/bar'],
+			],
+		)
+	})
+
+	it('keeps an adjacent declaration doc separate through the mcfunction adapter', async () => {
+		const content = await loadFixture('18-adjacent-declaration-doc.mcfunction')
+		const baseParser = (src: Source): AstNode => {
+			const children: AstNode[] = []
+			for (const match of src.string.matchAll(/^[\t ]*#/gm)) {
+				const lineStart = match.index
+				const hashStart = lineStart + match[0].length - 1
+				const lineEnd = src.string.indexOf('\n', hashStart)
+				children.push({
+					type: 'comment',
+					range: {
+						start: hashStart,
+						end: lineEnd < 0 ? src.string.length : lineEnd,
+					},
+				})
+			}
+			src.cursor = src.string.length
+			return {
+				type: 'fixture:mcfunction',
+				range: { start: 0, end: src.string.length },
+				children,
+			}
+		}
+		const src = new Source(content)
+		const err = new ErrorReporter()
+		const result = extendMcfunctionParser(baseParser)(src, createParserContext(err))
+		if (result === Failure) {
+			assert.fail('adapted mcfunction parse should not be Failure')
+		}
+		const docs = result.children?.filter(ImpDocNode.is) ?? []
+
+		assert.deepEqual(err.errors, [])
+		assert.equal(docs.length, 2)
+		assert.equal(docs[0]?.functionID?.raw, 'fixture:_index.d')
+		assert.deepEqual(
+			declarationsOf(docs).map(node => [node.category, node.name.raw]),
+			[
+				['score_holder', 'RW.TargetModel'],
+				['entity', '@s'],
+				['tag', 'foo/bar'],
+			],
 		)
 	})
 

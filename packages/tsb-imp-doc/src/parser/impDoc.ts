@@ -614,7 +614,11 @@ export const impDoc: core.Parser<ImpDocNode> = (src, ctx) => {
 			continue
 		}
 
-		if (src.canReadInLine() && !isFunctionDoc) {
+		if (isFunctionDoc) {
+			// v3 leaves the first non-continuation line for the outer mcfunction
+			// parser. In particular, an adjacent `#>` starts a separate component.
+			src.cursor = lineStart
+		} else if (src.canReadInLine()) {
 			node.declaration = parseDeclarationBlock(
 				src,
 				ctx,

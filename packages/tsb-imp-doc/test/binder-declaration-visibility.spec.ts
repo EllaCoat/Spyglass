@@ -233,6 +233,28 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 		)
 	})
 
+	it('binds permissive non-namespaced IDs from a doc adjacent to the function header', async () => {
+		const { declarations, err, symbols } = await bindFixture(
+			'18-adjacent-declaration-doc.mcfunction',
+		)
+		const expected = [
+			['score_holder', 'RW.TargetModel'],
+			['entity', '@s'],
+			['tag', 'foo/bar'],
+		] as const
+
+		assert.deepEqual(err.errors, [])
+		assert.deepEqual(
+			declarations.map(node => [node.category, node.name.raw]),
+			expected,
+		)
+		for (const [index, [category, name]] of expected.entries()) {
+			const symbol = symbols.lookup(category, [name]).symbol
+			assert.ok(symbol, `${category}:${name}`)
+			assert.equal(declarations[index]?.symbol, symbol)
+		}
+	})
+
 	it('stamps internal and denied as restricted owner-bearing metadata', () => {
 		const internal = bindStorage(['@internal']).symbol
 		assert.equal(internal.visibility, 3)

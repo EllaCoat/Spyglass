@@ -369,6 +369,44 @@ describe('incremental legacy export discovery', () => {
 		)
 	})
 
+	it('discovers and binds permissive declarations in a doc adjacent to the function header', async () => {
+		await run()
+		const keys = [
+			toSymbolKey('score_holder', ['RW.TargetModel']),
+			toSymbolKey('entity', ['@s']),
+			toSymbolKey('tag', ['foo/bar']),
+		]
+		const cache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+			graph: ReturnType<typeof createDependencyGraph>
+		}
+		cache.manifest.files[declarationDependent]!.references = keys
+		cache.graph = createDependencyGraph(cache.manifest)
+		await writeFile(cachePath, JSON.stringify(cache))
+
+		await writeFile(
+			exportFile,
+			'#> example:exports\n# @public\n'
+				+ '#> private\n# @private\n'
+				+ '    #declare score_holder RW.TargetModel\n'
+				+ '    #declare entity @s\n'
+				+ '    #declare tag foo/bar\n\n'
+				+ 'say exports\n',
+		)
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 2)
+		assert.deepEqual(incremental.diagnostics, [])
+
+		const updated = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+		}
+		const exports = updated.manifest.files[exportFile]!.exports.map(entry => entry.key)
+		for (const key of keys) {
+			assert.ok(exports.includes(key), key)
+		}
+	})
+
 	it('reprocesses dependents for decoded known and extension alias keys', async () => {
 		await run()
 		const knownKey = toSymbolKey('alias/vector', ['launch vector'])
@@ -377,6 +415,8 @@ describe('incremental legacy export discovery', () => {
 			manifest: PerFileManifest
 			graph: ReturnType<typeof createDependencyGraph>
 		}
+		// Phase 4-3: consumer 実装時に、この seed graph への手動 references 注入を
+		// 実 reference 生成経路の end-to-end test へ置換、または追加する。
 		cache.manifest.files[knownAliasDependent]!.references = [knownKey]
 		cache.manifest.files[extensionAliasDependent]!.references = [extensionKey]
 		cache.graph = createDependencyGraph(cache.manifest)
