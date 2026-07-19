@@ -215,6 +215,8 @@ export class Project extends EventDispatcher<{
 	readonly #checkedCacheDocUris = new Set<string>()
 	/** File-deletion events whose core cleanup is run inline by `#ready`. */
 	readonly #inlineFileDeletedUris = new Set<string>()
+	/** File-deletion URIs processed inline by the active `#ready` generation. */
+	#readyFileDeletedUris: Set<string> | undefined
 	readonly #initializers: readonly ProjectInitializer[]
 	#reinitializationPredicates = new Set<ProjectChangePredicate>()
 	#reinitializationGeneration = 0
@@ -408,7 +410,11 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
-			const process = () => this.processFileDeleted(uri)
+			const readyFileDeletedUris = this.#readyFileDeletedUris
+			const process = () =>
+				readyFileDeletedUris?.has(uri)
+					? undefined
+					: this.processFileDeleted(uri)
 			if (this.#inlineFileDeletedUris.has(uri)) {
 				// `#ready` has already taken responsibility for the cleanup, but a
 				// removed pack/config file must retain its reinitialization trigger.
@@ -711,13 +717,35 @@ export class Project extends EventDispatcher<{
 	 * Finish the initial run of parsing, binding, and checking the entire project.
 	 */
 	async ready(options: ProjectReadyOptions = {}): Promise<this> {
-		return (this.#readyPromise ??= this.enqueueLifecycle(() => this.#ready(options)))
+		return (this.#readyPromise ??= this.enqueueLifecycle(() => this.runReady(options)))
+	}
+
+	private async runReady(
+		options: ProjectReadyOptions = {},
+		diagnostics?: ProjectDiagnosticsEvent[],
+		propagateProcessorErrors = false,
+	): Promise<this> {
+		const readyFileDeletedUris = new Set<string>()
+		this.#readyFileDeletedUris = readyFileDeletedUris
+		try {
+			return await this.#ready(
+				options,
+				diagnostics,
+				propagateProcessorErrors,
+				readyFileDeletedUris,
+			)
+		} finally {
+			if (this.#readyFileDeletedUris === readyFileDeletedUris) {
+				this.#readyFileDeletedUris = undefined
+			}
+		}
 	}
 
 	async #ready(
 		{ projectRootsWatcher }: ProjectReadyOptions = {},
 		diagnostics?: ProjectDiagnosticsEvent[],
 		propagateProcessorErrors = false,
+		readyFileDeletedUris = new Set<string>(),
 	): Promise<this> {
 		if (!this.#isInitialized) {
 			throw new Error('Project.ready() must be called after Project.init() resolves')
@@ -859,6 +887,7 @@ export class Project extends EventDispatcher<{
 				this.#inlineFileDeletedUris.delete(uri)
 			}
 			await this.processFileDeleted(uri, true)
+			readyFileDeletedUris.add(uri)
 			freshlyPublishedUris.add(uri)
 		}
 		__profiler.task('Validate Cache')
@@ -939,7 +968,7 @@ export class Project extends EventDispatcher<{
 	async restart(): Promise<void> {
 		this.#bindingInProgressUris.clear()
 		this.#symbolUpToDateUris.clear()
-		const readyPromise = this.#ready({ projectRootsWatcher: this.#watcher })
+		const readyPromise = this.runReady({ projectRootsWatcher: this.#watcher })
 		this.#readyPromise = readyPromise
 		await readyPromise
 	}
@@ -947,7 +976,7 @@ export class Project extends EventDispatcher<{
 	private async restartForRebuild(diagnostics: ProjectDiagnosticsEvent[]): Promise<void> {
 		this.#bindingInProgressUris.clear()
 		this.#symbolUpToDateUris.clear()
-		const readyPromise = this.#ready(
+		const readyPromise = this.runReady(
 			{ projectRootsWatcher: this.#watcher },
 			diagnostics,
 			true,

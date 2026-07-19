@@ -74,15 +74,22 @@ class FixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
 	implements core.FileWatcher
 {
 	readonly watchedFiles = new core.UriStore()
+	readonly #onReady: ((watcher: FixtureWatcher) => void) | undefined
 
-	constructor(uris: readonly string[]) {
+	constructor(
+		uris: readonly string[],
+		onReady?: (watcher: FixtureWatcher) => void,
+	) {
 		super()
+		this.#onReady = onReady
 		for (const uri of uris) {
 			this.watchedFiles.add(uri)
 		}
 	}
 
-	async ready(): Promise<void> {}
+	async ready(): Promise<void> {
+		this.#onReady?.(this)
+	}
 
 	async close(): Promise<void> {}
 }
@@ -108,6 +115,7 @@ function createRuntimeProject(
 	cacheDir: string,
 	projectRoot: core.RootUriString,
 	initializers: readonly core.ProjectInitializer[] = [initializeRuntime],
+	fs?: core.FileService,
 ): core.Project {
 	return new core.Project({
 		cacheRoot: core.fileUtil.ensureEndingSlash(
@@ -115,6 +123,7 @@ function createRuntimeProject(
 		),
 		defaultConfig: createConfig(),
 		externals: NodeJsExternals,
+		fs,
 		initializers,
 		logger: {
 			error: () => {},
@@ -124,6 +133,47 @@ function createRuntimeProject(
 		},
 		projectRoots: [projectRoot],
 	})
+}
+
+function createArchiveFixtureFileService(
+	cacheDir: string,
+	archiveRoot: core.RootUriString,
+	files: ReadonlyMap<string, string>,
+): core.FileService {
+	const fs = core.FileService.create(
+		NodeJsExternals,
+		core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
+	)
+	fs.register('archive:', {
+		async hash(uri) {
+			if (uri === archiveRoot) {
+				return core.getSha1([...files.values()].join('\0'))
+			}
+			const content = files.get(uri)
+			assert.ok(content !== undefined)
+			return core.getSha1(content)
+		},
+		async readFile(uri) {
+			const content = files.get(uri)
+			assert.ok(content !== undefined)
+			return new TextEncoder().encode(content)
+		},
+		*listFiles() {
+			yield* files.keys()
+		},
+		*listRoots() {
+			yield archiveRoot
+		},
+	})
+	// Project.ready() installs its dependency-backed archive supporter. Keep this
+	// in-memory fixture supporter registered instead.
+	const register = fs.register.bind(fs)
+	fs.register = (protocol, supporter, force) => {
+		if (protocol !== 'archive:') {
+			register(protocol, supporter, force)
+		}
+	}
+	return fs
 }
 
 async function writeRuntimeFixtureFile(
@@ -445,6 +495,7 @@ describe('IMP-Doc function header purge on file deletion', () => {
 			let readyHeaderUri: string | undefined
 			let readyHeaderErrors: readonly core.PosRangeLanguageError[] | undefined
 			let readyOwnerErrors: readonly core.PosRangeLanguageError[] | undefined
+			let headerRemovalCount = 0
 			secondProject.on('ready', () => {
 				readyObserved = true
 				const readySymbol = secondProject.symbols.lookup(
@@ -456,16 +507,23 @@ describe('IMP-Doc function header purge on file deletion', () => {
 				readyOwnerErrors = [
 					...(secondProject.cacheService.errors[declaring.uri] ?? []),
 				]
+			}).on('documentRemoved', ({ uri }) => {
+				if (uri === header.uri) {
+					headerRemovalCount += 1
+				}
 			})
 			await secondProject.ready({
 				projectRootsWatcher: new FixtureWatcher([
 					pack.uri,
 					declaring.uri,
 					otherDeclaring.uri,
-				]),
+				], watcher => watcher.emit('unlink', header.uri)),
 			})
+			// Fence on the unlink lifecycle task queued by watcher.ready().
+			await secondProject.onDidClose(declaring.uri)
 
 			assert.equal(readyObserved, true)
+			assert.equal(headerRemovalCount, 1)
 			assert.equal(readyHeaderUri, undefined)
 			assert.deepEqual(readyHeaderErrors, [])
 			assert.ok(
@@ -831,6 +889,93 @@ describe('IMP-Doc implicit lint checker preservation for closed cache documents'
 			assert.ok(
 				republished.some(error => checkerMessage.test(error.message)),
 				'the warm-start implicit lint must preserve the restored checker diagnostic',
+			)
+		} finally {
+			await first?.close()
+			await second?.close()
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
+	it('restores checker preservation for an archive document from a warm cache', async () => {
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-checked-archive-cache-'))
+		const projectRoot = join(cacheDir, 'project')
+		await mkdir(projectRoot, { recursive: true })
+		let first: core.Project | undefined
+		let second: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Checked archive cache fixture"\n\t}\n}\n',
+			)
+			const ownerContent = '#> a:mismatch\n# @public\n\n'
+				+ '#> Canonical declaration\n# @public\n#declare storage shared:archive_data\n'
+			const sideContent = '#> b:side\n# @public\n\n'
+				+ '#> Compatible declaration\n# @public\n#declare storage shared:archive_data\n'
+			const conflictingSideContent = '#> b:side\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:archive_data\n'
+			const side = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/side.mcfunction',
+				sideContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const archiveRoot = 'archive://imp-doc-checker/' as core.RootUriString
+			const ownerUri = `${archiveRoot}data/a/functions/owner.mcfunction`
+			const archiveFiles = new Map([[ownerUri, ownerContent]])
+			const watchedUris = [pack.uri, side.uri]
+			const checkerMessage = /Expected function ID/
+			const createProject = () =>
+				createRuntimeProject(
+					cacheDir,
+					projectRootUri,
+					[initializeRuntime],
+					createArchiveFixtureFileService(cacheDir, archiveRoot, archiveFiles),
+				)
+
+			first = createProject()
+			await first.init()
+			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			const mappedOwnerUri = await first.fs.mapToDisk(ownerUri)
+			assert.ok(mappedOwnerUri)
+			assert.ok(mappedOwnerUri.startsWith(first.cacheRoot))
+			await first.onDidOpen(mappedOwnerUri, 'mcfunction', 1, ownerContent)
+			await first.onDidClose(mappedOwnerUri)
+			const closed = first.cacheService.errors[ownerUri] ?? []
+			assert.ok(
+				closed.some(error => checkerMessage.test(error.message)),
+				'the closed archive document must publish its checker diagnostic',
+			)
+			assert.equal(
+				closed.some(error => error.message.includes('impDocVisibilityConflict')),
+				false,
+			)
+			await first.close()
+			first = undefined
+
+			second = createProject()
+			await second.init()
+			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			assert.ok(
+				(second.cacheService.errors[ownerUri] ?? []).some(error =>
+					checkerMessage.test(error.message)
+				),
+				'the archive checker diagnostic must be restored from disk',
+			)
+
+			await second.onDidOpen(side.uri, 'mcfunction', 1, conflictingSideContent)
+			assert.equal(second.getClientManaged(ownerUri), undefined)
+			const republished = second.cacheService.errors[ownerUri] ?? []
+			assert.ok(
+				republished.some(error => error.message.includes('impDocVisibilityConflict')),
+				'the warm-start implicit lint must publish the archive conflict warning',
+			)
+			assert.ok(
+				republished.some(error => checkerMessage.test(error.message)),
+				'the warm-start implicit lint must preserve the archive checker diagnostic',
 			)
 		} finally {
 			await first?.close()
