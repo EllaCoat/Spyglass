@@ -26,6 +26,7 @@ const RuntimeFileUris = [
 	'./runtime/private-project/data/contract/functions/caller.mcfunction',
 	'./runtime/private-project/data/owner/functions/malformed.mcfunction',
 	'./runtime/private-project/data/external/functions/malformed_caller.mcfunction',
+	'./runtime/private-project/data/owner/functions/aliases.mcfunction',
 ].map(path => core.normalizeUri(new URL(path, import.meta.url).toString()))
 
 const PackMcmetaUri = core.normalizeUri(
@@ -137,6 +138,7 @@ async function runFull(options: RunOptions): Promise<void> {
 // failing assertion in the caller can never skip `close()` and leak the autosave
 // interval (which would keep the single-process test runner alive forever).
 async function runInit(options: RunOptions): Promise<{
+	restoredAliasExpansion: string | undefined
 	restoredFileCount: number
 	restoredContractInputCount: number
 }> {
@@ -149,7 +151,14 @@ async function runInit(options: RunOptions): Promise<{
 		const restoredContractInputCount = getImpDocSymbolData(
 			project.symbols.lookup('function', ['contract:target']).symbol?.data,
 		)?.contract?.inputs.length ?? 0
-		return { restoredFileCount, restoredContractInputCount }
+		const restoredAliasExpansion = getImpDocSymbolData(
+			project.symbols.lookup('alias/vector', ['cached_vector']).symbol?.data,
+		)?.alias?.expansion
+		return {
+			restoredAliasExpansion,
+			restoredFileCount,
+			restoredContractInputCount,
+		}
 	} finally {
 		await project.close()
 	}
@@ -168,7 +177,11 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 
 	it('reuses cache when initializer context matches', async () => {
 		await runFull({ cacheDir, pluginVersion: 'v-fixture-1' })
-		const { restoredContractInputCount, restoredFileCount } = await runInit({
+		const {
+			restoredAliasExpansion,
+			restoredContractInputCount,
+			restoredFileCount,
+		} = await runInit({
 			cacheDir,
 			pluginVersion: 'v-fixture-1',
 		})
@@ -177,6 +190,7 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			`Expected cache to restore checksums; got ${restoredFileCount}`,
 		)
 		assert.ok(restoredContractInputCount > 0, 'Expected cached IMP-Doc contract data')
+		assert.equal(restoredAliasExpansion, '1.0 2.0 3.0')
 	})
 
 	it('fingerprints initializer and lint cache context independently', async () => {

@@ -1,9 +1,9 @@
-import { ErrorReporter, ErrorSeverity, Failure, Source } from '@spyglassmc/core'
+import { ErrorReporter, ErrorSeverity, Failure, ResourceLocation, Source } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
-import type { ImpDocDeclarationNode } from '../lib/index.js'
-import { impDoc, ImpDocNode } from '../lib/index.js'
+import type { ImpDocAliasNode, ImpDocDeclarationNode } from '../lib/index.js'
+import { getLegacyCategorySpec, impDoc, ImpDocNode, LEGACY_DECLARABLE_TYPES } from '../lib/index.js'
 
 function fixtureUrl(name: string): URL {
 	return new URL(`./fixtures/${name}`, import.meta.url)
@@ -75,12 +75,15 @@ function assertTokenRanges(
 			),
 			declaration.category,
 		)
+		const sourceName = content.slice(
+			declaration.name.range.start,
+			declaration.name.range.end,
+		)
 		assert.equal(
-			content.slice(
-				declaration.name.range.start,
-				declaration.name.range.end,
-			),
 			declaration.name.raw,
+			getLegacyCategorySpec(declaration.category)?.namespaced
+				? ResourceLocation.lengthen(sourceName)
+				: sourceName,
 		)
 	}
 }
@@ -391,19 +394,101 @@ describe('IMP-Doc parser', () => {
 		)
 	})
 
-	it('silently records deferred non-Tier-A declaration categories', async () => {
+	it('parses formerly deferred declaration categories', async () => {
 		const content = await loadFixture('11-untier-a-declarations.mcfunction')
 		const { docs, err } = parseAll(content)
 		assert.equal(err.errors.length, 0)
 
-		assert.deepEqual(declarationsOf(docs), [])
-		const [, deferredDoc] = docs
 		assert.deepEqual(
-			deferredDoc?.declaration?.lines.map(line => line.raw),
+			declarationsOf(docs).map(node => [node.category, node.name.raw]),
+			[
+				['objective', 'ExampleObjective'],
+				['function', 'example:run'],
+				['loot_table', 'example:table'],
+			],
+		)
+		const [, declarationDoc] = docs
+		assert.deepEqual(
+			declarationDoc?.declaration?.lines.map(line => line.raw),
 			[
 				'    #declare objective ExampleObjective',
 				'    #declare function example:run',
 				'    #declare loot_table example:table',
+			],
+		)
+	})
+
+	it('parses #declare and #define for all 55 legacy categories', async () => {
+		const content = await loadFixture('14-declaration-parity.mcfunction')
+		const { docs, err } = parseAll(content)
+		assert.deepEqual(err.errors, [])
+
+		const declarations = declarationsOf(docs)
+		assert.equal(declarations.length, LEGACY_DECLARABLE_TYPES.length * 2)
+		for (const spec of LEGACY_DECLARABLE_TYPES) {
+			const matches = declarations.filter(node => node.category === spec.id)
+			assert.equal(matches.length, 2, spec.id)
+			assert.equal(matches[0]?.name.raw, matches[1]?.name.raw, spec.id)
+		}
+		assertTokenRanges(content, declarations)
+	})
+
+	it('canonicalizes omitted namespaces before declaration binding', () => {
+		const content = '#> fixture:_index.d\n# @private\n\n'
+			+ '#> Default namespace\n# @public\n    #define function fixture/run'
+		const { docs, err } = parseAll(content)
+		assert.deepEqual(err.errors, [])
+		assert.equal(declarationsOf(docs)[0]?.name.raw, 'minecraft:fixture/run')
+	})
+
+	it('parses three v3 aliases and selectorTemplate losslessly', async () => {
+		const content = await loadFixture('15-aliases.mcfunction')
+		const { docs, err } = parseAll(content)
+		assert.deepEqual(err.errors, [])
+		const aliases = docs.flatMap(doc =>
+			doc.declaration?.aliases ?? []
+		) satisfies ImpDocAliasNode[]
+
+		assert.deepEqual(
+			aliases.map(node => [node.kind, node.name.raw, node.value.raw]),
+			[
+				['entity', 'nearest_player', '@p[tag=Ready, limit=1]'],
+				['uuid', 'owner_uuid', '01234567-89ab-cdef-0123-456789abcdef'],
+				['vector', 'launch_vector', '0.0 1.5 -2.0'],
+				[
+					'selectorTemplate',
+					'hostile_selector',
+					'@e[type=#fixture:hostile, distance=..16]',
+				],
+			],
+		)
+		for (const alias of aliases) {
+			assert.equal(content.slice(alias.kindRange.start, alias.kindRange.end), alias.kind)
+			assert.equal(content.slice(alias.name.range.start, alias.name.range.end), alias.name.raw)
+			assert.equal(
+				content.slice(alias.value.range.start, alias.value.range.end),
+				alias.value.raw,
+			)
+		}
+		assert.deepEqual(
+			docs.flatMap(doc => doc.children ?? []).filter(node => node.type === 'impDoc:alias'),
+			aliases,
+		)
+	})
+
+	it('recognizes compact and three-token spaced colon input fields', async () => {
+		const { doc, err } = await parseFixture('16-contract-spaced-colon.mcfunction')
+		assert.deepEqual(err.errors, [])
+		assert.deepEqual(
+			doc.contract.inputs[0]?.entries[0]?.fields.map(field => ({
+				key: field.key.raw,
+				optional: field.optional,
+				valueType: field.valueType?.raw,
+			})),
+			[
+				{ key: 'Compact', optional: false, valueType: 'int' },
+				{ key: 'Spaced', optional: false, valueType: 'string | text' },
+				{ key: 'Optional', optional: true, valueType: 'boolean' },
 			],
 		)
 	})
@@ -426,5 +511,19 @@ describe('IMP-Doc parser', () => {
 			content.slice(diagnostic.range.start, diagnostic.range.end),
 			'foo',
 		)
+	})
+
+	it('uses the #declare diagnostic family for an unrecognized #define category', () => {
+		const content = '#> example:_index.d\n# @private\n\n'
+			+ '#> Malformed\n# @public\n    #define unsupported value'
+		const { docs, err } = parseAll(content)
+
+		assert.deepEqual(declarationsOf(docs), [])
+		assert.equal(err.errors.length, 1)
+		assert.equal(
+			err.errors[0]?.message,
+			'Unrecognized #declare category "unsupported"',
+		)
+		assert.equal(err.errors[0]?.severity, ErrorSeverity.Error)
 	})
 })

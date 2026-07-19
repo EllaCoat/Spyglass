@@ -1,5 +1,6 @@
 import * as core from '@spyglassmc/core'
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import { declaration as bindDeclaration } from '../lib/binder/declaration.js'
 import type {
@@ -9,7 +10,7 @@ import type {
 	ImpDocNode,
 	ImpDocValue,
 } from '../lib/index.js'
-import { getImpDocSymbolData } from '../lib/index.js'
+import { getImpDocSymbolData, impDoc, LEGACY_DECLARABLE_TYPES } from '../lib/index.js'
 
 const Owner = 'owner:_index.d'
 const Uri = 'file:///data/owner/functions/_index.d.mcfunction'
@@ -61,6 +62,7 @@ function bindStorage(
 		contract: EmptyContract,
 		declaration: {
 			declarations: [node],
+			aliases: [],
 			lines: [],
 			range: node.range,
 		},
@@ -100,6 +102,58 @@ function bindStorage(
 	return { err, node, symbol }
 }
 
+async function bindFixture(name: string): Promise<{
+	err: core.ErrorReporter
+	declarations: ImpDocDeclarationNode[]
+	symbols: core.SymbolUtil
+}> {
+	const content = await readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
+	const src = new core.Source(content)
+	const err = new core.ErrorReporter()
+	const docs: ImpDocNode[] = []
+	while (src.canRead()) {
+		src.skipWhitespace()
+		if (!src.canRead()) {
+			break
+		}
+		const result = impDoc(
+			src,
+			{ err } as Parameters<typeof impDoc>[1],
+		)
+		assert.notEqual(result, core.Failure)
+		const doc = result as ImpDocNode
+		core.AstNode.setParents(doc)
+		docs.push(doc)
+	}
+
+	const symbols = new core.SymbolUtil(core.SymbolTable.link({
+		function: {
+			'fixture:_index.d': { definition: [{ uri: Uri }] },
+		},
+	} as core.UnlinkedSymbolTable))
+	symbols.buildCache()
+	const ctx = {
+		doc: {
+			uri: Uri,
+			languageId: 'mcfunction',
+			version: 1,
+			lineCount: content.split(/\r?\n/u).length,
+			getText: () => content,
+			offsetAt: (position: { character: number }) => position.character,
+			positionAt: (offset: number) => ({ line: 0, character: offset }),
+		},
+		err,
+		symbols,
+	} as unknown as core.BinderContext
+	const declarations = docs.flatMap(doc => doc.declaration?.declarations ?? [])
+	symbols.contributeAs('binder', () => {
+		for (const node of declarations) {
+			bindDeclaration(node, ctx)
+		}
+	})
+	return { err, declarations, symbols }
+}
+
 describe('IMP-Doc declaration binder visibility fallback', () => {
 	it('preserves valid variants and defaults annotation-free declarations to public', () => {
 		for (
@@ -117,6 +171,66 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 			assert.equal(node.symbol, symbol, label)
 			assert.deepEqual(err.errors, [], label)
 		}
+	})
+
+	it('binds #declare and #define to one symbol for every legacy category', async () => {
+		const { declarations, err, symbols } = await bindFixture(
+			'14-declaration-parity.mcfunction',
+		)
+		assert.deepEqual(err.errors, [])
+		assert.equal(declarations.length, LEGACY_DECLARABLE_TYPES.length * 2)
+
+		for (const spec of LEGACY_DECLARABLE_TYPES) {
+			const nodes = declarations.filter(node => node.category === spec.id)
+			assert.equal(nodes.length, 2, spec.id)
+			const name = nodes[0]!.name.raw
+			const symbol = symbols.lookup(spec.id, [name]).symbol
+			assert.ok(symbol, spec.id)
+			assert.equal(nodes[0]?.symbol, symbol, spec.id)
+			assert.equal(nodes[1]?.symbol, symbol, spec.id)
+			assert.equal(symbol.declaration?.length, 2, spec.id)
+		}
+
+		assert.ok(symbols.lookup('sequence', ['Sequence.One']).symbol)
+		assert.equal(
+			symbols.lookup('random_sequence', ['Sequence.One']).symbol,
+			undefined,
+		)
+	})
+
+	it('characterizes namespaced, bossbar/storage, entity-like, and plain families', async () => {
+		const { declarations, err, symbols } = await bindFixture(
+			'17-declaration-families.mcfunction',
+		)
+		assert.deepEqual(err.errors, [])
+		assert.deepEqual(
+			declarations.map(node => [node.category, node.name.raw]),
+			[
+				['function', 'minecraft:fixture/run'],
+				['bossbar', 'fixture:bossbar'],
+				['storage', 'fixture:storage'],
+				['entity', 'Entity.One'],
+				['score_holder', '$Score.Holder'],
+				['objective', 'Objective.One'],
+				['tag', 'Tag.One'],
+				['team', 'Team.One'],
+				['sequence', 'Sequence.One'],
+				['storage', 'fixture:storage'],
+			],
+		)
+
+		for (const node of declarations) {
+			assert.equal(
+				node.symbol,
+				symbols.lookup(node.category, [node.name.raw]).symbol,
+				node.category,
+			)
+		}
+		assert.equal(
+			declarations[2]?.symbol,
+			declarations.at(-1)?.symbol,
+			'#define must resolve to the same storage symbol as #declare',
+		)
 	})
 
 	it('stamps internal and denied as restricted owner-bearing metadata', () => {

@@ -1,5 +1,11 @@
 {
-  "impDocVersion": "0.0.5-visibility-parity.1",
+  "impDocVersion": "0.0.6-declaration-parity.0",
+  "alias": {
+    "alias": {
+      "kind": "selectorTemplate",
+      "expansion": "@e[type=#example:hostile, distance=..16]"
+    }
+  },
   "public": {
     "visibility": {
       "type": "public"
