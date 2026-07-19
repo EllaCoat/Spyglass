@@ -1,9 +1,14 @@
-import { ErrorReporter, ErrorSeverity, Failure, ResourceLocation, Source } from '@spyglassmc/core'
+import { ErrorReporter, ErrorSeverity, Failure, Source } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import type { ImpDocAliasNode, ImpDocDeclarationNode } from '../lib/index.js'
-import { getLegacyCategorySpec, impDoc, ImpDocNode, LEGACY_DECLARABLE_TYPES } from '../lib/index.js'
+import {
+	canonicalizeLegacyDeclarationName,
+	impDoc,
+	ImpDocNode,
+	LEGACY_DECLARABLE_TYPES,
+} from '../lib/index.js'
 
 function fixtureUrl(name: string): URL {
 	return new URL(`./fixtures/${name}`, import.meta.url)
@@ -81,9 +86,7 @@ function assertTokenRanges(
 		)
 		assert.equal(
 			declaration.name.raw,
-			getLegacyCategorySpec(declaration.category)?.namespaced
-				? ResourceLocation.lengthen(sourceName)
-				: sourceName,
+			canonicalizeLegacyDeclarationName(declaration.category, sourceName),
 		)
 	}
 }
@@ -441,6 +444,29 @@ describe('IMP-Doc parser', () => {
 		assert.equal(declarationsOf(docs)[0]?.name.raw, 'minecraft:fixture/run')
 	})
 
+	it('matches v3 canonicalization for permissive namespaced declaration IDs', () => {
+		const content = '#> fixture:_index.d\n# @private\n\n'
+			+ '#> Legacy namespaced spellings\n# @public\n'
+			+ '    #define function #foo\n'
+			+ '    #declare advancement UPPER:Thing\n'
+			+ '    #declare storage :foo\n'
+			+ '    #declare structure many:colon:ignored\n'
+			+ '    #declare tag Foo.Bar'
+		const { docs, err } = parseAll(content)
+		assert.deepEqual(err.errors, [])
+
+		assert.deepEqual(
+			declarationsOf(docs).map(node => [node.category, node.name.raw]),
+			[
+				['function', 'minecraft:foo'],
+				['advancement', 'UPPER:Thing'],
+				['storage', 'minecraft:foo'],
+				['structure', 'many:colon'],
+				['tag', 'Foo.Bar'],
+			],
+		)
+	})
+
 	it('parses three v3 aliases and selectorTemplate losslessly', async () => {
 		const content = await loadFixture('15-aliases.mcfunction')
 		const { docs, err } = parseAll(content)
@@ -473,6 +499,36 @@ describe('IMP-Doc parser', () => {
 		assert.deepEqual(
 			docs.flatMap(doc => doc.children ?? []).filter(node => node.type === 'impDoc:alias'),
 			aliases,
+		)
+	})
+
+	it('decodes quoted alias names while preserving their quoted source ranges', () => {
+		const content = '#> fixture:_index.d\n# @private\n\n'
+			+ '#> Quoted aliases\n# @public\n'
+			+ '    #alias vector "launch vector" 0 1 2\n'
+			+ "    #alias entity 'foo\\'bar' @s"
+		const { docs, err } = parseAll(content)
+		assert.deepEqual(err.errors, [])
+		const aliases = docs.flatMap(doc => doc.declaration?.aliases ?? [])
+
+		assert.deepEqual(
+			aliases.map(node => ({
+				kind: node.kind,
+				key: node.name.raw,
+				source: content.slice(node.name.range.start, node.name.range.end),
+				expansion: node.value.raw,
+			})),
+			[{
+				kind: 'vector',
+				key: 'launch vector',
+				source: '"launch vector"',
+				expansion: '0 1 2',
+			}, {
+				kind: 'entity',
+				key: "foo'bar",
+				source: "'foo\\'bar'",
+				expansion: '@s',
+			}],
 		)
 	})
 

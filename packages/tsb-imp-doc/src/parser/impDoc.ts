@@ -1,6 +1,6 @@
 import * as core from '@spyglassmc/core'
-import { getLegacyCategorySpec, LEGACY_DECLARABLE_TYPES } from '../legacy/categories.js'
-import type { LegacyCategorySpec } from '../legacy/categories.js'
+import { LEGACY_DECLARABLE_TYPES } from '../legacy/categories.js'
+import { canonicalizeLegacyDeclarationName, parseLegacyAliasNameToken } from '../legacy/syntax.js'
 import type {
 	ImpDocAliasNode,
 	ImpDocAnnotation,
@@ -17,25 +17,6 @@ import type {
 } from '../node/ImpDocNode.js'
 import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
 
-const PlainIdentifierPattern = /^[0-9A-Za-z_.+-]+$/
-const ScoreHolderPattern = /^\$[0-9A-Za-z_.+^-]+$/
-// Legacy IdentityNode.fromString() accepts an omitted namespace and an empty
-// path after an explicit namespace (`api:`). Keep those two forms while
-// rejecting characters which cannot form a resource location.
-const NamespacedIdentityPattern = /^(?:[0-9a-z_.-]+:[0-9a-z_./-]*|[0-9a-z_./-]+)$/
-
-const DeclarationNamePatterns: Readonly<
-	Record<LegacyCategorySpec['family'], (spec: LegacyCategorySpec, raw: string) => boolean>
-> = {
-	namespaced: (_spec, raw) => NamespacedIdentityPattern.test(raw),
-	'entity-like': (spec, raw) =>
-		spec.id === 'score_holder'
-			? ScoreHolderPattern.test(raw)
-			: PlainIdentifierPattern.test(raw),
-	'plain-variable': (_spec, raw) => PlainIdentifierPattern.test(raw),
-	alias: (_spec, raw) => PlainIdentifierPattern.test(raw),
-}
-
 const DeclarationCategoryIds: ReadonlySet<string> = new Set(
 	LEGACY_DECLARABLE_TYPES.map(spec => spec.id),
 )
@@ -48,17 +29,6 @@ function isDeclarationCategory(
 
 function parseDeclarationDirective(src: core.Source): boolean {
 	return src.trySkip('#declare') || src.trySkip('#define')
-}
-
-function canonicalDeclarationName(
-	category: ImpDocDeclarationCategory,
-	raw: string,
-): string | undefined {
-	const spec = getLegacyCategorySpec(category)
-	if (!spec || !DeclarationNamePatterns[spec.family](spec, raw)) {
-		return undefined
-	}
-	return spec.namespaced ? core.ResourceLocation.lengthen(raw) : raw
 }
 
 function parseDeclarationLine(
@@ -101,7 +71,7 @@ function parseDeclarationLine(
 	lineSrc.skipSpace()
 	const nameStart = lineSrc.cursor
 	const raw = lineSrc.readUntil(' ', '\t', '\r', '\n')
-	const canonical = canonicalDeclarationName(category, raw)
+	const canonical = canonicalizeLegacyDeclarationName(category, raw)
 	const name = {
 		raw: canonical ?? raw,
 		range: core.Range.create(nameStart, lineSrc.cursor),
@@ -152,13 +122,21 @@ function parseAliasLine(
 
 	lineSrc.skipSpace()
 	const nameStart = lineSrc.cursor
-	const rawName = lineSrc.readUntil(' ', '\t', '\r', '\n')
+	const errorCount = ctx.err.errors.length
+	const nameSrc = new core.Source(lineSrc.peekLine(), [{
+		inner: core.Range.create(0),
+		outer: core.Range.create(nameStart),
+	}])
+	const parsedName = parseLegacyAliasNameToken(nameSrc, ctx)
+	lineSrc.cursor = nameSrc.cursor
 	const name = {
-		raw: rawName,
-		range: core.Range.create(nameStart, lineSrc.cursor),
+		raw: parsedName?.value ?? '',
+		range: parsedName?.range ?? core.Range.create(nameStart, lineSrc.cursor),
 	}
-	if (!PlainIdentifierPattern.test(rawName) || !core.Source.isSpace(lineSrc.peek())) {
-		ctx.err.report('Malformed #alias line', rawName ? name.range : line.range)
+	if (!parsedName || !core.Source.isSpace(lineSrc.peek())) {
+		if (ctx.err.errors.length === errorCount) {
+			ctx.err.report('Malformed #alias line', parsedName ? name.range : line.range)
+		}
 		return undefined
 	}
 

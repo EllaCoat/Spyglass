@@ -38,11 +38,7 @@ async function parseFixture(): Promise<ImpDocNode> {
 	return result as ImpDocNode
 }
 
-async function parseAliasFixture(): Promise<ImpDocAliasNode[]> {
-	const content = await readFile(
-		new URL('./fixtures/15-aliases.mcfunction', import.meta.url),
-		'utf8',
-	)
+function parseAliases(content: string): ImpDocAliasNode[] {
 	const src = new core.Source(content)
 	const err = new core.ErrorReporter()
 	const aliases: ImpDocAliasNode[] = []
@@ -60,6 +56,15 @@ async function parseAliasFixture(): Promise<ImpDocAliasNode[]> {
 	}
 	assert.deepEqual(err.errors, [])
 	return aliases
+}
+
+async function parseAliasFixture(): Promise<ImpDocAliasNode[]> {
+	return parseAliases(
+		await readFile(
+			new URL('./fixtures/15-aliases.mcfunction', import.meta.url),
+			'utf8',
+		),
+	)
 }
 
 function getCurrentFunction(symbols: core.SymbolUtil, uri: string) {
@@ -120,6 +125,77 @@ describe('IMP-Doc contract binder', () => {
 				expansion: '@e[type=#fixture:hostile, distance=..16]',
 			},
 		)
+	})
+
+	it('binds and serializes decoded quoted alias keys with source token ranges', () => {
+		const content = '#> fixture:_index.d\n# @private\n\n'
+			+ '#> Quoted aliases\n# @public\n'
+			+ '    #alias vector "launch vector" 0 1 2\n'
+			+ "    #alias entity 'foo\\'bar' @s"
+		const aliases = parseAliases(content)
+		const table = core.SymbolTable.link({})
+		const symbols = new core.SymbolUtil(table)
+		const err = new core.ErrorReporter()
+		const uri = 'file:///quoted-aliases.mcfunction'
+		const ctx = {
+			doc: {
+				uri,
+				languageId: 'mcfunction',
+				version: 1,
+				lineCount: 1,
+				getText: () => content,
+				offsetAt: (position: { character: number }) => position.character,
+				positionAt: (offset: number) => ({ line: 0, character: offset }),
+			},
+			err,
+			symbols,
+		} as unknown as core.BinderContext
+
+		symbols.contributeAs('binder', () => {
+			for (const alias of aliases) {
+				bindAlias(alias, ctx)
+			}
+		})
+
+		const expected = [{
+			category: 'alias/vector',
+			key: 'launch vector',
+			source: '"launch vector"',
+			expansion: '0 1 2',
+		}, {
+			category: 'alias/entity',
+			key: "foo'bar",
+			source: "'foo\\'bar'",
+			expansion: '@s',
+		}]
+		for (const [index, item] of expected.entries()) {
+			const alias = aliases[index]!
+			const symbol = symbols.lookup(item.category, [item.key]).symbol
+			assert.ok(symbol, item.key)
+			assert.equal(alias.symbol, symbol)
+			assert.equal(
+				content.slice(alias.name.range.start, alias.name.range.end),
+				item.source,
+			)
+			assert.deepEqual(symbol.declaration?.[0]?.range, alias.name.range)
+			assert.deepEqual(getImpDocSymbolData(symbol.data)?.alias, {
+				kind: alias.kind,
+				expansion: item.expansion,
+			})
+		}
+
+		const restored = core.SymbolTable.deserialize(core.SymbolTable.serialize(table))
+		for (const [index, item] of expected.entries()) {
+			const alias = aliases[index]!
+			const symbol = restored[item.category]?.[item.key]
+			assert.ok(symbol, item.key)
+			assert.deepEqual(symbol.declaration?.[0]?.range, alias.name.range)
+			assert.deepEqual(getImpDocSymbolData(symbol.data)?.alias, {
+				kind: alias.kind,
+				expansion: item.expansion,
+			})
+		}
+		assert.deepEqual(err.errors, [])
 	})
 
 	it('stores a serializable contract on the current function symbol', async () => {
