@@ -92,7 +92,10 @@ describe('Phase 5b Asset profiler', () => {
 			AssetProfilerIds,
 		)
 		for (const profiler of output.profilers) {
-			assert.equal(profiler.totalTasks, 18)
+			// The lint stage runs one pass per enabled rule
+			// (impDocPrivate + impDocPrivateBestEffort), so it records
+			// one task per file per rule.
+			assert.equal(profiler.totalTasks, profiler.id === 'project#lint' ? 36 : 18)
 			assert.ok(profiler.tasks.length > 0)
 		}
 	})

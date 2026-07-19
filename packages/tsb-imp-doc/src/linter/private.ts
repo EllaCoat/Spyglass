@@ -45,7 +45,8 @@ function getCallerByFullScan(ctx: LinterContext): string | undefined {
 	return declaration
 }
 
-function getCaller(ctx: LinterContext): string | undefined {
+/** Resolves the calling function of `ctx.doc`. Shared with the best-effort rule. */
+export function getCaller(ctx: LinterContext): string | undefined {
 	const candidates = ctx.symbols.getSymbolCandidatesAtUri(ctx.doc.uri)
 	if (candidates.length === 0) {
 		return getCallerByFullScan(ctx)

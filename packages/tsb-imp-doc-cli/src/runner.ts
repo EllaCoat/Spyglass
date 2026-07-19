@@ -25,7 +25,13 @@ import type { DiagnosticSeverity, LintDiagnostic } from './reporter.js'
 
 const CacheVersion = 2
 const ImpDocPrivateRule = 'impDocPrivate'
+const ImpDocPrivateBestEffortRule = 'impDocPrivateBestEffort'
 const UnresolvedRule = 'unresolved'
+/** Default severities applied unless the rule is configured in the overrides. */
+const DefaultLintSeverities: Readonly<Record<string, string>> = {
+	[ImpDocPrivateRule]: 'error',
+	[ImpDocPrivateBestEffortRule]: 'warning',
+}
 export const SerializeProfilerId = 'project#cache#serialize'
 export const SerializeManifestProfilerId = 'project#cache#serialize#manifest'
 const ExportUsageTypes = [
@@ -290,7 +296,7 @@ function createConfig(overrides: Record<string, unknown> | undefined): core.Conf
 		core.VanillaConfig,
 		{
 			env: { dependencies: [] },
-			lint: { [ImpDocPrivateRule]: 'error' },
+			lint: { ...DefaultLintSeverities },
 		},
 		overrides ?? {},
 	)
@@ -298,11 +304,13 @@ function createConfig(overrides: Record<string, unknown> | undefined): core.Conf
 	for (const rule of Object.keys(core.VanillaConfig.lint)) {
 		delete lint[rule]
 	}
-	if (
-		!(overrides?.['lint'] && typeof overrides['lint'] === 'object'
-			&& ImpDocPrivateRule in overrides['lint'])
-	) {
-		lint[ImpDocPrivateRule] = 'error'
+	for (const [rule, severity] of Object.entries(DefaultLintSeverities)) {
+		if (
+			!(overrides?.['lint'] && typeof overrides['lint'] === 'object'
+				&& rule in overrides['lint'])
+		) {
+			lint[rule] = severity
+		}
 	}
 	return config
 }
@@ -806,39 +814,49 @@ export async function runImpDocLint(
 	checkProfiler.finalize()
 
 	const lintConfig = config.lint as unknown as Record<string, unknown>
-	const lintValue = core.LinterConfigValue.destruct(
-		lintConfig[ImpDocPrivateRule] as Parameters<typeof core.LinterConfigValue.destruct>[0],
-	)
-	if (lintValue) {
-		const registration = meta.getLinter(ImpDocPrivateRule)
-		if (registration.configValidator(ImpDocPrivateRule, lintValue.ruleValue, logger)) {
-			const lintProfiler = projectData.profilers.get('project#lint', 'top-n', 50)
-			await core.mapLimit(states, options.parallel, async (state) => {
-				try {
-					const err = new core.LinterErrorReporter(
-						ImpDocPrivateRule,
-						lintValue.ruleSeverity,
-						projectData.ctx['errorSource'],
-					)
-					const ctx = core.LinterContext.create(projectData, {
-						doc: state.doc,
-						err,
-						ruleName: ImpDocPrivateRule,
-						ruleValue: lintValue.ruleValue,
-					})
-					core.traversePreOrder(
-						state.node,
-						() => true,
-						registration.nodePredicate,
-						(node) => registration.linter(core.StateProxy.create(node), ctx),
-					)
-					state.node.linterErrors = err.dump()
-				} finally {
-					lintProfiler.task(state.uri)
-				}
-			})
-			lintProfiler.finalize()
+	for (const ruleName of [ImpDocPrivateRule, ImpDocPrivateBestEffortRule]) {
+		const lintValue = core.LinterConfigValue.destruct(
+			lintConfig[ruleName] as Parameters<typeof core.LinterConfigValue.destruct>[0],
+		)
+		if (!lintValue) {
+			continue
 		}
+		const registration = meta.getLinter(ruleName)
+		if (!registration.configValidator(ruleName, lintValue.ruleValue, logger)) {
+			continue
+		}
+		const lintProfiler = projectData.profilers.get('project#lint', 'top-n', 50)
+		await core.mapLimit(states, options.parallel, async (state) => {
+			try {
+				const err = new core.LinterErrorReporter(
+					ruleName,
+					lintValue.ruleSeverity,
+					projectData.ctx['errorSource'],
+				)
+				const ctx = core.LinterContext.create(projectData, {
+					doc: state.doc,
+					err,
+					ruleName,
+					ruleValue: lintValue.ruleValue,
+				})
+				core.traversePreOrder(
+					state.node,
+					() => true,
+					registration.nodePredicate,
+					(node) => registration.linter(core.StateProxy.create(node), ctx),
+				)
+				// Diagnostics carry the rule that produced them, so they are
+				// attributed here instead of a shared post-pass over linterErrors.
+				const errors = err.dump()
+				state.node.linterErrors = [...state.node.linterErrors ?? [], ...errors]
+				for (const error of errors) {
+					diagnostics.push(toDiagnostic(state, error, ruleName))
+				}
+			} finally {
+				lintProfiler.task(state.uri)
+			}
+		})
+		lintProfiler.finalize()
 	}
 
 	for (const state of states) {
@@ -852,9 +870,6 @@ export async function runImpDocLint(
 			) {
 				diagnostics.push(toDiagnostic(state, error, UnresolvedRule))
 			}
-		}
-		for (const error of state.node.linterErrors ?? []) {
-			diagnostics.push(toDiagnostic(state, error, ImpDocPrivateRule))
 		}
 	}
 	sortDiagnostics(diagnostics)
