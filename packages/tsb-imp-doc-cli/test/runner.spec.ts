@@ -128,4 +128,23 @@ describe('runner best-effort reference provenance', () => {
 		assert.equal(warm.cacheHit, true)
 		assert.deepEqual(warm.diagnostics, cold.diagnostics)
 	})
+
+	it('downgrades fully dynamic function references to unresolved warnings', async () => {
+		const dynamicFile = join(functionsDir, 'dynamic.mcfunction')
+		await writeFile(dynamicFile, '#> example:dynamic\n\n$function $(target)\n')
+
+		const result = await run()
+		assert.deepEqual(
+			digest(
+				result.diagnostics.filter(diagnostic => diagnostic.file === dynamicFile),
+				'unresolved',
+			),
+			[{
+				file: dynamicFile,
+				line: 3,
+				severity: 'warning',
+				message: 'Unresolved dynamic function reference',
+			}],
+		)
+	})
 })

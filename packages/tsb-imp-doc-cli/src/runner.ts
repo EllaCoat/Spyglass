@@ -245,10 +245,21 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 			const isMacroLine = line[leadingSpace] === '$'
 			const dynamicPattern = /\bfunction[\t ]+\$\([^\s)]*\)?/g
 			for (const match of line.matchAll(dynamicPattern)) {
+				const range = core.Range.create(
+					offset + match.index,
+					offset + match.index + match[0].length,
+				)
+				// A fully dynamic target can never be resolved statically, so it
+				// stays best-effort: a warning plus a provenance-tagged marker
+				// node instead of a hard error.
 				ctx.err.report(
 					'Unresolved dynamic function reference',
-					core.Range.create(offset + match.index, offset + match.index + match[0].length),
+					range,
+					core.ErrorSeverity.Warning,
 				)
+				const marker: core.AstNode = { type: 'tsb-imp-doc-cli:dynamic-ref', range }
+				impDoc.setRefProvenance(marker, 'dynamic-pattern')
+				children.push(marker)
 			}
 
 			const referencePattern =
