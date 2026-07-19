@@ -6,10 +6,10 @@ import type {
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
 import {
-	clearDeclarationVisibilities,
 	fallbackVisibility,
 	parseVisibility,
 	stampVisibility,
+	trackDeclarationVisibility,
 } from '../util/withinPattern.js'
 
 function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
@@ -51,23 +51,6 @@ function ownerForDocument(
 	}
 	ownerCache.set(ctx, { value: declaredOwner })
 	return declaredOwner
-}
-
-function isFirstReboundDeclaration(
-	symbol: core.Symbol,
-	candidate: ImpDocDeclarationSource,
-): boolean {
-	return !symbol.declaration?.some(location =>
-		location.uri === candidate.uri
-		&& location.range !== undefined
-		&& (
-			location.range.start < candidate.range.start
-			|| (
-				location.range.start === candidate.range.start
-				&& location.range.end < candidate.range.end
-			)
-		)
-	)
 }
 
 export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
@@ -124,13 +107,11 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 
 		node.symbol = symbol
 
-		// v3 union parity: declaration position ごとの visibility を全て保持する。
-		// 同一 URI の再 bind では、 最初に bind される declaration が stale entry
-		// (= 編集で範囲が変わった / 消えた declaration) を掃除してから追記する。
-		if (isFirstReboundDeclaration(symbol, candidate)) {
-			clearDeclarationVisibilities(symbol, candidate.uri)
-		}
+		// URI 単位の stale purge は Project の binder/release lifecycle hook が
+		// declaration binder より先に済ませる。ここでは今回 bind した位置を
+		// v3 union entry として記録するだけにする。
 		stampVisibility(symbol, visibility, candidate)
+		trackDeclarationVisibility(ctx.symbols, symbol, candidate.uri)
 
 		// desc は (uri, range) 辞書順先頭の declaration entry が担う (= 再解析で
 		// 非決定的に変わることを防ぐ、 canonical 1 本時代からの determinism 維持)。

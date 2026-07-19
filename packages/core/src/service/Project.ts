@@ -399,7 +399,7 @@ export class Project extends EventDispatcher<{
 					this.updateRoots()
 				}
 				this.#symbolUpToDateUris.delete(uri)
-				this.symbols.clear({ uri })
+				this.clearUriSymbolLocations(uri)
 				this.tryClearingCache(uri)
 			}
 			if (this.shouldReinitializeFor(uri)) {
@@ -1171,7 +1171,7 @@ export class Project extends EventDispatcher<{
 		try {
 			const binder = this.meta.getBinder(node.type)
 			const ctx = BinderContext.create(this, { doc })
-			ctx.symbols.clear({ contributor: 'binder', uri: doc.uri })
+			this.clearUriSymbolLocations(doc.uri, 'binder')
 			await ctx.symbols.contributeAsAsync('binder', async () => {
 				const proxy = StateProxy.create(node)
 				await binder(proxy, ctx)
@@ -1345,6 +1345,23 @@ export class Project extends EventDispatcher<{
 	}
 
 	/**
+	 * Clear core locations for one URI and first give plugins a chance to remove
+	 * metadata that is keyed by that URI rather than represented as a location.
+	 * Checker contributions are intentionally excluded: they are cleared after
+	 * every check and must not invalidate binder-owned metadata.
+	 */
+	private clearUriSymbolLocations(
+		uri: string,
+		contributor: 'binder' | undefined = undefined,
+	): void {
+		const ctx = UriBinderContext.create(this)
+		for (const clearer of this.meta.uriSymbolClearers) {
+			clearer(uri, ctx)
+		}
+		this.symbols.clear({ contributor, uri })
+	}
+
+	/**
 	 * Notify that a new document was opened in the editor.
 	 */
 	async onDidOpen(
@@ -1456,7 +1473,7 @@ export class Project extends EventDispatcher<{
 				restored = { doc, node }
 			} else {
 				// Reading the archive source failed; stale client contributions must not survive.
-				this.symbols.clear({ uri })
+				this.clearUriSymbolLocations(uri)
 			}
 		}
 

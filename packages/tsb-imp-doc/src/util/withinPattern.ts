@@ -1,6 +1,6 @@
 // core の Symbol 型は global Symbol constructor (unique symbol 宣言で使用) と
 // 衝突するため alias で import する。
-import { StateProxy } from '@spyglassmc/core'
+import { StateProxy, SymbolUtil } from '@spyglassmc/core'
 import type { ErrorReporter, Symbol as CoreSymbol } from '@spyglassmc/core'
 import { isLegacyWithinTarget } from '../legacy/categories.js'
 import type {
@@ -19,6 +19,44 @@ function asRecord(value: unknown): Record<string, unknown> {
 	return value && typeof value === 'object' && !Array.isArray(value)
 		? value as Record<string, unknown>
 		: {}
+}
+
+/**
+ * `symbol.data` is outside core's SymbolLocation lifecycle, so retain a
+ * per-SymbolUtil reverse index for declaration visibility entries. The first
+ * access reconstructs it from a loaded symbol cache; later declaration binds
+ * update it incrementally.
+ */
+type DeclarationVisibilityIndex = Map<string, Set<CoreSymbol>>
+const declarationVisibilityIndexes = new WeakMap<SymbolUtil, DeclarationVisibilityIndex>()
+
+function addToDeclarationVisibilityIndex(
+	index: DeclarationVisibilityIndex,
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	let symbols = index.get(uri)
+	if (!symbols) {
+		symbols = new Set()
+		index.set(uri, symbols)
+	}
+	symbols.add(symbol)
+}
+
+function getDeclarationVisibilityIndex(symbols: SymbolUtil): DeclarationVisibilityIndex {
+	let index = declarationVisibilityIndexes.get(symbols)
+	if (index) {
+		return index
+	}
+
+	index = new Map()
+	SymbolUtil.forEachSymbol(symbols.global, (symbol) => {
+		for (const entry of getImpDocSymbolData(symbol.data)?.declarations ?? []) {
+			addToDeclarationVisibilityIndex(index!, symbol, entry.uri)
+		}
+	})
+	declarationVisibilityIndexes.set(symbols, index)
+	return index
 }
 
 const RegexSpecials = new Set([
@@ -582,6 +620,39 @@ export function clearDeclarationVisibilities(
 
 	refreshAggregateVisibility(symbol, impDoc)
 	symbol.data = { ...root, impDoc }
+}
+
+/**
+ * Clear all declaration visibility metadata contributed by one document. Core
+ * clears SymbolLocations before a rebind or a file removal, but the IMP-Doc
+ * payload is stored in `symbol.data` and therefore needs this matching URI
+ * lifecycle step. The index is rebuilt from warm-cache data on first use.
+ */
+export function clearDeclarationVisibilitiesForUri(
+	symbols: SymbolUtil,
+	uri: string,
+): void {
+	const index = getDeclarationVisibilityIndex(symbols)
+	const affected = index.get(uri)
+	if (!affected) {
+		return
+	}
+
+	// Drop the URI first: current bind will repopulate it through
+	// `trackDeclarationVisibility`, while a fully removed URI stays absent.
+	index.delete(uri)
+	for (const symbol of affected) {
+		clearDeclarationVisibilities(symbol, uri)
+	}
+}
+
+/** Record a freshly bound `#declare` entry in the URI purge index. */
+export function trackDeclarationVisibility(
+	symbols: SymbolUtil,
+	symbol: CoreSymbol,
+	uri: string,
+): void {
+	addToDeclarationVisibilityIndex(getDeclarationVisibilityIndex(symbols), symbol, uri)
 }
 
 /**

@@ -12,6 +12,7 @@ import { configValidator, privateVisibility } from './linter/private.js'
 import type { ImpDocAliasNode, ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
 import { extendMcfunctionParser, impDoc } from './parser/impDoc.js'
 import { registerContractSignatureHelpProvider } from './signatureHelp/contract.js'
+import { clearDeclarationVisibilitiesForUri } from './util/withinPattern.js'
 
 export { bindContract, cloneContract, stampContract } from './binder/contract.js'
 export * from './cachePolicy.js'
@@ -46,6 +47,9 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		'impDoc:declaration',
 		bindDeclaration,
 	)
+	meta.registerUriSymbolClearer((uri, ctx) => {
+		clearDeclarationVisibilitiesForUri(ctx.symbols, uri)
+	})
 	meta.registerChecker<ImpDocNode>('impDoc', checkImpDoc)
 	meta.registerChecker<ImpDocAliasNode>('impDoc:alias', checkAlias)
 	registerContractSignatureHelpProvider(meta)

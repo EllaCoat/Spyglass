@@ -27,7 +27,12 @@ import type { DependencyKey, DependencyProvider } from './Dependency.js'
 import type { FileExtension } from './fileUtil.js'
 import type { SymbolRegistrar } from './SymbolRegistrar.js'
 import type { UriBuilder } from './UriBuilder.js'
-import type { UriBinder, UriSorter, UriSorterRegistration } from './UriProcessor.js'
+import type {
+	UriBinder,
+	UriSorter,
+	UriSorterRegistration,
+	UriSymbolClearer,
+} from './UriProcessor.js'
 
 export interface LanguageOptions {
 	/**
@@ -85,6 +90,7 @@ export class MetaRegistry {
 	readonly #symbolRegistrars = new Map<string, SymbolRegistrarRegistration>()
 	readonly #custom = new Map<string, Map<string, unknown>>()
 	readonly #uriBinders = new Set<UriBinder>()
+	readonly #uriSymbolClearers = new Set<UriSymbolClearer>()
 	readonly #uriBuilders = new Map<string, UriBuilder>()
 	#uriSorter: UriSorter = () => 0
 
@@ -301,6 +307,13 @@ export class MetaRegistry {
 	}
 	public get uriBinders(): Set<UriBinder> {
 		return this.#uriBinders
+	}
+
+	public registerUriSymbolClearer(uriSymbolClearer: UriSymbolClearer): void {
+		this.#uriSymbolClearers.add(uriSymbolClearer)
+	}
+	public get uriSymbolClearers(): Set<UriSymbolClearer> {
+		return this.#uriSymbolClearers
 	}
 
 	public hasUriBuilder(category: string): boolean {

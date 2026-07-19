@@ -1,5 +1,10 @@
-import type { AstNode, Linter, LinterContext, Logger, StateProxy } from '@spyglassmc/core'
-import type { ImpDocDeclarationNode, ImpDocVisibility } from '../node/ImpDocNode.js'
+import { SymbolUtil } from '@spyglassmc/core'
+import type { AstNode, Linter, LinterContext, Logger, Symbol as CoreSymbol } from '@spyglassmc/core'
+import type {
+	ImpDocDeclarationVisibility,
+	ImpDocSymbolData,
+	ImpDocVisibility,
+} from '../node/ImpDocNode.js'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
 
 export function conflictConfigValidator(
@@ -16,21 +21,28 @@ export function conflictConfigValidator(
 	return false
 }
 
-function visit(node: AstNode, fn: (node: AstNode) => void): void {
-	fn(node)
-	for (const child of node.children ?? []) {
-		visit(child, fn)
-	}
-}
-
-function isDeclarationNode(node: AstNode): node is ImpDocDeclarationNode {
-	return node.type === 'impDoc:declaration'
-}
-
 interface ConflictCounterpart {
 	visibility: ImpDocVisibility
 	/** Human-readable location of the counterpart declaration. */
 	where: string
+}
+
+interface ConflictSource extends ConflictCounterpart {}
+
+function compareDeclarationSource(
+	a: ImpDocDeclarationVisibility,
+	b: ImpDocDeclarationVisibility,
+): number {
+	if (a.uri !== b.uri) {
+		return a.uri < b.uri ? -1 : 1
+	}
+	return a.range.start - b.range.start || a.range.end - b.range.end
+}
+
+function getSortedDeclarations(
+	data: ImpDocSymbolData,
+): ImpDocDeclarationVisibility[] {
+	return [...data.declarations ?? []].sort(compareDeclarationSource)
 }
 
 /**
@@ -65,57 +77,106 @@ function getConflictMessage(
 	return undefined
 }
 
-/**
- * 同一 symbol に対する複数 visibility 宣言 (function header + `#declare` 群) が
- * 意味論的に矛盾していないか検査する。 v3 union parity (any-match) の採用で
- * 失われる「宣言間の食い違い」 検出を warning として別軸で補う rule。
- * 診断はこの document 内の declaration name に付け、 counterpart 側の位置は
- * message 中に埋め込む (= 矛盾 pair の両側の file がそれぞれ 1 回ずつ報告する)。
- */
-export const visibilityConflict: Linter<AstNode> = (node, ctx: LinterContext) => {
-	visit(node as StateProxy<AstNode>, (candidate) => {
-		if (!isDeclarationNode(candidate)) {
-			return
-		}
-		const data = getImpDocSymbolData(candidate.symbol?.data)
-		if (!data) {
-			return
-		}
-		const own = (data.declarations ?? []).find(entry =>
-			entry.uri === ctx.doc.uri
-			&& entry.range.start === candidate.name.range.start
-			&& entry.range.end === candidate.name.range.end
-		)
-		if (!own) {
-			return
-		}
-		const counterparts: ConflictCounterpart[] = [
-			...(data.visibility
-				? [{ visibility: data.visibility, where: 'the function header' }]
-				: []),
-			...(data.declarations ?? [])
-				.filter(entry =>
-					entry.uri !== own.uri
-					|| entry.range.start !== own.range.start
-					|| entry.range.end !== own.range.end
-				)
-				.map(entry => ({
-					visibility: entry.visibility,
-					where: `“${entry.uri}”`,
-				})),
-		]
-		for (const counterpart of counterparts) {
-			const message = getConflictMessage(
-				candidate.name.raw,
-				own.visibility,
-				counterpart,
-			)
+function getConflictMessages(
+	identifier: string,
+	data: ImpDocSymbolData,
+	declarations: readonly ImpDocDeclarationVisibility[],
+): string[] {
+	const sources: ConflictSource[] = [
+		...(data.visibility
+			? [{ visibility: data.visibility, where: 'the function header' }]
+			: []),
+		...declarations.map(entry => ({
+			visibility: entry.visibility,
+			where: `“${entry.uri}”`,
+		})),
+	]
+	const messages: string[] = []
+	for (let index = 0; index < sources.length; index += 1) {
+		const own = sources[index]!
+		for (const counterpart of sources.slice(index + 1)) {
+			const message = getConflictMessage(identifier, own.visibility, counterpart)
 			if (message) {
-				// 1 declaration につき最初の矛盾のみ報告する (counterpart が多い
-				// 場合の同一行への診断積み上げを避ける)。
-				ctx.err.lint(message, candidate.name.range)
-				return
+				messages.push(message)
 			}
 		}
+	}
+	return messages
+}
+
+/**
+ * A function symbol's defining document is the canonical diagnostic owner. A
+ * declaration-only symbol (storage, bossbar, or a headerless function) has no
+ * such document, so the lexicographically first declaration entry owns it.
+ */
+function getConflictOwnerUri(
+	symbol: CoreSymbol,
+	declarations: readonly ImpDocDeclarationVisibility[],
+): string | undefined {
+	if (symbol.category === 'function') {
+		const definitionUri = [...new Set(symbol.definition?.map(location => location.uri) ?? [])]
+			.sort()[0]
+		if (definitionUri) {
+			return definitionUri
+		}
+	}
+	return declarations[0]?.uri
+}
+
+function getConflictOwnerRange(
+	symbol: CoreSymbol,
+	declarations: readonly ImpDocDeclarationVisibility[],
+	ownerUri: string,
+) {
+	const definition = symbol.definition?.find(location => location.uri === ownerUri)
+	if (definition?.range) {
+		return definition.range
+	}
+	return declarations.find(entry => entry.uri === ownerUri)?.range
+		?? { start: 0, end: 0 }
+}
+
+function getSymbolsForDocument(ctx: LinterContext): CoreSymbol[] {
+	const candidates = ctx.symbols.getSymbolCandidatesAtUri(ctx.doc.uri)
+	if (candidates.length > 0) {
+		return candidates
+	}
+
+	// Direct/unit contexts do not always call SymbolUtil.buildCache(). Keep the
+	// same result shape by falling back to a complete location scan in that case.
+	const symbols: CoreSymbol[] = []
+	SymbolUtil.forEachSymbol(ctx.symbols.global, (symbol) => {
+		if (
+			symbol.definition?.some(location => location.uri === ctx.doc.uri)
+			|| symbol.declaration?.some(location => location.uri === ctx.doc.uri)
+		) {
+			symbols.push(symbol)
+		}
 	})
+	return symbols
+}
+
+/**
+ * 同一 symbol の矛盾 pair は canonical owner document の一箇所にだけ配置する。
+ * function は definition/header document、 それ以外は `(uri, range)` 昇順先頭の
+ * declaration document を owner とするため、両側 declaration への重複診断や
+ * editor 上の片側 stale を作らない。
+ */
+export const visibilityConflict: Linter<AstNode> = (_node, ctx: LinterContext) => {
+	for (const symbol of getSymbolsForDocument(ctx)) {
+		const data = getImpDocSymbolData(symbol.data)
+		if (!data) {
+			continue
+		}
+		const declarations = getSortedDeclarations(data)
+		const ownerUri = getConflictOwnerUri(symbol, declarations)
+		if (ownerUri !== ctx.doc.uri) {
+			continue
+		}
+
+		const range = getConflictOwnerRange(symbol, declarations, ownerUri)
+		for (const message of getConflictMessages(symbol.identifier, data, declarations)) {
+			ctx.err.lint(message, range)
+		}
+	}
 }
