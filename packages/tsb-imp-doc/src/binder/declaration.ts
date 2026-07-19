@@ -84,7 +84,7 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 		}
 
 		const owner = ownerForDocument(ctx)
-			?? (doc.functionID
+			?? (doc.functionID?.raw
 				? core.ResourceLocation.lengthen(doc.functionID.raw)
 				: undefined)
 		if (!owner) {

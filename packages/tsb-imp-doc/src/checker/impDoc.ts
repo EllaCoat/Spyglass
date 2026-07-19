@@ -10,7 +10,7 @@ import { checkContract } from './contract.js'
 export const impDoc: core.Checker<ImpDocNode> = async (node, ctx) => {
 	checkContract(node, ctx)
 
-	const parsedID = node.functionID
+	const parsedID = node.functionID?.raw
 		? core.ResourceLocation.lengthen(node.functionID.raw)
 		: undefined
 	const currentFunction = getCurrentFunctionSymbol(ctx)

@@ -12,7 +12,7 @@ import { bindContract, getCurrentFunctionSymbol } from './contract.js'
  * ID mismatch diagnostic remains in checker phase (need per-node ctx.err).
  */
 export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
-	const parsedID = node.functionID
+	const parsedID = node.functionID?.raw
 		? core.ResourceLocation.lengthen(node.functionID.raw)
 		: undefined
 	const currentFunction = getCurrentFunctionSymbol(ctx)
