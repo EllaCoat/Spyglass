@@ -1,5 +1,9 @@
 import type { AstNode } from '@spyglassmc/core'
-import type { LegacyFileTypeId } from '../legacy/categories.js'
+import type {
+	LegacyAliasTypeId,
+	LegacyDeclarableTypeId,
+	LegacyFileTypeId,
+} from '../legacy/categories.js'
 
 export interface ImpDocValue {
 	raw: string
@@ -119,7 +123,7 @@ export interface ImpDocDeclarationLine {
 	raw: string
 }
 
-export type ImpDocDeclarationCategory = 'tag' | 'storage' | 'score_holder'
+export type ImpDocDeclarationCategory = LegacyDeclarableTypeId
 
 export interface ImpDocDeclarationNode extends AstNode {
 	type: 'impDoc:declaration'
@@ -128,8 +132,25 @@ export interface ImpDocDeclarationNode extends AstNode {
 	name: ImpDocValue
 }
 
+export type ImpDocKnownAliasKind = LegacyAliasTypeId extends `alias/${infer Kind}` ? Kind : never
+
+/**
+ * The three v3 kinds retain literal completions, while TSB dialect extensions
+ * such as `selectorTemplate` remain lossless and bindable.
+ */
+export type ImpDocAliasKind = ImpDocKnownAliasKind | (string & {})
+
+export interface ImpDocAliasNode extends AstNode {
+	type: 'impDoc:alias'
+	kind: ImpDocAliasKind
+	kindRange: AstNode['range']
+	name: ImpDocValue
+	value: ImpDocValue
+}
+
 export interface ImpDocDeclarationBlock {
 	declarations: ImpDocDeclarationNode[]
+	aliases: ImpDocAliasNode[]
 	lines: ImpDocDeclarationLine[]
 	range: AstNode['range']
 }
@@ -218,6 +239,8 @@ export interface ImpDocSymbolData {
 	declaration?: ImpDocDeclarationSource
 	/** Serializable function contract copied from the bound IMP-Doc header. */
 	contract?: ImpDocContract
+	/** Serializable alias payload retained across symbol-cache reloads. */
+	alias?: { kind: string; expansion: string }
 	/**
 	 * P1a characterization / downstream compatibility 用の shortcut。
 	 * SoT は `visibility`、 Step 3 以降で撤去候補。

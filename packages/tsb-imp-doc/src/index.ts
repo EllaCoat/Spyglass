@@ -1,13 +1,14 @@
 import type { ProjectInitializer } from '@spyglassmc/core'
+import { bindAlias } from './binder/alias.js'
 import { declaration as bindDeclaration } from './binder/declaration.js'
 import { impDoc as bindImpDoc } from './binder/impDoc.js'
 import { mcfunction as bindMcfunction } from './binder/mcfunction.js'
 import { getImpDocCacheContext } from './cachePolicy.js'
-import { impDoc as checkImpDoc } from './checker/impDoc.js'
+import { checkAlias, impDoc as checkImpDoc } from './checker/impDoc.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
 import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
 import { configValidator, privateVisibility } from './linter/private.js'
-import type { ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
+import type { ImpDocAliasNode, ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
 import { extendMcfunctionParser, impDoc } from './parser/impDoc.js'
 import { registerContractSignatureHelpProvider } from './signatureHelp/contract.js'
 
@@ -38,11 +39,13 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 	meta.registerParser<ImpDocNode>('impDoc', impDoc)
 	meta.registerBinder<ImpDocNode>('impDoc', bindImpDoc)
 	meta.registerBinder('mcfunction:entry', bindMcfunction)
+	meta.registerBinder<ImpDocAliasNode>('impDoc:alias', bindAlias)
 	meta.registerBinder<ImpDocDeclarationNode>(
 		'impDoc:declaration',
 		bindDeclaration,
 	)
 	meta.registerChecker<ImpDocNode>('impDoc', checkImpDoc)
+	meta.registerChecker<ImpDocAliasNode>('impDoc:alias', checkAlias)
 	registerContractSignatureHelpProvider(meta)
 	meta.registerLinter('impDocPrivate', {
 		configValidator,

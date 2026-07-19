@@ -1,5 +1,8 @@
 import * as core from '@spyglassmc/core'
+import { getLegacyCategorySpec, LEGACY_DECLARABLE_TYPES } from '../legacy/categories.js'
+import type { LegacyCategorySpec } from '../legacy/categories.js'
 import type {
+	ImpDocAliasNode,
 	ImpDocAnnotation,
 	ImpDocContract,
 	ImpDocContractEntry,
@@ -14,25 +17,48 @@ import type {
 } from '../node/ImpDocNode.js'
 import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
 
-const DeferredDeclarationCategories = new Set([
-	'objective',
-	'function',
-	'loot_table',
-])
+const PlainIdentifierPattern = /^[0-9A-Za-z_.+-]+$/
+const ScoreHolderPattern = /^\$[0-9A-Za-z_.+^-]+$/
+// Legacy IdentityNode.fromString() accepts an omitted namespace and an empty
+// path after an explicit namespace (`api:`). Keep those two forms while
+// rejecting characters which cannot form a resource location.
+const NamespacedIdentityPattern = /^(?:[0-9a-z_.-]+:[0-9a-z_./-]*|[0-9a-z_./-]+)$/
 
-const DeclarationNamePatterns: Readonly<Record<ImpDocDeclarationCategory, RegExp>> = {
-	tag: /^[0-9A-Za-z_.+-]+$/,
-	// `api:` の空 path と namespace 無しの `global` を許可。
-	storage: /^(?:[0-9a-z_.-]+:[0-9a-z_./-]*|[0-9a-z_./-]+)$/,
-	score_holder: /^\$[0-9A-Za-z_.+^-]+$/,
+const DeclarationNamePatterns: Readonly<
+	Record<LegacyCategorySpec['family'], (spec: LegacyCategorySpec, raw: string) => boolean>
+> = {
+	namespaced: (_spec, raw) => NamespacedIdentityPattern.test(raw),
+	'entity-like': (spec, raw) =>
+		spec.id === 'score_holder'
+			? ScoreHolderPattern.test(raw)
+			: PlainIdentifierPattern.test(raw),
+	'plain-variable': (_spec, raw) => PlainIdentifierPattern.test(raw),
+	alias: (_spec, raw) => PlainIdentifierPattern.test(raw),
 }
+
+const DeclarationCategoryIds: ReadonlySet<string> = new Set(
+	LEGACY_DECLARABLE_TYPES.map(spec => spec.id),
+)
 
 function isDeclarationCategory(
 	value: string,
 ): value is ImpDocDeclarationCategory {
-	return value === 'tag'
-		|| value === 'storage'
-		|| value === 'score_holder'
+	return DeclarationCategoryIds.has(value)
+}
+
+function parseDeclarationDirective(src: core.Source): boolean {
+	return src.trySkip('#declare') || src.trySkip('#define')
+}
+
+function canonicalDeclarationName(
+	category: ImpDocDeclarationCategory,
+	raw: string,
+): string | undefined {
+	const spec = getLegacyCategorySpec(category)
+	if (!spec || !DeclarationNamePatterns[spec.family](spec, raw)) {
+		return undefined
+	}
+	return spec.namespaced ? core.ResourceLocation.lengthen(raw) : raw
 }
 
 function parseDeclarationLine(
@@ -45,7 +71,7 @@ function parseDeclarationLine(
 	lineSrc.skipSpace()
 
 	const start = lineSrc.cursor
-	if (!lineSrc.trySkip('#declare')) {
+	if (!parseDeclarationDirective(lineSrc)) {
 		return undefined
 	}
 	if (!core.Source.isSpace(lineSrc.peek())) {
@@ -60,9 +86,6 @@ function parseDeclarationLine(
 	const category = lineSrc.readUntil(' ', '\t', '\r', '\n')
 	const categoryRange = core.Range.create(categoryStart, lineSrc.cursor)
 
-	if (DeferredDeclarationCategories.has(category)) {
-		return undefined
-	}
 	if (!isDeclarationCategory(category)) {
 		ctx.err.report(
 			`Unrecognized #declare category "${category}"`,
@@ -78,12 +101,13 @@ function parseDeclarationLine(
 	lineSrc.skipSpace()
 	const nameStart = lineSrc.cursor
 	const raw = lineSrc.readUntil(' ', '\t', '\r', '\n')
+	const canonical = canonicalDeclarationName(category, raw)
 	const name = {
-		raw,
+		raw: canonical ?? raw,
 		range: core.Range.create(nameStart, lineSrc.cursor),
 	}
 
-	if (!DeclarationNamePatterns[category].test(raw)) {
+	if (canonical === undefined) {
 		ctx.err.report(
 			'Malformed #declare line',
 			raw ? name.range : line.range,
@@ -97,6 +121,66 @@ function parseDeclarationLine(
 		category,
 		categoryRange,
 		name,
+	}
+}
+
+function parseAliasLine(
+	src: core.Source,
+	line: ImpDocDeclarationLine,
+	ctx: core.ParserContext,
+): ImpDocAliasNode | undefined {
+	const lineSrc = src.clone()
+	lineSrc.cursor = line.range.start
+	lineSrc.skipSpace()
+
+	const start = lineSrc.cursor
+	if (!lineSrc.trySkip('#alias')) {
+		return undefined
+	}
+	if (!core.Source.isSpace(lineSrc.peek())) {
+		return undefined
+	}
+
+	lineSrc.skipSpace()
+	const kindStart = lineSrc.cursor
+	const kind = lineSrc.readUntil(' ', '\t', '\r', '\n')
+	const kindRange = core.Range.create(kindStart, lineSrc.cursor)
+	if (!kind || !core.Source.isSpace(lineSrc.peek())) {
+		ctx.err.report('Malformed #alias line', line.range)
+		return undefined
+	}
+
+	lineSrc.skipSpace()
+	const nameStart = lineSrc.cursor
+	const rawName = lineSrc.readUntil(' ', '\t', '\r', '\n')
+	const name = {
+		raw: rawName,
+		range: core.Range.create(nameStart, lineSrc.cursor),
+	}
+	if (!PlainIdentifierPattern.test(rawName) || !core.Source.isSpace(lineSrc.peek())) {
+		ctx.err.report('Malformed #alias line', rawName ? name.range : line.range)
+		return undefined
+	}
+
+	lineSrc.skipSpace()
+	const valueStart = lineSrc.cursor
+	const rawValue = lineSrc.readUntil('\r', '\n')
+	const value = {
+		raw: rawValue,
+		range: core.Range.create(valueStart, lineSrc.cursor),
+	}
+	if (!rawValue) {
+		ctx.err.report('Malformed #alias line', line.range)
+		return undefined
+	}
+
+	return {
+		type: 'impDoc:alias',
+		range: core.Range.create(start, value.range.end),
+		kind,
+		kindRange,
+		name,
+		value,
 	}
 }
 
@@ -172,32 +256,53 @@ function contractField(
 	src: core.Source,
 	values: readonly ImpDocValue[],
 ): ImpDocContractField[] {
-	const keyIndexes = values.flatMap((value, index) => value.raw.endsWith(':') ? [index] : [])
-	if (keyIndexes.length === 0) {
+	const keys = values.flatMap((value, index) => {
+		if (!value.raw.endsWith(':')) {
+			return []
+		}
+		if (value.raw === ':' || value.raw === '?:') {
+			const keyToken = values[index - 1]
+			if (!keyToken || keyToken.raw.endsWith(':')) {
+				return []
+			}
+			const optional = value.raw === '?:' || keyToken.raw.endsWith('?')
+			return [{
+				keyToken,
+				keyEnd: keyToken.range.end - (optional && keyToken.raw.endsWith('?') ? 1 : 0),
+				nextValue: index + 1,
+				optional,
+			}]
+		}
+		const optional = value.raw.endsWith('?:')
+		return [{
+			keyToken: value,
+			keyEnd: value.range.end - (optional ? 2 : 1),
+			nextValue: index + 1,
+			optional,
+		}]
+	})
+	if (keys.length === 0) {
 		return []
 	}
 
 	let child: ImpDocContractField | undefined
-	for (let i = keyIndexes.length - 1; i >= 0; i--) {
-		const keyIndex = keyIndexes[i]!
-		const token = values[keyIndex]!
-		const optional = token.raw.endsWith('?:')
-		const suffixLength = optional ? 2 : 1
+	for (let i = keys.length - 1; i >= 0; i--) {
+		const keySpec = keys[i]!
 		const key = valueBetween(
 			src,
-			token.range.start,
-			token.range.end - suffixLength,
+			keySpec.keyToken.range.start,
+			keySpec.keyEnd,
 		)
-		const nextKeyIndex = keyIndexes[i + 1]
-		const typeValues = nextKeyIndex === undefined
-			? values.slice(keyIndex + 1)
+		const nextKey = keys[i + 1]
+		const typeValues = nextKey === undefined
+			? values.slice(keySpec.nextValue)
 			: []
 		const end = typeValues.at(-1)?.range.end ?? child?.raw.range.end
-			?? token.range.end
+			?? values[keySpec.nextValue - 1]!.range.end
 		const field: ImpDocContractField = {
-			raw: valueBetween(src, token.range.start, end),
+			raw: valueBetween(src, keySpec.keyToken.range.start, end),
 			key,
-			optional,
+			optional: keySpec.optional,
 			...(typeValues.length
 				? {
 					valueType: valueBetween(
@@ -426,6 +531,7 @@ function parseDeclarationBlock(
 ): ImpDocDeclarationBlock {
 	const lines: ImpDocDeclarationLine[] = []
 	const declarations: ImpDocDeclarationNode[] = []
+	const aliases: ImpDocAliasNode[] = []
 	let commandIndent = indent.length
 
 	const addLine = (start: number, lineIndent: string): void => {
@@ -434,6 +540,11 @@ function parseDeclarationBlock(
 		const declaration = parseDeclarationLine(src, line, ctx)
 		if (declaration) {
 			declarations.push(declaration)
+			return
+		}
+		const alias = parseAliasLine(src, line, ctx)
+		if (alias) {
+			aliases.push(alias)
 		}
 	}
 
@@ -453,6 +564,7 @@ function parseDeclarationBlock(
 
 	return {
 		declarations,
+		aliases,
 		lines,
 		range: core.Range.create(lines[0].range.start, lines.at(-1)!.range.end),
 	}
@@ -546,7 +658,9 @@ export const impDoc: core.Parser<ImpDocNode> = (src, ctx) => {
 	node.children = [
 		...node.annotations,
 		...(node.declaration?.declarations ?? []),
+		...(node.declaration?.aliases ?? []),
 	]
+	node.children.sort((a, b) => a.range.start - b.range.start)
 	return node
 }
 
@@ -603,6 +717,7 @@ export function extendMcfunctionParser(
 			}
 			const bodyNodes = [
 				...(component.declaration?.declarations ?? []),
+				...(component.declaration?.aliases ?? []),
 				...attachedNodes,
 			].sort((a, b) => a.range.start - b.range.start)
 			component.children = [...component.annotations, ...bodyNodes]

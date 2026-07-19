@@ -1,6 +1,6 @@
 {
   "name": "@spyglassmc/tsb-imp-doc",
-  "version": "0.0.5-visibility-parity.1",
+  "version": "0.0.6-declaration-parity.0",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
