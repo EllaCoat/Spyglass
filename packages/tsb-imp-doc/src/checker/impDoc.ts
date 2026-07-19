@@ -1,7 +1,13 @@
 import * as core from '@spyglassmc/core'
 import { getCurrentFunctionSymbol } from '../binder/contract.js'
-import type { ImpDocNode } from '../node/ImpDocNode.js'
+import type { ImpDocAliasNode, ImpDocNode } from '../node/ImpDocNode.js'
 import { checkContract } from './contract.js'
+
+/**
+ * Unknown alias kinds are an intentional lossless TSB extension. They receive
+ * no diagnostic and are kept available to downstream consumers.
+ */
+export const checkAlias: core.SyncChecker<ImpDocAliasNode> = () => {}
 
 /**
  * Visibility stamp は binder phase (`binder/impDoc.ts`) に移行済み。

@@ -85,14 +85,14 @@ describe('Phase 5b Asset profiler', () => {
 			profilers: session.factory,
 		})
 
-		assert.equal(result.filesScanned, 13)
+		assert.equal(result.filesScanned, 18)
 		const output = session.toOutput()
 		assert.deepEqual(
 			output.profilers.map(profiler => profiler.id),
 			AssetProfilerIds,
 		)
 		for (const profiler of output.profilers) {
-			assert.equal(profiler.totalTasks, 13)
+			assert.equal(profiler.totalTasks, 18)
 			assert.ok(profiler.tasks.length > 0)
 		}
 	})
@@ -149,7 +149,7 @@ describe('serialize stage profiler', () => {
 		const manifest = summaries.find(candidate => candidate.id === SerializeManifestProfilerId)
 		assert.ok(manifest)
 		assert.equal(manifest.style, 'top-n')
-		assert.equal(manifest.totalTasks, 13)
+		assert.equal(manifest.totalTasks, 18)
 	})
 
 	it('stops after the dependency graph when no cache path is configured', async () => {

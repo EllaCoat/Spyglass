@@ -303,6 +303,147 @@ describe('incremental runner cache', () => {
 	)
 })
 
+describe('incremental legacy export discovery', () => {
+	let cachePath: string
+	let projectDir: string
+	let functionsDir: string
+	let exportFile: string
+	let declarationDependent: string
+	let knownAliasDependent: string
+	let extensionAliasDependent: string
+
+	beforeEach(async () => {
+		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-cli-'))
+		functionsDir = join(projectDir, 'data', 'example', 'functions')
+		await mkdir(functionsDir, { recursive: true })
+		cachePath = join(projectDir, '.tsb-lint-cache.json')
+		exportFile = join(functionsDir, 'exports.mcfunction')
+		declarationDependent = join(functionsDir, 'declaration-dependent.mcfunction')
+		knownAliasDependent = join(functionsDir, 'known-alias-dependent.mcfunction')
+		extensionAliasDependent = join(functionsDir, 'extension-alias-dependent.mcfunction')
+		await Promise.all([
+			writeFile(exportFile, 'say exports\n'),
+			writeFile(declarationDependent, 'function minecraft:foo\n'),
+			writeFile(knownAliasDependent, 'say known alias dependent\n'),
+			writeFile(extensionAliasDependent, 'say extension alias dependent\n'),
+			writeFile(join(functionsDir, 'independent.mcfunction'), 'say independent\n'),
+		])
+	})
+
+	afterEach(async () => {
+		await rm(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+	})
+
+	async function run() {
+		return runImpDocLint(await scanMcfunctionFiles(projectDir), {
+			targetDir: projectDir,
+			parallel: 2,
+			cachePath,
+		})
+	}
+
+	it('reprocesses a dependent for a newly added canonical #define export', async () => {
+		const cold = await run()
+		assert.equal(cold.fullScan, true)
+		assert.equal(cold.filesProcessed, 5)
+
+		await writeFile(
+			exportFile,
+			'#> example:exports\n# @public\n\n'
+				+ '#> Legacy function export\n# @public\n'
+				+ '    #define function #foo\n\n'
+				+ 'say exports\n',
+		)
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 2)
+		assert.deepEqual(incremental.diagnostics, [])
+
+		const cache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+		}
+		assert.ok(
+			cache.manifest.files[exportFile]?.exports.some(entry =>
+				entry.key === toSymbolKey('function', ['minecraft:foo'])
+			),
+		)
+	})
+
+	it('discovers and binds permissive declarations in a doc adjacent to the function header', async () => {
+		await run()
+		const keys = [
+			toSymbolKey('score_holder', ['RW.TargetModel']),
+			toSymbolKey('entity', ['@s']),
+			toSymbolKey('tag', ['foo/bar']),
+		]
+		const cache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+			graph: ReturnType<typeof createDependencyGraph>
+		}
+		cache.manifest.files[declarationDependent]!.references = keys
+		cache.graph = createDependencyGraph(cache.manifest)
+		await writeFile(cachePath, JSON.stringify(cache))
+
+		await writeFile(
+			exportFile,
+			'#> example:exports\n# @public\n'
+				+ '#> private\n# @private\n'
+				+ '    #declare score_holder RW.TargetModel\n'
+				+ '    #declare entity @s\n'
+				+ '    #declare tag foo/bar\n\n'
+				+ 'say exports\n',
+		)
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 2)
+		assert.deepEqual(incremental.diagnostics, [])
+
+		const updated = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+		}
+		const exports = updated.manifest.files[exportFile]!.exports.map(entry => entry.key)
+		for (const key of keys) {
+			assert.ok(exports.includes(key), key)
+		}
+	})
+
+	it('reprocesses dependents for decoded known and extension alias keys', async () => {
+		await run()
+		const knownKey = toSymbolKey('alias/vector', ['launch vector'])
+		const extensionKey = toSymbolKey('alias/selectorTemplate', ["foo'bar"])
+		const cache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+			graph: ReturnType<typeof createDependencyGraph>
+		}
+		// Phase 4-3: consumer 実装時に、この seed graph への手動 references 注入を
+		// 実 reference 生成経路の end-to-end test へ置換、または追加する。
+		cache.manifest.files[knownAliasDependent]!.references = [knownKey]
+		cache.manifest.files[extensionAliasDependent]!.references = [extensionKey]
+		cache.graph = createDependencyGraph(cache.manifest)
+		await writeFile(cachePath, JSON.stringify(cache))
+
+		await writeFile(
+			exportFile,
+			'#> example:exports\n# @public\n\n'
+				+ '#> Legacy aliases\n# @public\n'
+				+ '    #alias vector "launch vector" 0 1 2\n'
+				+ "    #alias selectorTemplate 'foo\\'bar' @e\n\n"
+				+ 'say exports\n',
+		)
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.filesProcessed, 3)
+		assert.deepEqual(incremental.diagnostics, [])
+
+		const updated = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			manifest: PerFileManifest
+		}
+		const keys = updated.manifest.files[exportFile]!.exports.map(entry => entry.key)
+		assert.ok(keys.includes(knownKey))
+		assert.ok(keys.includes(extensionKey))
+	})
+})
+
 describe('manifest exports characterization', () => {
 	let cachePath: string
 	let projectDir: string

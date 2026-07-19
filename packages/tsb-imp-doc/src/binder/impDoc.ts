@@ -42,7 +42,7 @@ export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
 	}
 
 	// impDoc binder を明示登録すると fallback は impDoc で停止するため、
-	// declaration + attached mcfunction command node の binder を明示 dispatch する。
+	// declaration / alias + attached mcfunction command node の binder を明示 dispatch する。
 	for (const child of node.children ?? []) {
 		if (ctx.meta.hasBinder(child.type)) {
 			const childBinder = ctx.meta.getBinder(child.type)

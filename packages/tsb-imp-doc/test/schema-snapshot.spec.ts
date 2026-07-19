@@ -26,6 +26,12 @@ function emptySymbol(): core.Symbol {
 	return { data: {} } as core.Symbol
 }
 
+function alias(kind: string, expansion: string): unknown {
+	const symbol = emptySymbol()
+	symbol.data = { impDoc: { alias: { kind, expansion } } }
+	return getImpDocSymbolData(symbol.data)
+}
+
 function stamp(
 	visibility: ImpDocVisibility,
 	declaration?: ImpDocDeclarationSource,
@@ -64,6 +70,10 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 		const showcaseContract = (showcase as ImpDocNode).contract
 		const actual = {
 			impDocVersion: ImpDocVersion,
+			alias: alias(
+				'selectorTemplate',
+				'@e[type=#example:hostile, distance=..16]',
+			),
 			public: stamp({ type: 'public' }, undefined, EmptyContract),
 			private: stamp(
 				{ type: 'private', owner: 'example:owner' },

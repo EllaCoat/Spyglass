@@ -35,6 +35,27 @@ const ExportUsageTypes = [
 	'typeDefinition',
 ] as const
 
+function escapeRegExp(value: string): string {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+const LegacyDeclarationCategoryPattern = impDoc.LEGACY_DECLARABLE_TYPES
+	.map(spec => escapeRegExp(spec.id))
+	.sort((a, b) => b.length - a.length || a.localeCompare(b))
+	.join('|')
+const LegacyDeclarationExportPattern = new RegExp(
+	`^[\\t ]*#(?:declare|define)[\\t ]+(${LegacyDeclarationCategoryPattern})`
+		+ '[\\t ]+(\\S+)',
+	'gm',
+)
+const LegacyAliasExportPattern = /^[\t ]*#alias[\t ]+(\S+)[\t ]+([^\r\n]*)/gm
+const LegacyAliasCategoryByKind: ReadonlyMap<string, string> = new Map(
+	impDoc.LEGACY_ALIAS_TYPES.map(spec => [
+		spec.id.slice('alias/'.length),
+		spec.id,
+	]),
+)
+
 export interface RunnerOptions {
 	targetDir: string
 	parallel: number
@@ -386,12 +407,27 @@ function discoverExportKeys(input: FileInput): string[] {
 	for (const match of input.content.matchAll(/^\s*#>\s*(\S+)/gm)) {
 		keys.add(toSymbolKey('function', [match[1]]))
 	}
-	for (
-		const match of input.content.matchAll(
-			/^\s*#declare\s+(tag|storage|score_holder)\s+(\S+)/gm,
-		)
-	) {
-		keys.add(toSymbolKey(match[1], [match[2]]))
+	for (const match of input.content.matchAll(LegacyDeclarationExportPattern)) {
+		const category = match[1]!
+		const canonical = impDoc.canonicalizeLegacyDeclarationName(category, match[2]!)
+		if (canonical !== undefined) {
+			keys.add(toSymbolKey(category, [canonical]))
+		}
+	}
+	for (const match of input.content.matchAll(LegacyAliasExportPattern)) {
+		const kind = match[1]!
+		const nameSrc = new core.Source(match[2]!)
+		const err = new core.ErrorReporter()
+		const name = impDoc.parseLegacyAliasNameToken(nameSrc, { err })
+		if (!name || !core.Source.isSpace(nameSrc.peek())) {
+			continue
+		}
+		nameSrc.skipSpace()
+		if (!nameSrc.canRead()) {
+			continue
+		}
+		const category = LegacyAliasCategoryByKind.get(kind) ?? `alias/${kind}`
+		keys.add(toSymbolKey(category, [name.value]))
 	}
 	return [...keys]
 }
