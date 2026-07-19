@@ -577,6 +577,334 @@ describe('IMP-Doc warm start queued lint vs staged diagnostics ordering', () => 
 	})
 })
 
+describe('IMP-Doc conflict ownership handoff on header file deletion', () => {
+	it('queues the surviving declaration owner and publishes the conflict there', async () => {
+		const projectRoot = await mkdtemp(
+			join(tmpdir(), 'spyglass-imp-doc-owner-handoff-project-'),
+		)
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-owner-handoff-cache-'))
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Owner handoff fixture"\n\t}\n}\n',
+			)
+			const header = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/target.mcfunction',
+				'#> a:target\n# @public\n',
+			)
+			const first = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/first.mcfunction',
+				'#> b:first\n# @public\n\n'
+					+ '#> First private declaration\n# @private\n#declare function a:target\n',
+			)
+			const second = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/c/functions/second.mcfunction',
+				'#> c:second\n# @public\n\n'
+					+ '#> Second private declaration\n# @private\n#declare function a:target\n',
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watcher = new FixtureWatcher([pack.uri, header.uri, first.uri, second.uri])
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			await project.ready({ projectRootsWatcher: watcher })
+			// The initial scan is bind-only, so no document owns the conflict yet.
+			assert.deepEqual(
+				(project.cacheService.errors[first.uri] ?? []).filter(error =>
+					error.message.includes('impDocVisibilityConflict')
+				),
+				[],
+			)
+
+			await rm(header.path, { force: true })
+			watcher.emit('unlink', header.uri)
+			// The fileDeleted lifecycle operation is enqueued behind the watcher
+			// event; fence on another lifecycle operation before asserting.
+			await project.onDidClose(header.uri)
+
+			// With the header (= previous canonical owner) gone, the surviving
+			// first declaration document must be queued and publish the
+			// private-owner conflict of the remaining declarations.
+			const republished = project.cacheService.errors[first.uri] ?? []
+			assert.ok(
+				republished.some(error =>
+					error.message.includes('impDocVisibilityConflict')
+					&& /private to “b:first” here and private to “c:second”/.test(error.message)
+				),
+				'the surviving declaration owner must publish the conflict',
+			)
+			assert.deepEqual(project.cacheService.errors[header.uri] ?? [], [])
+		} finally {
+			await project?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
+describe('IMP-Doc implicit lint checker preservation for closed cache documents', () => {
+	it('keeps checker diagnostics when a queued lint republishes a closed cache document', async () => {
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-checked-cache-'))
+		// Place the project inside the cache root so its documents take the
+		// cache-URI restore path (bind + check) in onDidClose.
+		const projectRoot = join(cacheDir, 'project')
+		await mkdir(projectRoot, { recursive: true })
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Checked cache doc fixture"\n\t}\n}\n',
+			)
+			// The mismatched header ID produces a checker-stage diagnostic.
+			const ownerContent = '#> a:mismatch\n# @public\n\n'
+				+ '#> Canonical declaration\n# @public\n#declare storage shared:data\n'
+			const sideContent = '#> b:side\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:data\n'
+			const owner = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/owner.mcfunction',
+				ownerContent,
+			)
+			const side = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/side.mcfunction',
+				sideContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher([pack.uri, owner.uri, side.uri]),
+			})
+
+			const checkerMessage = /Expected function ID/
+			await project.onDidOpen(owner.uri, 'mcfunction', 1, ownerContent)
+			await project.onDidClose(owner.uri)
+			const closed = project.cacheService.errors[owner.uri] ?? []
+			assert.ok(
+				closed.some(error => checkerMessage.test(error.message)),
+				'the closed cache document must keep its checker diagnostics published',
+			)
+
+			// Opening the conflicting side queues an implicit lint of the owner.
+			await project.onDidOpen(side.uri, 'mcfunction', 1, sideContent)
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+			const republished = project.cacheService.errors[owner.uri] ?? []
+			assert.ok(
+				republished.some(error => error.message.includes('impDocVisibilityConflict')),
+				'the implicit lint must publish the canonical conflict warning',
+			)
+			assert.ok(
+				republished.some(error => checkerMessage.test(error.message)),
+				'the implicit lint must not drop the closed document checker diagnostics',
+			)
+		} finally {
+			await project?.close()
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
+describe('IMP-Doc ready event vs queued lint flush ordering', () => {
+	it('emits ready only after queued warm-start lints have settled', async () => {
+		const projectRoot = await mkdtemp(
+			join(tmpdir(), 'spyglass-imp-doc-ready-order-project-'),
+		)
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-ready-order-cache-'))
+		let first: core.Project | undefined
+		let second: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Ready order fixture"\n\t}\n}\n',
+			)
+			const owner = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/owner.mcfunction',
+				'#> a:owner\n# @public\n\n'
+					+ '#> Canonical declaration\n# @public\n#declare storage shared:data\n',
+			)
+			const sideContent = '#> b:side\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:data\n'
+			const side = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/side.mcfunction',
+				sideContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watchedUris = [pack.uri, owner.uri, side.uri]
+
+			first = createRuntimeProject(cacheDir, projectRootUri)
+			await first.init()
+			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			// Seed the cached diagnostics with the canonical-owner conflict warning.
+			await first.onDidOpen(side.uri, 'mcfunction', 1, sideContent)
+			const seeded = first.cacheService.errors[owner.uri] ?? []
+			assert.ok(seeded.some(error => error.message.includes('impDocVisibilityConflict')))
+			await first.close()
+			first = undefined
+
+			// Resolve the conflict while no project is running.
+			await writeFile(
+				side.path,
+				'#> b:side\n# @public\n\n'
+					+ '#> Resolved declaration\n# @public\n#declare storage shared:data\n',
+			)
+
+			second = createRuntimeProject(cacheDir, projectRootUri)
+			const secondProject = second
+			await secondProject.init()
+			let readySnapshot: core.PosRangeLanguageError[] | undefined
+			secondProject.on('ready', () => {
+				readySnapshot = [...(secondProject.cacheService.errors[owner.uri] ?? [])]
+			})
+			await secondProject.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+
+			// The queued implicit lint of the unchanged owner must have settled
+			// before ready fired; its listeners never observe the stale staged
+			// conflict warning.
+			assert.ok(readySnapshot, 'the ready event must have fired')
+			assert.deepEqual(
+				readySnapshot.filter(error => error.message.includes('impDocVisibilityConflict')),
+				[],
+			)
+		} finally {
+			await first?.close()
+			await second?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
+describe('IMP-Doc warm start changed file staged diagnostics rollback', () => {
+	it('does not republish stale cached errors over a changed file fresh scan', async () => {
+		const projectRoot = await mkdtemp(
+			join(tmpdir(), 'spyglass-imp-doc-changed-file-project-'),
+		)
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-changed-file-cache-'))
+		let first: core.Project | undefined
+		let second: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Changed file fixture"\n\t}\n}\n',
+			)
+			// No IMP-Doc content on purpose: the queued-lint drain must stay out
+			// of this URI so the assertion isolates the staged publish ordering.
+			const plain = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/plain.mcfunction',
+				'badcommand foo\n',
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watchedUris = [pack.uri, plain.uri]
+
+			first = createRuntimeProject(cacheDir, projectRootUri)
+			await first.init()
+			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			assert.ok(
+				(first.cacheService.errors[plain.uri] ?? []).length > 0,
+				'the broken command must seed a cached diagnostic',
+			)
+			await first.close()
+			first = undefined
+
+			// Fix the file while no project is running.
+			await writeFile(plain.path, '# fixed\n')
+
+			second = createRuntimeProject(cacheDir, projectRootUri)
+			await second.init()
+			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+
+			// The changed file publishes fresh (clean) diagnostics during the
+			// scan; the stale staged entry must not roll them back.
+			assert.deepEqual(second.cacheService.errors[plain.uri] ?? [], [])
+		} finally {
+			await first?.close()
+			await second?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
+describe('IMP-Doc header desc priority over declaration desc', () => {
+	it('keeps the header hover desc regardless of bind order and declaration removal', async () => {
+		const projectRoot = await mkdtemp(
+			join(tmpdir(), 'spyglass-imp-doc-desc-priority-project-'),
+		)
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-desc-priority-cache-'))
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Desc priority fixture"\n\t}\n}\n',
+			)
+			const target = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/target.mcfunction',
+				'#> a:target\n# @public\n# Target header description\n',
+			)
+			const declContent = '#> b:decl\n# @public\n\n'
+				+ '#> Declaration description text\n# @private\n#declare function a:target\n'
+			const decl = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/decl.mcfunction',
+				declContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			// The watcher order fixes the scan order (default uriSorter is
+			// stable), so the header binds before the cross-document #declare:
+			// last-bind-wins would clobber the header desc here.
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher([pack.uri, target.uri, decl.uri]),
+			})
+			const symbol = project.symbols.lookup('function', ['a:target']).symbol
+			assert.ok(symbol)
+			assert.match(symbol.desc ?? '', /\*\*Visibility:\*\*/)
+			assert.match(symbol.desc ?? '', /Target header description/)
+			assert.doesNotMatch(symbol.desc ?? '', /Declaration description text/)
+
+			// Removing the canonical declaration must not clobber the header desc
+			// either (the desc restore only applies to headerless symbols).
+			await project.onDidOpen(decl.uri, 'mcfunction', 1, declContent)
+			await project.onDidChange(decl.uri, [{ text: '#> b:decl\n# @public\n' }], 2)
+			const after = project.symbols.lookup('function', ['a:target']).symbol
+			assert.ok(after)
+			assert.match(after.desc ?? '', /\*\*Visibility:\*\*/)
+			assert.match(after.desc ?? '', /Target header description/)
+		} finally {
+			await project?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
 describe('IMP-Doc conflict linter reverse URI cache re-verification', () => {
 	it('skips stale candidates whose locations at the document were removed', () => {
 		const staleUri = 'file:///fixture/stale.mcfunction'

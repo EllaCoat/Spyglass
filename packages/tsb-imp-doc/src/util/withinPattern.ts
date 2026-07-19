@@ -500,15 +500,25 @@ export function compareDeclarationSource(
 /**
  * The canonical document for metadata that belongs to one declaration union.
  * Functions prefer their defining document; declaration-only symbols use the
- * first declaration source in the already-sorted union.
+ * first declaration source in the already-sorted union. `excludeUri` computes
+ * the owner as if that document were already gone: the URI clear hook runs
+ * before core removes the document's SymbolLocations, so without the
+ * exclusion a deleted definition URI would still look like the owner.
  */
 export function getCanonicalDeclarationOwnerUri(
 	symbol: CoreSymbol,
 	declarations: readonly ImpDocDeclarationVisibility[],
+	excludeUri?: string,
 ): string | undefined {
 	if (symbol.category === 'function') {
-		const definitionUri = [...new Set(symbol.definition?.map(location => location.uri) ?? [])]
-			.sort()[0]
+		const definitionUri = [
+			...new Set(
+				symbol.definition
+					?.map(location => location.uri)
+					.filter(definition => definition !== excludeUri)
+					?? [],
+			),
+		].sort()[0]
 		if (definitionUri) {
 			return definitionUri
 		}
@@ -612,11 +622,19 @@ export function stampVisibility(
  * whenever header-side metadata or the canonical declaration entry is removed,
  * so a headerless target keeps its cross-document `#declare` hover regardless
  * of bind order (Terra r3 WANT-1).
+ *
+ * Desc priority is bind-order independent: while a function header is alive
+ * (`headerUri` present) its formatted desc owns `Symbol.desc`, and the
+ * canonical declaration desc only takes over once the header is gone. Callers
+ * that purge the header delete `headerUri` before calling this.
  */
 function restoreCanonicalDeclarationDesc(
 	symbol: CoreSymbol,
 	impDoc: ImpDocSymbolData,
 ): void {
+	if (impDoc.headerUri !== undefined) {
+		return
+	}
 	const description = [...impDoc.declarations ?? []]
 		.sort(compareDeclarationSource)[0]?.description
 	if (description === undefined) {
@@ -737,7 +755,12 @@ export function clearImpDocMetadataForUri(
 		const after = getImpDocSymbolData(symbol.data)
 		const afterDeclarations = [...after?.declarations ?? []]
 			.sort(compareDeclarationSource)
-		const nextOwner = getCanonicalDeclarationOwnerUri(symbol, afterDeclarations)
+		// `symbol.definition` still contains the cleared URI at this point (core
+		// clears SymbolLocations only after this hook), so exclude it: otherwise
+		// a deleted function header URI would keep claiming ownership and the
+		// declaration document that becomes the canonical owner after the clear
+		// would never be queued for an implicit lint (Terra r4 MUST-1).
+		const nextOwner = getCanonicalDeclarationOwnerUri(symbol, afterDeclarations, uri)
 		for (const ownerUri of new Set([previousOwner, nextOwner])) {
 			if (ownerUri) {
 				queueLint?.(ownerUri)

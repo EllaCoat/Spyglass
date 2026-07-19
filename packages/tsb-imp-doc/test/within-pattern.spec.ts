@@ -3,7 +3,12 @@ import type { Symbol as CoreSymbol } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { getImpDocSymbolData } from '../lib/index.js'
-import type { ImpDocAnnotation, ImpDocDeclarationSource, ImpDocValue } from '../lib/index.js'
+import type {
+	ImpDocAnnotation,
+	ImpDocDeclarationSource,
+	ImpDocDeclarationVisibility,
+	ImpDocValue,
+} from '../lib/index.js'
 import {
 	LEGACY_FILE_TYPE_IDS,
 	LEGACY_MISC_TYPES,
@@ -11,6 +16,7 @@ import {
 } from '../lib/legacy/categories.js'
 import {
 	clearVisibility,
+	getCanonicalDeclarationOwnerUri,
 	legacyGlobToRegex,
 	matchesVisibility,
 	parseVisibility,
@@ -886,5 +892,40 @@ describe('clearVisibility', () => {
 
 		assert.equal(symbol.desc, undefined)
 		assert.equal(getImpDocSymbolData(symbol.data), undefined)
+	})
+})
+
+describe('getCanonicalDeclarationOwnerUri', () => {
+	const definitionUri = 'file:///fixture/data/a/functions/target.mcfunction'
+	const declarationUri = 'file:///fixture/data/b/functions/decl.mcfunction'
+	const declarations: ImpDocDeclarationVisibility[] = [{
+		uri: declarationUri,
+		range: { start: 10, end: 20 },
+		owner: 'b:decl',
+		visibility: { type: 'private', owner: 'b:decl' },
+	}]
+
+	it('prefers the defining document of a function', () => {
+		const symbol = {
+			category: 'function',
+			definition: [{ uri: definitionUri }],
+		} as CoreSymbol
+		assert.equal(
+			getCanonicalDeclarationOwnerUri(symbol, declarations),
+			definitionUri,
+		)
+	})
+
+	it('falls back to the surviving declaration when the definition URI is being cleared', () => {
+		// The URI clear hook computes the post-clear owner before core removes
+		// the SymbolLocations, so the cleared URI must not claim ownership.
+		const symbol = {
+			category: 'function',
+			definition: [{ uri: definitionUri }],
+		} as CoreSymbol
+		assert.equal(
+			getCanonicalDeclarationOwnerUri(symbol, declarations, definitionUri),
+			declarationUri,
+		)
 	})
 })

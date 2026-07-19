@@ -204,6 +204,13 @@ export class Project extends EventDispatcher<{
 	readonly #symbolUpToDateUris = new Set<string>()
 	readonly #queuedLintUris = new Set<string>()
 	#queuedLintFlushPromise: Promise<void> | undefined
+	/**
+	 * Non-client-managed cache URIs whose published diagnostics include checker
+	 * results (produced by the `onDidClose` restore path). Implicit lint passes
+	 * must re-run the checker for them, or republishing would drop the checker
+	 * errors from the published superset.
+	 */
+	readonly #checkedCacheDocUris = new Set<string>()
 	readonly #initializers: readonly ProjectInitializer[]
 	#reinitializationPredicates = new Set<ProjectChangePredicate>()
 	#reinitializationGeneration = 0
@@ -624,7 +631,6 @@ export class Project extends EventDispatcher<{
 			throw e
 		}
 		await this.publishRebuildEvents(diagnostics)
-		await this.flushQueuedLints()
 		this.emit('reinitialized', { contextChanged: true })
 		return true
 	}
@@ -835,6 +841,7 @@ export class Project extends EventDispatcher<{
 
 		const __parseProfiler = this.profilers.get('project#ready#parse', 'top-n', 50)
 		const __bindProfiler = this.profilers.get('project#ready#bind', 'top-n', 50)
+		const freshlyPublishedUris = new Set<string>()
 		for (const uri of files) {
 			await this.#parseAndBindForReady(
 				uri,
@@ -842,6 +849,7 @@ export class Project extends EventDispatcher<{
 				__bindProfiler,
 				shouldPublishEvents ? undefined : stagedDiagnostics,
 				propagateProcessorErrors,
+				freshlyPublishedUris,
 			)
 		}
 		__parseProfiler.finalize()
@@ -851,14 +859,15 @@ export class Project extends EventDispatcher<{
 		await this.rebindAndCheckClientManaged(propagateProcessorErrors)
 		this.#isReady = true
 		__profiler.finalize()
-		// Queued lints republish per-URI diagnostics, so they must flush after
-		// the staged (possibly stale) cache diagnostics have been published:
-		// flushing first would let the old staged entries roll the fresh results
-		// back. On the staged path the caller publishes after this method
-		// settles and is responsible for flushing the queue afterwards.
+		// `publishRebuildEvents` publishes the staged (possibly stale) cache
+		// diagnostics, drains the queued lints on top of them, and only then
+		// emits READY. On the staged path the caller runs it after this method
+		// settles. Re-scanned files already published fresh diagnostics during
+		// the scan above, so their pre-scan staged entries are dropped here:
+		// republishing them would roll the fresh results back to stale ones.
 		if (shouldPublishEvents) {
-			await this.publishRebuildEvents(stagedDiagnostics)
-			await this.flushQueuedLints()
+			const staged = stagedDiagnostics.filter(event => !freshlyPublishedUris.has(event.data.uri))
+			await this.publishRebuildEvents(staged)
 		}
 
 		return this
@@ -969,13 +978,15 @@ export class Project extends EventDispatcher<{
 			throw e
 		}
 		await this.publishRebuildEvents(diagnostics)
-		await this.flushQueuedLints()
 	}
 
 	private async rebuildProjectFromEmptyCache(): Promise<ProjectDiagnosticsEvent[]> {
 		this.logger.info('[Project#resetCache] Initiated...')
 		this.#isReady = false
 		this.reparseClientManaged()
+		// The rebuild republishes every non-client-managed document from a fresh
+		// bind-only scan, so no closed document keeps checker diagnostics.
+		this.#checkedCacheDocUris.clear()
 		const diagnostics: ProjectDiagnosticsEvent[] = []
 
 		// Clear existing errors.
@@ -1045,6 +1056,11 @@ export class Project extends EventDispatcher<{
 		for (const value of this.#clientManagedDocAndNodes.values()) {
 			await this.emitAsync('documentUpdated', value)
 		}
+		// Queued lints republish per-URI diagnostics, so they must drain after the
+		// staged (possibly stale) diagnostics above — flushing first would let the
+		// old staged entries roll the fresh results back — and before READY is
+		// emitted, so `ready` listeners never observe stale staged diagnostics.
+		await this.flushQueuedLints()
 		await this.emitAsync('ready', {})
 	}
 
@@ -1207,6 +1223,27 @@ export class Project extends EventDispatcher<{
 		node: FileNode<AstNode>,
 		propagateErrors = false,
 	): Promise<void> {
+		await this.checkWithoutLintFlush(doc, node, propagateErrors)
+		try {
+			await this.flushQueuedLints()
+		} catch (e) {
+			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
+			if (propagateErrors) {
+				throw e
+			}
+		}
+	}
+
+	/**
+	 * Checker + linter stages without the trailing queued-lint flush. The
+	 * implicit lint drain calls this directly: flushing there would await the
+	 * drain's own promise and deadlock. {@link check} wraps this and flushes.
+	 */
+	private async checkWithoutLintFlush(
+		doc: TextDocument,
+		node: FileNode<AstNode>,
+		propagateErrors = false,
+	): Promise<void> {
 		if (node.checkerErrors) {
 			return
 		}
@@ -1224,7 +1261,6 @@ export class Project extends EventDispatcher<{
 				this.lint(doc, node)
 				__lintProfiler.task(doc.uri)
 			})
-			await this.flushQueuedLints()
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
 			if (propagateErrors) {
@@ -1319,6 +1355,7 @@ export class Project extends EventDispatcher<{
 
 					const doc = await this.read(uri)
 					if (!doc) {
+						this.#checkedCacheDocUris.delete(uri)
 						await this.emitAsync('documentErrored', { errors: [], uri })
 						continue
 					}
@@ -1326,10 +1363,17 @@ export class Project extends EventDispatcher<{
 					// Republishing replaces this URI's diagnostics wholesale, so bind
 					// before linting: a lint-only pass on a fresh AST would drop the
 					// binder diagnostics published for this document earlier. Checkers
-					// only run for client-managed documents, so no checker stage is
-					// needed to reproduce the published superset.
+					// normally run only for client-managed documents, but a cache URI
+					// document closed in the editor keeps its checker diagnostics
+					// published (see `onDidCloseOnce`), so reproduce that superset
+					// with the flush-free check path (flushing here would await this
+					// drain from inside itself).
 					await this.bind(doc, node)
-					this.lint(doc, node)
+					if (this.#checkedCacheDocUris.has(uri)) {
+						await this.checkWithoutLintFlush(doc, node)
+					} else {
+						this.lint(doc, node)
+					}
 					await this.emitAsync('documentUpdated', { doc, node })
 				}
 			}
@@ -1373,6 +1417,7 @@ export class Project extends EventDispatcher<{
 		bindProfiler: Profiler,
 		diagnostics: ProjectDiagnosticsEvent[] | undefined,
 		propagateProcessorErrors: boolean,
+		publishedUris: Set<string>,
 	): Promise<void> {
 		uri = this.normalizeUri(uri)
 		if (this.#symbolUpToDateUris.has(uri) || this.#bindingInProgressUris.has(uri)) {
@@ -1400,6 +1445,7 @@ export class Project extends EventDispatcher<{
 				// Initial scans have no rollback boundary, so preserve per-file streaming and let the
 				// document/AST become collectible before processing the next file.
 				await this.emitAsync('documentUpdated', { doc, node })
+				publishedUris.add(uri)
 			}
 		} finally {
 			this.#bindingInProgressUris.delete(uri)
@@ -1473,6 +1519,10 @@ export class Project extends EventDispatcher<{
 		const doc = TextDocument.create(uri, languageID, version, content)
 		const node = this.parse(doc)
 		this.#clientManagedUris.add(uri)
+		// While the document is client-managed its diagnostics are maintained
+		// through the client path; the closed-document marker is re-added by
+		// `onDidCloseOnce` when applicable.
+		this.#checkedCacheDocUris.delete(uri)
 		this.#clientManagedDocAndNodes.set(uri, { doc, node })
 		this.#clientManagedUriMap.delete(uri)
 		this.#clientManagedUriMap.set(uri, clientUri)
@@ -1552,6 +1602,9 @@ export class Project extends EventDispatcher<{
 				const node = this.parse(doc)
 				await this.bind(doc, node)
 				await this.check(doc, node)
+				// The published diagnostics for this closed document now include
+				// checker results; implicit lint passes must keep that superset.
+				this.#checkedCacheDocUris.add(uri)
 				restored = { doc, node }
 			} else {
 				// Reading the archive source failed; stale client contributions must not survive.

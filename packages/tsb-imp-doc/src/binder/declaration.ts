@@ -116,9 +116,13 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 
 		// desc は (uri, range) 辞書順先頭の declaration entry が担う (= 再解析で
 		// 非決定的に変わることを防ぐ、 canonical 1 本時代からの determinism 維持)。
-		const first = getImpDocSymbolData(symbol.data)?.declarations?.[0]
+		// ただし function header が生きている間 (`headerUri` あり) は header 側
+		// desc が優先。 bind 順序依存の last-bind-wins を避ける。
+		const data = getImpDocSymbolData(symbol.data)
+		const first = data?.declarations?.[0]
 		if (
-			first
+			data?.headerUri === undefined
+			&& first
 			&& first.uri === candidate.uri
 			&& first.range.start === candidate.range.start
 			&& first.range.end === candidate.range.end
