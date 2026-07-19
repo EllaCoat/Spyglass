@@ -13,6 +13,7 @@ import { registerContractSignatureHelpProvider } from './signatureHelp/contract.
 
 export { bindContract, cloneContract, stampContract } from './binder/contract.js'
 export * from './cachePolicy.js'
+export * from './legacy/categories.js'
 export { getContractCheckSeverity, type ImpDocContractCheckSeverity } from './linter/contract.js'
 export * from './node/ImpDocNode.js'
 export * from './parser/impDoc.js'

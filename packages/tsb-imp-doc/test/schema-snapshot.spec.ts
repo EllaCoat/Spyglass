@@ -70,13 +70,23 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 				undefined,
 				EmptyContract,
 			),
+			internal: stamp(
+				{ type: 'internal', owner: 'example:owner' },
+				undefined,
+				EmptyContract,
+			),
+			denied: stamp(
+				{ type: 'denied', owner: 'example:owner' },
+				undefined,
+				EmptyContract,
+			),
 			withinDeclaration: stamp({
 				type: 'within',
 				owner: 'example:owner',
 				patterns: [{
 					raw: 'example:allowed/**',
 					targetType: 'function',
-					regex: '^example:allowed/.*$',
+					regex: '^example:allowed/.{0,}$',
 				}],
 			}, declaration),
 			representativeContract: stamp(

@@ -44,6 +44,10 @@ function formatVisibility(visibility: ImpDocVisibility): string {
 			return 'public'
 		case 'private':
 			return `private (${visibility.owner})`
+		case 'internal':
+			return `internal (${visibility.owner})`
+		case 'denied':
+			return `denied (${visibility.owner})`
 		case 'within':
 			return `within ${visibility.patterns.map(pattern => pattern.raw).join(', ')}`
 	}

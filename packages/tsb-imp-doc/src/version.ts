@@ -3,4 +3,4 @@
  * CacheService can invalidate stale caches whenever plugin behaviour changes.
  * Bump whenever plugin output (binding / metadata / lint diagnostics) changes.
  */
-export const ImpDocVersion = '0.0.4-contract-semantics.0'
+export const ImpDocVersion = '0.0.5-visibility-parity.0'

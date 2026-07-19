@@ -106,8 +106,10 @@ export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => 
 		}
 
 		const target = ResourceLocationNode.toString(candidate, 'full')
-		const scope = visibility.type === 'private'
+		const scope = visibility.type === 'private' || visibility.type === 'denied'
 			? `private to “${visibility.owner}”`
+			: visibility.type === 'internal'
+			? `internal to the namespace of “${visibility.owner}”`
 			: `restricted by “${visibility.owner}”`
 
 		ctx.err.lint(

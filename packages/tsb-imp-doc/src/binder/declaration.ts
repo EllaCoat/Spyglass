@@ -5,7 +5,7 @@ import type {
 	ImpDocNode,
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { parseVisibility, stampVisibility } from '../util/withinPattern.js'
+import { fallbackVisibility, parseVisibility, stampVisibility } from '../util/withinPattern.js'
 
 function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
 	let parent = node.parent
@@ -93,7 +93,7 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 		}
 
 		const visibility = parseVisibility(doc.annotations, owner, ctx.err)
-			?? { type: 'public' as const }
+			?? fallbackVisibility(doc.annotations, owner, ctx.err)
 
 		doc.visibility = visibility
 

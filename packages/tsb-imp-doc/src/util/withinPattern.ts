@@ -2,6 +2,7 @@
 // 衝突するため alias で import する。
 import { StateProxy } from '@spyglassmc/core'
 import type { ErrorReporter, Symbol as CoreSymbol } from '@spyglassmc/core'
+import { isLegacyWithinTarget } from '../legacy/categories.js'
 import type {
 	ImpDocAnnotation,
 	ImpDocDeclarationSource,
@@ -70,13 +71,16 @@ function getCompiledPatternRegExp(pattern: WithinPattern): RegExp {
  */
 const PreparedFallback: unique symbol = Symbol('PreparedFallback')
 type PreparedRegExp = RegExp | undefined | typeof PreparedFallback
-interface PreparedVisibility {
-	function: PreparedRegExp
-	star: PreparedRegExp
-}
+type CallerTypeCache = Map<string, PreparedRegExp>
 const preparedVisibilityCache: WeakMap<
 	Extract<ImpDocVisibility, { type: 'within' }>,
-	PreparedVisibility
+	CallerTypeCache
+> = new WeakMap()
+
+type PreparedInternal = { owner: string; regexps: readonly RegExp[] }
+const preparedInternalCache: WeakMap<
+	Extract<ImpDocVisibility, { type: 'internal' }>,
+	PreparedInternal
 > = new WeakMap()
 
 // fallback 閾値。 実 workload の pattern source は 100 bytes 以下なので 10x 余裕の
@@ -125,28 +129,29 @@ function buildPreparedRegExp(
 	}
 }
 
-function prepareVisibility(
-	visibility: Extract<ImpDocVisibility, { type: 'within' }>,
-): PreparedVisibility {
-	return {
-		function: buildPreparedRegExp(visibility.patterns, 'function'),
-		star: buildPreparedRegExp(visibility.patterns, '*'),
-	}
-}
-
 /**
  * Legacy IMP-Doc の path pattern を anchored regex source に変換する。
- * `*` は `/` を跨がない、 `**` は `/` を跨ぐ、 その他 regex meta character は escape。
+ * v3 の置換順 (`?`, double-star + slash, `**`, `*`) を single-pass lookahead で再現する。
+ * separator は resource ID の namespace/path を区切る `:` と `/` の双方。
  */
 export function legacyGlobToRegex(pattern: string): string {
 	let ans = '^'
 	for (let i = 0; i < pattern.length; i++) {
 		const char = pattern[i]
-		if (char === '*' && pattern[i + 1] === '*') {
-			ans += '.*'
+		if (char === '?') {
+			ans += '[^:/]'
+		} else if (
+			char === '*'
+			&& pattern[i + 1] === '*'
+			&& pattern[i + 2] === '/'
+		) {
+			ans += '.{0,}'
+			i += 2
+		} else if (char === '*' && pattern[i + 1] === '*') {
+			ans += '.{0,}'
 			i++
 		} else if (char === '*') {
-			ans += '[^/]*'
+			ans += '[^:/]{0,}'
 		} else {
 			ans += RegexSpecials.has(char) ? `\\${char}` : char
 		}
@@ -172,7 +177,7 @@ function parseWithin(
 	const targetType: string = second ? first.raw : '*'
 	const raw = second?.raw ?? first.raw
 
-	if (targetType !== '*' && targetType !== 'function') {
+	if (!isLegacyWithinTarget(targetType)) {
 		err?.report(
 			`Unsupported @within target type "${targetType}"`,
 			first,
@@ -182,15 +187,75 @@ function parseWithin(
 
 	return {
 		raw,
-		targetType: targetType as WithinTargetType,
+		targetType,
 		regex: legacyGlobToRegex(raw),
 	}
 }
 
+const DefaultNamespace = 'minecraft'
+const DefaultNamespacePrefix = `${DefaultNamespace}:`
+const VisibilityAnnotationNames: ReadonlySet<string> = new Set([
+	'@within',
+	'@internal',
+	'@private',
+	'@public',
+	'@api',
+])
+
+function getNamespace(id: string): string {
+	const separator = id.indexOf(':')
+	return separator < 0 ? DefaultNamespace : id.slice(0, separator)
+}
+
+function getInternalPatternRaws(owner: string): string[] {
+	const namespace = getNamespace(owner)
+	return namespace === DefaultNamespace
+		? [`${namespace}:**`]
+		: [`${namespace}:**`, `${DefaultNamespace}:**`]
+}
+
+function getInternalWithinPatterns(owner: string): WithinPattern[] {
+	return getInternalPatternRaws(owner).map(raw => ({
+		raw,
+		targetType: '*',
+		regex: legacyGlobToRegex(raw),
+	}))
+}
+
+function findVisibilityAnnotation(
+	annotations: readonly ImpDocAnnotation[],
+): ImpDocValue | undefined {
+	return ImpDocNode.flattenAnnotations(annotations)
+		.find(values => VisibilityAnnotationNames.has(values[0]?.raw ?? ''))?.[0]
+}
+
+export function hasVisibilityAnnotation(
+	annotations: readonly ImpDocAnnotation[],
+): boolean {
+	return findVisibilityAnnotation(annotations) !== undefined
+}
+
+/** Apply the hybrid fail-closed default after `parseVisibility()` returns undefined. */
+export function fallbackVisibility(
+	annotations: readonly ImpDocAnnotation[],
+	owner: string,
+	err?: ErrorReporter,
+): ImpDocVisibility {
+	const annotation = findVisibilityAnnotation(annotations)
+	if (!annotation) {
+		return { type: 'public' }
+	}
+
+	err?.report(
+		'IMP-Doc visibility annotation is malformed; falling back to deny state',
+		annotation,
+	)
+	return { type: 'denied', owner }
+}
+
 /**
  * annotation 群から visibility を解析。 `@public` (と Legacy 別名 `@api`) が含まれれば
- * unrestricted。 `@private` と `@within` は OR で合成、 owner に自己参照 + patterns の
- * いずれかで許可。
+ * unrestricted。 `@private` / `@internal` / `@within` は Legacy 同様 OR で合成する。
  */
 export function parseVisibility(
 	annotations: readonly ImpDocAnnotation[],
@@ -199,6 +264,7 @@ export function parseVisibility(
 ): ImpDocVisibility | undefined {
 	let isPublic = false
 	let isPrivate = false
+	let isInternal = false
 	const patterns: WithinPattern[] = []
 
 	for (const values of ImpDocNode.flattenAnnotations(annotations)) {
@@ -209,6 +275,9 @@ export function parseVisibility(
 				break
 			case '@private':
 				isPrivate = true
+				break
+			case '@internal':
+				isInternal = true
 				break
 			case '@within': {
 				const pattern = parseWithin(values, err)
@@ -223,7 +292,7 @@ export function parseVisibility(
 	if (isPublic) {
 		return { type: 'public' }
 	}
-	if (!isPrivate && patterns.length === 0) {
+	if (!isPrivate && !isInternal && patterns.length === 0) {
 		return undefined
 	}
 	if (!owner) {
@@ -236,15 +305,50 @@ export function parseVisibility(
 		return undefined
 	}
 	if (patterns.length) {
-		return { type: 'within', owner, patterns }
+		return {
+			type: 'within',
+			owner,
+			patterns: isInternal
+				? [...getInternalWithinPatterns(owner), ...patterns]
+				: patterns,
+		}
+	}
+	if (isInternal) {
+		return { type: 'internal', owner }
 	}
 	return { type: 'private', owner }
 }
 
+export function toShortestString(id: string): string {
+	return id.startsWith(DefaultNamespacePrefix)
+		? id.slice(DefaultNamespacePrefix.length)
+		: id
+}
+
+function testCallerForms(regexp: RegExp, caller: string): boolean {
+	const shortest = toShortestString(caller)
+	return regexp.test(caller) || (shortest !== caller && regexp.test(shortest))
+}
+
+function getPreparedInternalRegExps(
+	visibility: Extract<ImpDocVisibility, { type: 'internal' }>,
+): readonly RegExp[] {
+	const key = StateProxy.dereference(visibility)
+	const cached = preparedInternalCache.get(key)
+	if (cached?.owner === key.owner) {
+		return cached.regexps
+	}
+	const regexps = getInternalPatternRaws(key.owner)
+		.map(raw => new RegExp(legacyGlobToRegex(raw)))
+	preparedInternalCache.set(key, { owner: key.owner, regexps })
+	return regexps
+}
+
 /**
  * caller (= function identifier) が visibility の許可条件を満たすか判定。
- * public / undefined は defensive に許可、 private は owner exact、 within は owner
- * OR patterns。 targetType が `*` なら caller の kind を問わず match。
+ * public / undefined は defensive に許可、 private / denied は owner exact、 internal
+ * は namespace patterns、 within は owner OR patterns。 targetType が `*` なら caller
+ * の kind を問わず match。
  * within の patterns は `preparedVisibilityCache` (Option B) の unified regex で 1 回の
  * `test()` に畳む。 fallback 発火時は `compiledPatternCache` (Option A) の per-pattern
  * 評価に降ろす。
@@ -259,7 +363,11 @@ export function matchesVisibility(
 		case 'public':
 			return true
 		case 'private':
+		case 'denied':
 			return caller === visibility.owner
+		case 'internal':
+			return getPreparedInternalRegExps(visibility)
+				.some(regexp => testCallerForms(regexp, caller))
 		case 'within': {
 			if (caller === visibility.owner) {
 				return true
@@ -267,12 +375,18 @@ export function matchesVisibility(
 			// linter は StateProxy 経由で visibility を渡すため handler ごとに identity が異なる。
 			// origin object を key に正規化しないと cache が hit しない (Terra 2 巡目 MUST)。
 			const key = StateProxy.dereference(visibility)
-			let prepared = preparedVisibilityCache.get(key)
-			if (!prepared) {
-				prepared = prepareVisibility(key)
-				preparedVisibilityCache.set(key, prepared)
+			let callerTypeCache = preparedVisibilityCache.get(key)
+			if (!callerTypeCache) {
+				callerTypeCache = new Map()
+				preparedVisibilityCache.set(key, callerTypeCache)
 			}
-			const compiled = callerType === 'function' ? prepared.function : prepared.star
+			let compiled: PreparedRegExp
+			if (callerTypeCache.has(callerType)) {
+				compiled = callerTypeCache.get(callerType)
+			} else {
+				compiled = buildPreparedRegExp(key.patterns, callerType)
+				callerTypeCache.set(callerType, compiled)
+			}
 			if (compiled === undefined) {
 				return false
 			}
@@ -280,10 +394,10 @@ export function matchesVisibility(
 				// fallback path も origin patterns を回す (per-pattern cache も identity dependent)。
 				return key.patterns.some(pattern =>
 					(pattern.targetType === '*' || pattern.targetType === callerType)
-					&& getCompiledPatternRegExp(pattern).test(caller)
+					&& testCallerForms(getCompiledPatternRegExp(pattern), caller)
 				)
 			}
-			return compiled.test(caller)
+			return testCallerForms(compiled, caller)
 		}
 	}
 }
@@ -300,7 +414,10 @@ export function visibilityRestrictions(
 		case 'public':
 			return undefined
 		case 'private':
+		case 'denied':
 			return [legacyGlobToRegex(visibility.owner)]
+		case 'internal':
+			return getInternalPatternRaws(visibility.owner).map(legacyGlobToRegex)
 		case 'within':
 			return [
 				legacyGlobToRegex(visibility.owner),
@@ -313,8 +430,8 @@ export function visibilityRestrictions(
 
 /**
  * symbol.data.impDoc に visibility metadata を stamp する。 public は
- * `privateOwner` を削除、 restricted は owner を反映。 declaration source を
- * 渡された場合 canonical location として保存。
+ * `privateOwner` を削除、 restricted は owner を反映 (`denied` は private 相当)。
+ * declaration source を渡された場合 canonical location として保存。
  */
 export function stampVisibility(
 	symbol: CoreSymbol,
