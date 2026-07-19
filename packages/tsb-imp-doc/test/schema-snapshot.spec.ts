@@ -57,6 +57,7 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 			uri: 'file:///fixture/_index.d.mcfunction',
 			range: { start: 10, end: 20 },
 			owner: 'example:owner',
+			description: 'Canonical declaration description',
 		}
 		const showcaseSource = await readFile(
 			new URL('./fixtures/12-contract-showcase.mcfunction', import.meta.url),

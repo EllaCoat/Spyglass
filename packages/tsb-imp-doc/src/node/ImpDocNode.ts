@@ -192,6 +192,8 @@ export interface ImpDocDeclarationSource {
 	uri: string
 	range: AstNode['range']
 	owner: string
+	/** Canonical hover text for this declaration source, retained across cache reloads. */
+	description?: string
 }
 
 /** One `#declare` site's visibility record (v3 `dcl` position parity). */

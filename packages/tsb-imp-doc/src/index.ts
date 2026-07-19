@@ -48,7 +48,7 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		bindDeclaration,
 	)
 	meta.registerUriSymbolClearer((uri, ctx) => {
-		clearDeclarationVisibilitiesForUri(ctx.symbols, uri)
+		clearDeclarationVisibilitiesForUri(ctx.symbols, uri, ctx.queueLint)
 	})
 	meta.registerChecker<ImpDocNode>('impDoc', checkImpDoc)
 	meta.registerChecker<ImpDocAliasNode>('impDoc:alias', checkAlias)

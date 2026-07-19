@@ -1,5 +1,5 @@
 {
-  "impDocVersion": "0.0.7-declaration-union.1",
+  "impDocVersion": "0.0.7-declaration-union.2",
   "alias": {
     "alias": {
       "kind": "selectorTemplate",
@@ -41,6 +41,7 @@
           "end": 20
         },
         "owner": "example:owner",
+        "description": "Canonical declaration description",
         "visibility": {
           "type": "within",
           "owner": "example:owner",
@@ -69,6 +70,7 @@
           "end": 20
         },
         "owner": "example:owner",
+        "description": "Canonical declaration description",
         "visibility": {
           "type": "private",
           "owner": "example:owner"

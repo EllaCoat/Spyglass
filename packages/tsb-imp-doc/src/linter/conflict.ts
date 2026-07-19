@@ -6,6 +6,7 @@ import type {
 	ImpDocVisibility,
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
+import { getCanonicalDeclarationOwnerUri } from '../util/withinPattern.js'
 
 export function conflictConfigValidator(
 	_ruleName: string,
@@ -104,25 +105,6 @@ function getConflictMessages(
 	return messages
 }
 
-/**
- * A function symbol's defining document is the canonical diagnostic owner. A
- * declaration-only symbol (storage, bossbar, or a headerless function) has no
- * such document, so the lexicographically first declaration entry owns it.
- */
-function getConflictOwnerUri(
-	symbol: CoreSymbol,
-	declarations: readonly ImpDocDeclarationVisibility[],
-): string | undefined {
-	if (symbol.category === 'function') {
-		const definitionUri = [...new Set(symbol.definition?.map(location => location.uri) ?? [])]
-			.sort()[0]
-		if (definitionUri) {
-			return definitionUri
-		}
-	}
-	return declarations[0]?.uri
-}
-
 function getConflictOwnerRange(
 	symbol: CoreSymbol,
 	declarations: readonly ImpDocDeclarationVisibility[],
@@ -169,13 +151,20 @@ export const visibilityConflict: Linter<AstNode> = (_node, ctx: LinterContext) =
 			continue
 		}
 		const declarations = getSortedDeclarations(data)
-		const ownerUri = getConflictOwnerUri(symbol, declarations)
+		const ownerUri = getCanonicalDeclarationOwnerUri(symbol, declarations)
+		const messages = getConflictMessages(symbol.identifier, data, declarations)
 		if (ownerUri !== ctx.doc.uri) {
+			// The owner can be unopened in an LSP session. Defer its lint until
+			// this document's bind/check has settled so the diagnostic remains
+			// canonical while still being published immediately.
+			if (ownerUri && messages.length > 0) {
+				ctx.queueLint?.(ownerUri)
+			}
 			continue
 		}
 
 		const range = getConflictOwnerRange(symbol, declarations, ownerUri)
-		for (const message of getConflictMessages(symbol.identifier, data, declarations)) {
+		for (const message of messages) {
 			ctx.err.lint(message, range)
 		}
 	}

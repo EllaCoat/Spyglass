@@ -225,6 +225,62 @@ describe('IMP-Doc declaration union runtime (P4-2b v3 parity)', () => {
 	})
 })
 
+describe('IMP-Doc conflict owner implicit lint', () => {
+	it('publishes and clears a canonical-owner warning while that owner remains unopened', async () => {
+		const projectRoot = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-conflict-project-'))
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-conflict-cache-'))
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Implicit conflict lint fixture"\n\t}\n}\n',
+			)
+			const ownerContent = '#> a:owner\n# @public\n\n'
+				+ '#> Canonical declaration\n# @public\n#declare storage shared:data\n'
+			const sideContent = '#> b:side\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:data\n'
+			const resolvedSideContent = '#> b:side\n# @public\n\n'
+				+ '#> Resolved declaration\n# @public\n#declare storage shared:data\n'
+			const owner = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/owner.mcfunction',
+				ownerContent,
+			)
+			const side = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/side.mcfunction',
+				sideContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher([pack.uri, owner.uri, side.uri]),
+			})
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+
+			await project.onDidOpen(side.uri, 'mcfunction', 1, sideContent)
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+			const warning = project.cacheService.errors[owner.uri] ?? []
+			assert.equal(warning.length, 1)
+			assert.equal(warning[0]?.severity, core.ErrorSeverity.Warning)
+			assert.match(warning[0]?.message ?? '', /impDocVisibilityConflict/)
+
+			await project.onDidChange(side.uri, [{ text: resolvedSideContent }], 2)
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+			assert.deepEqual(project.cacheService.errors[owner.uri] ?? [], [])
+		} finally {
+			await project?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
 describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 	it('removes the final declaration entries after their source document changes', async () => {
 		const projectRoot = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-union-project-'))
@@ -240,32 +296,28 @@ describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 			const source = await writeRuntimeFixtureFile(
 				projectRoot,
 				'data/a/functions/declarations.mcfunction',
-				'#> a:declarations\n# @public\n\n#> Visibility to remove\n# @private\n#declare function cache:target\n\n#> Conflict side to remove\n# @private\n#declare storage cache:conflict\n',
+				'#> a:declarations\n# @public\n\n#> Visibility to remove\n# @private\n#declare storage cache:target\n\n#> Conflict side to remove\n# @private\n#declare storage cache:conflict\n',
 			)
 			const retained = await writeRuntimeFixtureFile(
 				projectRoot,
 				'data/b/functions/declarations.mcfunction',
-				'#> b:declarations\n# @public\n\n#> Retained visibility\n# @within function b:**\n#declare function cache:target\n\n#> Retained conflict side\n# @public\n#declare storage cache:conflict\n',
-			)
-			const target = await writeRuntimeFixtureFile(
-				projectRoot,
-				'data/cache/functions/target.mcfunction',
-				'# Headerless target whose visibility comes from #declare entries.\n',
+				'#> b:declarations\n# @public\n\n#> Retained visibility\n# @within function b:**\n#declare storage cache:target\n\n#> Retained conflict side\n# @public\n#declare storage cache:conflict\n',
 			)
 			const projectRootUri = core.fileUtil.ensureEndingSlash(
 				core.normalizeUri(pathToFileURL(projectRoot).toString()),
 			)
-			const watchedUris = [pack.uri, source.uri, retained.uri, target.uri]
+			const watchedUris = [pack.uri, source.uri, retained.uri]
 
 			first = createRuntimeProject(cacheDir, projectRootUri)
 			await first.init()
 			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
-			const firstTarget = first.symbols.lookup('function', ['cache:target']).symbol
+			const firstTarget = first.symbols.lookup('storage', ['cache:target']).symbol
 			assert.ok(firstTarget)
 			assert.deepEqual(
 				getImpDocSymbolData(firstTarget.data)?.declarations?.map(entry => entry.uri),
 				[source.uri, retained.uri],
 			)
+			assert.match(firstTarget.desc ?? '', /Visibility to remove/)
 			await first.close()
 			first = undefined
 
@@ -278,7 +330,7 @@ describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 			await second.init()
 			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
 
-			const targetAfterReload = second.symbols.lookup('function', ['cache:target']).symbol
+			const targetAfterReload = second.symbols.lookup('storage', ['cache:target']).symbol
 			assert.ok(targetAfterReload)
 			const targetData = getImpDocSymbolData(targetAfterReload.data)
 			assert.deepEqual(
@@ -289,6 +341,8 @@ describe('IMP-Doc declaration URI purge across a warm cache reload', () => {
 			assert.equal(matchesAnyVisibility(targetData, 'b:caller'), true)
 			assert.equal(targetAfterReload.visibility, 3)
 			assert.deepEqual(targetAfterReload.visibilityRestriction, ['^b:.{0,}$'])
+			assert.match(targetAfterReload.desc ?? '', /Retained visibility/)
+			assert.doesNotMatch(targetAfterReload.desc ?? '', /Visibility to remove/)
 
 			const conflictAfterReload = second.symbols.lookup('storage', ['cache:conflict']).symbol
 			assert.ok(conflictAfterReload)

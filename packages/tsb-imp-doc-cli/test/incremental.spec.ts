@@ -734,3 +734,72 @@ describe('manifest exports multi-usage characterization', () => {
 		])
 	})
 })
+
+describe('incremental declaration visibility URI purge', () => {
+	let cachePath: string
+	let projectDir: string
+	let declarationFile: string
+
+	beforeEach(async () => {
+		projectDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-cli-'))
+		const declarationDir = join(projectDir, 'data', 'example', 'functions')
+		const targetDir = join(projectDir, 'data', 'cache', 'functions')
+		await Promise.all([
+			mkdir(declarationDir, { recursive: true }),
+			mkdir(targetDir, { recursive: true }),
+		])
+		cachePath = join(projectDir, '.tsb-lint-cache.json')
+		declarationFile = join(declarationDir, 'declarations.mcfunction')
+		await Promise.all([
+			writeFile(
+				declarationFile,
+				'#> example:declarations\n# @public\n\n'
+					+ '#> Visibility to remove\n# @private\n#declare function cache:target\n',
+			),
+			writeFile(join(targetDir, 'target.mcfunction'), 'say target\n'),
+		])
+	})
+
+	afterEach(async () => {
+		await rm(projectDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+	})
+
+	async function run() {
+		return runImpDocLint(await scanMcfunctionFiles(projectDir), {
+			targetDir: projectDir,
+			parallel: 2,
+			cachePath,
+		})
+	}
+
+	interface CachedTargetSymbol {
+		data?: { impDoc?: { declarations?: { uri: string }[] } }
+	}
+
+	async function cachedTarget(): Promise<CachedTargetSymbol | undefined> {
+		const cache = JSON.parse(await readFile(cachePath, 'utf8')) as {
+			symbols: { function?: Record<string, CachedTargetSymbol | undefined> }
+		}
+		return cache.symbols.function?.['cache:target']
+	}
+
+	it('purges removed #declare metadata on a warm cache reload', async () => {
+		const cold = await run()
+		assert.equal(cold.fullScan, true)
+		assert.deepEqual(
+			(await cachedTarget())?.data?.impDoc?.declarations?.map(entry => entry.uri),
+			[
+				pathToFileURL(declarationFile).toString(),
+			],
+		)
+
+		await writeFile(
+			declarationFile,
+			'#> example:declarations\n# @public\n\n# All #declare directives were removed.\n',
+		)
+		const warm = await run()
+		assert.equal(warm.fullScan, false)
+		assert.ok(await cachedTarget())
+		assert.equal((await cachedTarget())?.data?.impDoc?.declarations, undefined)
+	})
+})

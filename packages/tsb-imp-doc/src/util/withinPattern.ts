@@ -494,6 +494,25 @@ export function compareDeclarationSource(
 }
 
 /**
+ * The canonical document for metadata that belongs to one declaration union.
+ * Functions prefer their defining document; declaration-only symbols use the
+ * first declaration source in the already-sorted union.
+ */
+export function getCanonicalDeclarationOwnerUri(
+	symbol: CoreSymbol,
+	declarations: readonly ImpDocDeclarationVisibility[],
+): string | undefined {
+	if (symbol.category === 'function') {
+		const definitionUri = [...new Set(symbol.definition?.map(location => location.uri) ?? [])]
+			.sort()[0]
+		if (definitionUri) {
+			return definitionUri
+		}
+	}
+	return declarations[0]?.uri
+}
+
+/**
  * v3 union parity: 同一 symbol の visibility は「definition (= function header)
  * 1 本 + declaration (= #declare) 位置ごとの list」 を全て列挙する。 参照可否は
  * この entry 群の OR で判定する (legacy-v3 `ClientCache.getCacheForID` の
@@ -600,11 +619,21 @@ export function clearDeclarationVisibilities(
 	}
 
 	const impDoc: ImpDocSymbolData = { ...previous }
-	const remaining = previous.declarations.filter(entry => entry.uri !== uri)
+	const declarations = [...previous.declarations].sort(compareDeclarationSource)
+	const removedCanonical = declarations[0]?.uri === uri
+	const remaining = declarations.filter(entry => entry.uri !== uri)
 	if (remaining.length) {
 		impDoc.declarations = remaining
 	} else {
 		delete impDoc.declarations
+	}
+	if (removedCanonical) {
+		const description = remaining[0]?.description
+		if (description === undefined) {
+			delete symbol.desc
+		} else {
+			symbol.desc = description
+		}
 	}
 	// derived shortcut は一旦落とす (restricted entry が残れば refresh が再設定)。
 	delete impDoc.privateOwner
@@ -631,6 +660,7 @@ export function clearDeclarationVisibilities(
 export function clearDeclarationVisibilitiesForUri(
 	symbols: SymbolUtil,
 	uri: string,
+	queueLint?: (this: void, uri: string) => void,
 ): void {
 	const index = getDeclarationVisibilityIndex(symbols)
 	const affected = index.get(uri)
@@ -642,7 +672,20 @@ export function clearDeclarationVisibilitiesForUri(
 	// `trackDeclarationVisibility`, while a fully removed URI stays absent.
 	index.delete(uri)
 	for (const symbol of affected) {
+		const before = getImpDocSymbolData(symbol.data)
+		const beforeDeclarations = [...before?.declarations ?? []]
+			.sort(compareDeclarationSource)
+		const previousOwner = getCanonicalDeclarationOwnerUri(symbol, beforeDeclarations)
 		clearDeclarationVisibilities(symbol, uri)
+		const after = getImpDocSymbolData(symbol.data)
+		const afterDeclarations = [...after?.declarations ?? []]
+			.sort(compareDeclarationSource)
+		const nextOwner = getCanonicalDeclarationOwnerUri(symbol, afterDeclarations)
+		for (const ownerUri of new Set([previousOwner, nextOwner])) {
+			if (ownerUri) {
+				queueLint?.(ownerUri)
+			}
+		}
 	}
 }
 

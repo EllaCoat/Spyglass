@@ -82,6 +82,7 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			uri: ctx.doc.uri,
 			range: node.name.range,
 			owner,
+			description: ImpDocNodeUtil.getDescription(doc),
 		}
 
 		ctx.symbols.query(
@@ -121,9 +122,8 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			&& first.uri === candidate.uri
 			&& first.range.start === candidate.range.start
 			&& first.range.end === candidate.range.end
-			&& core.Range.containsRange(doc.range, node.range)
 		) {
-			symbol.desc = ImpDocNodeUtil.getDescription(doc)
+			symbol.desc = candidate.description
 		}
 
 		// core の getDeclaredLocation() が同じ canonical を返すよう整列。

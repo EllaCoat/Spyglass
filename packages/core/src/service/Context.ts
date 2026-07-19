@@ -146,11 +146,18 @@ export namespace CheckerContext {
 
 export interface LinterContext extends ProcessorContext {
 	err: LinterErrorReporter
+	/**
+	 * Queue a supported document for an implicit lint pass after the current
+	 * document has completed processing. The target does not become
+	 * client-managed.
+	 */
+	queueLint?: (this: void, uri: string) => void
 	ruleName: string
 	ruleValue: unknown
 }
 interface LinterContextOptions extends ProcessorContextOptions {
 	err: LinterErrorReporter
+	queueLint?: (this: void, uri: string) => void
 	ruleName: string
 	ruleValue: unknown
 }
@@ -159,6 +166,7 @@ export namespace LinterContext {
 		return {
 			...ProcessorContext.create(project, opts),
 			err: opts.err,
+			queueLint: opts.queueLint,
 			ruleName: opts.ruleName,
 			ruleValue: opts.ruleValue,
 		}
@@ -242,11 +250,24 @@ export namespace SignatureHelpProviderContext {
 
 export interface UriBinderContext extends ContextBase {
 	config: Config
+	/** See {@link LinterContext.queueLint}. */
+	queueLint?: (this: void, uri: string) => void
 	symbols: SymbolUtil
 }
+interface UriBinderContextOptions {
+	queueLint?: (this: void, uri: string) => void
+}
 export namespace UriBinderContext {
-	export function create(project: ProjectData): UriBinderContext {
-		return { ...ContextBase.create(project), config: project.config, symbols: project.symbols }
+	export function create(
+		project: ProjectData,
+		opts: UriBinderContextOptions = {},
+	): UriBinderContext {
+		return {
+			...ContextBase.create(project),
+			config: project.config,
+			queueLint: opts.queueLint,
+			symbols: project.symbols,
+		}
 	}
 }
 

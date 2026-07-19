@@ -202,6 +202,8 @@ export class Project extends EventDispatcher<{
 	readonly #clientManagedUriMap = new TwoWayMap<string, string>()
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
+	readonly #queuedLintUris = new Set<string>()
+	#queuedLintFlushPromise: Promise<void> | undefined
 	readonly #initializers: readonly ProjectInitializer[]
 	#reinitializationPredicates = new Set<ProjectChangePredicate>()
 	#reinitializationGeneration = 0
@@ -387,6 +389,7 @@ export class Project extends EventDispatcher<{
 				if (this.isOnlyWatched(uri)) {
 					await this.ensureBindingStarted(uri)
 				}
+				await this.flushQueuedLints()
 			}
 			if (this.shouldReinitializeFor(uri)) {
 				this.requestReinitialization(uri, process)
@@ -394,13 +397,14 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
-			const process = () => {
+			const process = async () => {
 				if (uri.endsWith(Project.RootSuffix)) {
 					this.updateRoots()
 				}
 				this.#symbolUpToDateUris.delete(uri)
 				this.clearUriSymbolLocations(uri)
 				this.tryClearingCache(uri)
+				await this.flushQueuedLints()
 			}
 			if (this.shouldReinitializeFor(uri)) {
 				this.requestReinitialization(uri, process)
@@ -845,6 +849,7 @@ export class Project extends EventDispatcher<{
 
 		await this.rebindAndCheckClientManaged(propagateProcessorErrors)
 		this.#isReady = true
+		await this.flushQueuedLints()
 		__profiler.finalize()
 		if (shouldPublishEvents) {
 			await this.publishRebuildEvents(stagedDiagnostics)
@@ -1212,6 +1217,7 @@ export class Project extends EventDispatcher<{
 				this.lint(doc, node)
 				__lintProfiler.task(doc.uri)
 			})
+			await this.flushQueuedLints()
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
 			if (propagateErrors) {
@@ -1248,6 +1254,7 @@ export class Project extends EventDispatcher<{
 				const ctx = LinterContext.create(this, {
 					doc,
 					err: new LinterErrorReporter(ruleName, ruleSeverity, this.ctx['errorSource']),
+					queueLint: uri => this.queueLint(uri),
 					ruleName,
 					ruleValue,
 				})
@@ -1262,6 +1269,66 @@ export class Project extends EventDispatcher<{
 			}
 		} catch (e) {
 			this.logger.error(`[Project] [lint] Failed for ${doc.uri} # ${doc.version}`, e)
+		}
+	}
+
+	/** Queue a non-client-managed document for a post-processing lint pass. */
+	private queueLint(uri: string): void {
+		this.#queuedLintUris.add(this.normalizeUri(uri))
+	}
+
+	/**
+	 * Lint documents requested by processors without retaining them as
+	 * client-managed editor documents. A single drain deduplicates cycles among
+	 * cross-document lint rules and republishes the target's diagnostics.
+	 */
+	private async flushQueuedLints(): Promise<void> {
+		if (!this.#isReady || this.#queuedLintUris.size === 0) {
+			return
+		}
+		if (this.#queuedLintFlushPromise) {
+			await this.#queuedLintFlushPromise
+			return
+		}
+
+		const drain = async () => {
+			const processed = new Set<string>()
+			while (this.#queuedLintUris.size > 0) {
+				const uris = [...this.#queuedLintUris]
+				this.#queuedLintUris.clear()
+				for (const uri of uris) {
+					if (processed.has(uri)) {
+						continue
+					}
+					processed.add(uri)
+
+					const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+					if (clientManaged) {
+						delete clientManaged.node.linterErrors
+						this.lint(clientManaged.doc, clientManaged.node)
+						await this.emitAsync('documentUpdated', clientManaged)
+						continue
+					}
+
+					const doc = await this.read(uri)
+					if (!doc) {
+						await this.emitAsync('documentErrored', { errors: [], uri })
+						continue
+					}
+					const node = this.parse(doc)
+					this.lint(doc, node)
+					await this.emitAsync('documentUpdated', { doc, node })
+				}
+			}
+		}
+		const promise = drain()
+		this.#queuedLintFlushPromise = promise
+		try {
+			await promise
+		} finally {
+			if (this.#queuedLintFlushPromise === promise) {
+				this.#queuedLintFlushPromise = undefined
+			}
 		}
 	}
 
@@ -1354,7 +1421,9 @@ export class Project extends EventDispatcher<{
 		uri: string,
 		contributor: 'binder' | undefined = undefined,
 	): void {
-		const ctx = UriBinderContext.create(this)
+		const ctx = UriBinderContext.create(this, {
+			queueLint: target => this.queueLint(target),
+		})
 		for (const clearer of this.meta.uriSymbolClearers) {
 			clearer(uri, ctx)
 		}
@@ -1482,6 +1551,7 @@ export class Project extends EventDispatcher<{
 			this.emit('documentUpdated', restored)
 		}
 		this.tryClearingCache(uri)
+		await this.flushQueuedLints()
 	}
 
 	@SingletonPromise()
