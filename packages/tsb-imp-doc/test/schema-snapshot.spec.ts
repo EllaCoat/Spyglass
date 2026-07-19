@@ -100,6 +100,16 @@ describe('Symbol.data.impDoc schema snapshot', () => {
 					regex: '^example:allowed/.{0,}$',
 				}],
 			}, declaration),
+			union: (() => {
+				const symbol = emptySymbol()
+				stampVisibility(symbol, { type: 'public' })
+				stampVisibility(
+					symbol,
+					{ type: 'private', owner: 'example:owner' },
+					declaration,
+				)
+				return getImpDocSymbolData(symbol.data)
+			})(),
 			representativeContract: stamp(
 				{ type: 'public' },
 				undefined,

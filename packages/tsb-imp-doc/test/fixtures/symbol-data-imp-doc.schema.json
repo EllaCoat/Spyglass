@@ -1,5 +1,5 @@
 {
-  "impDocVersion": "0.0.6-declaration-parity.2",
+  "impDocVersion": "0.0.7-declaration-union.0",
   "alias": {
     "alias": {
       "kind": "selectorTemplate",
@@ -33,27 +33,48 @@
     "privateOwner": "example:owner"
   },
   "withinDeclaration": {
-    "visibility": {
-      "type": "within",
-      "owner": "example:owner",
-      "includeOwner": true,
-      "patterns": [
-        {
-          "raw": "example:allowed/**",
-          "targetType": "function",
-          "regex": "^example:allowed/.{0,}$"
+    "declarations": [
+      {
+        "uri": "file:///fixture/_index.d.mcfunction",
+        "range": {
+          "start": 10,
+          "end": 20
+        },
+        "owner": "example:owner",
+        "visibility": {
+          "type": "within",
+          "owner": "example:owner",
+          "includeOwner": true,
+          "patterns": [
+            {
+              "raw": "example:allowed/**",
+              "targetType": "function",
+              "regex": "^example:allowed/.{0,}$"
+            }
+          ]
         }
-      ]
-    },
-    "declaration": {
-      "uri": "file:///fixture/_index.d.mcfunction",
-      "range": {
-        "start": 10,
-        "end": 20
-      },
-      "owner": "example:owner"
-    },
+      }
+    ],
     "privateOwner": "example:owner"
+  },
+  "union": {
+    "visibility": {
+      "type": "public"
+    },
+    "declarations": [
+      {
+        "uri": "file:///fixture/_index.d.mcfunction",
+        "range": {
+          "start": 10,
+          "end": 20
+        },
+        "owner": "example:owner",
+        "visibility": {
+          "type": "private",
+          "owner": "example:owner"
+        }
+      }
+    ]
   },
   "representativeContract": {
     "visibility": {
