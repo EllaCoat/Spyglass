@@ -35,7 +35,7 @@ function visit(node: AstNode, fn: (node: AstNode) => void): void {
  * surface through the resolved-symbol diagnostics.
  */
 export const privateBestEffortVisibility: Linter<AstNode> = (node, ctx: LinterContext) => {
-	const caller = getCaller(ctx)
+	const caller = getCaller(ctx, node)
 
 	visit(node as StateProxy<AstNode>, (candidate) => {
 		if (!ResourceLocationNode.is(candidate) || candidate.options.category !== 'function') {

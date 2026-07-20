@@ -200,4 +200,73 @@ describe('runner best-effort reference provenance', () => {
 		assert.equal(markers.length, 1)
 		assert.equal(getRefProvenance(markers[0]!), 'dynamic-pattern')
 	})
+
+	it('uses the document header before a lexically earlier caller-local #declare', async () => {
+		const caller = join(
+			projectDir,
+			'data',
+			'core',
+			'functions',
+			'migration',
+			'v1.0.1',
+			'.mcfunction',
+		)
+		const common = join(
+			projectDir,
+			'data',
+			'core',
+			'functions',
+			'migration',
+			'common',
+			'.mcfunction',
+		)
+		const update = join(
+			projectDir,
+			'data',
+			'am',
+			'functions',
+			'isle',
+			'upd',
+			'.mcfunction',
+		)
+		await Promise.all([
+			mkdir(join(caller, '..'), { recursive: true }),
+			mkdir(join(common, '..'), { recursive: true }),
+			mkdir(join(update, '..'), { recursive: true }),
+		])
+		await Promise.all([
+			writeFile(
+				caller,
+				'#> core:migration/v1.0.1/\n#\n#\n#\n'
+					+ '# @within function core:migration/\n\n'
+					+ '#> Common Migration\n'
+					+ '    function core:migration/common/\n\n'
+					+ '#> from: https://example.com/b\n'
+					+ '# @private\n'
+					+ '#declare function am:isle/upd/\n'
+					+ 'function am:isle/upd/\n',
+			),
+			writeFile(
+				common,
+				'#> core:migration/common/\n#\n# @within function core:migration/*/\n',
+			),
+			writeFile(
+				update,
+				'#> am:isle/upd/\n#\n# @within function am:isle/ok\n',
+			),
+		])
+
+		const cold = await run()
+		assert.deepEqual(
+			cold.diagnostics.filter(diagnostic => diagnostic.file === caller),
+			[],
+		)
+
+		const warm = await run()
+		assert.equal(warm.cacheHit, true)
+		assert.deepEqual(
+			warm.diagnostics.filter(diagnostic => diagnostic.file === caller),
+			[],
+		)
+	})
 })

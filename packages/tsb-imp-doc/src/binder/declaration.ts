@@ -5,6 +5,7 @@ import type {
 	ImpDocNode,
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
+import { getDocumentFunction } from '../util/documentFunction.js'
 import {
 	fallbackVisibility,
 	parseVisibility,
@@ -27,30 +28,15 @@ const ownerCache = new WeakMap<core.BinderContext, { value: string | undefined }
 
 function ownerForDocument(
 	ctx: core.BinderContext,
+	node: core.AstNode,
 ): string | undefined {
 	const cached = ownerCache.get(ctx)
 	if (cached) {
 		return cached.value
 	}
-	const functions = ctx.symbols.lookup('function', []).parentMap
-	let declaredOwner: string | undefined
-	for (const symbol of Object.values(functions ?? {})) {
-		if (!symbol) {
-			continue
-		}
-		if (symbol.definition?.some(location => location.uri === ctx.doc.uri)) {
-			ownerCache.set(ctx, { value: symbol.identifier })
-			return symbol.identifier
-		}
-		if (
-			declaredOwner === undefined
-			&& symbol.declaration?.some(location => location.uri === ctx.doc.uri)
-		) {
-			declaredOwner = symbol.identifier
-		}
-	}
-	ownerCache.set(ctx, { value: declaredOwner })
-	return declaredOwner
+	const owner = getDocumentFunction(ctx, node)?.identifier
+	ownerCache.set(ctx, { value: owner })
+	return owner
 }
 
 export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
@@ -61,7 +47,7 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			return
 		}
 
-		const owner = ownerForDocument(ctx)
+		const owner = ownerForDocument(ctx, node)
 			?? (doc.functionID?.raw
 				? core.ResourceLocation.lengthen(doc.functionID.raw)
 				: undefined)
