@@ -1,5 +1,7 @@
 import type { AstNode, Symbol, SymbolUtil } from '@spyglassmc/core'
 import { ResourceLocation } from '@spyglassmc/core'
+import type { LegacyFileTypeId } from '../legacy/categories.js'
+import { isLegacyFileType } from '../legacy/categories.js'
 import { getImpDocSymbolData, ImpDocNode } from '../node/ImpDocNode.js'
 
 interface DocumentFunctionContext {
@@ -98,4 +100,68 @@ export function getDocumentFunction(
 		?? selectInSymbolMapOrder(ctx, headerMatches)
 		?? selectInSymbolMapOrder(ctx, trackedHeaderMatches)
 		?? selectInSymbolMapOrder(ctx, declarations)
+}
+
+/**
+ * The resource a document represents, generalized over v3's caller notion of
+ * the current document's `{fileType, resourceID}`. `fileType` is always one of
+ * the 47 legacy file types and doubles as the `@within` caller type.
+ */
+export interface DocumentResource {
+	readonly fileType: LegacyFileTypeId
+	readonly resourceID: string
+}
+
+/** All candidates must agree on one resource; ambiguity fails closed. */
+function selectUnambiguousResource(
+	candidates: readonly DocumentResource[],
+): DocumentResource | undefined {
+	const first = candidates[0]
+	if (!first) {
+		return undefined
+	}
+	const ambiguous = candidates.some(candidate =>
+		candidate.fileType !== first.fileType
+		|| candidate.resourceID !== first.resourceID
+	)
+	return ambiguous ? undefined : first
+}
+
+/**
+ * Resolves the resource defined by a document. Function documents keep the
+ * full {@link getDocumentFunction} priority chain (CLI compatibility included);
+ * any other document resolves through the URI reverse index to the non-function
+ * legacy file-type symbol bound at this URI (JSON / worldgen / tag files).
+ * Definitions take priority over declarations; a document that resolves to
+ * several distinct resources fails closed instead of guessing.
+ */
+export function getDocumentResource(
+	ctx: DocumentFunctionContext,
+	node?: AstNode,
+): DocumentResource | undefined {
+	const functionSymbol = getDocumentFunction(ctx, node)
+	if (functionSymbol) {
+		return { fileType: 'function', resourceID: functionSymbol.identifier }
+	}
+
+	const uri = ctx.doc.uri
+	const definitions: DocumentResource[] = []
+	const declarations: DocumentResource[] = []
+	for (const symbol of ctx.symbols.getSymbolCandidatesAtUri(uri)) {
+		if (
+			symbol.category === 'function'
+			|| symbol.path.length !== 1
+			|| !isLegacyFileType(symbol.category)
+		) {
+			continue
+		}
+		if (symbol.definition?.some(location => location.uri === uri)) {
+			definitions.push({ fileType: symbol.category, resourceID: symbol.identifier })
+		} else if (symbol.declaration?.some(location => location.uri === uri)) {
+			declarations.push({ fileType: symbol.category, resourceID: symbol.identifier })
+		}
+	}
+	return definitions.length > 0
+		? selectUnambiguousResource(definitions)
+		: selectUnambiguousResource(declarations)
 }

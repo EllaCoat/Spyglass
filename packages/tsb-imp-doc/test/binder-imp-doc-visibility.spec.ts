@@ -40,7 +40,9 @@ async function bindHeader(
 	await bindImpDoc(node, {
 		doc: { uri: Uri },
 		err,
-		meta: { hasBinder: () => false },
+		// Child dispatch always resolves a binder now (unregistered types fall
+		// back); a sync no-op keeps this harness header-only.
+		meta: { getBinder: () => () => {} },
 		symbols,
 	} as unknown as core.BinderContext)
 	const symbol = symbols.lookup('function', [symbolID]).symbol

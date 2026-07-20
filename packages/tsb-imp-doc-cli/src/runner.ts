@@ -182,54 +182,11 @@ function runnerError(file: string, error: unknown): LintDiagnostic {
 	}
 }
 
-function parseResourceLocation(
-	raw: string,
-	range: core.Range,
-): core.ResourceLocationNode {
-	const isTag = raw.startsWith('#')
-	const id = isTag ? raw.slice(1) : raw
-	const separator = id.indexOf(':')
-	const namespace = separator >= 0 ? id.slice(0, separator) : undefined
-	const path = id.slice(separator + 1).split('/')
-	return {
-		type: 'resource_location',
-		range,
-		namespace,
-		path,
-		isTag,
-		options: {
-			category: 'function',
-			allowTag: true,
-			usageType: 'reference',
-		},
-	}
-}
-
-/**
- * Naive single-line scan that reports whether `index` sits inside an unclosed
- * `'` / `"` quote. Backslash escapes are honoured; any nested structure beyond
- * that is irrelevant for provenance classification.
- */
-function isInsideQuote(line: string, index: number): boolean {
-	let quote: string | undefined
-	for (let i = 0; i < index; i++) {
-		const char = line[i]
-		if (quote === undefined) {
-			if (char === '"' || char === "'") {
-				quote = char
-			}
-		} else if (char === '\\') {
-			i++
-		} else if (char === quote) {
-			quote = undefined
-		}
-	}
-	return quote !== undefined
-}
-
 /**
  * Minimal base parser for the CI vertical slice. The IMP-Doc initializer wraps this parser and
  * replaces the emitted legacy comment nodes with its own ImpDocNode implementation.
+ * Reference extraction and provenance classification live in the shared
+ * line-level scanner (`@spyglassmc/tsb-imp-doc` `scanLineFunctionRefs`).
  */
 export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 	const children: core.AstNode[] = []
@@ -243,12 +200,8 @@ export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 			})
 		} else {
 			const isMacroLine = line[leadingSpace] === '$'
-			const dynamicPattern = /\bfunction[\t ]+#?\$\([^\s)]*\)?/g
-			for (const match of line.matchAll(dynamicPattern)) {
-				const range = core.Range.create(
-					offset + match.index,
-					offset + match.index + match[0].length,
-				)
+			const scan = impDoc.scanLineFunctionRefs(line, offset, isMacroLine)
+			for (const range of scan.dynamicRanges) {
 				// A fully dynamic target can never be resolved statically, so it
 				// stays best-effort: a warning plus a provenance-tagged marker
 				// node instead of a hard error.
@@ -261,33 +214,7 @@ export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				impDoc.setRefProvenance(marker, 'dynamic-pattern')
 				children.push(marker)
 			}
-
-			const referencePattern =
-				/\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
-			for (const match of line.matchAll(referencePattern)) {
-				const raw = match[1]
-				// A `$(` in the same resource-location token means the actual target
-				// is completed by a macro substitution at runtime; the prefix alone
-				// would be a spurious reference, so no node is emitted for it.
-				const suffix = line.slice(match.index + match[0].length)
-				if (/^[A-Za-z0-9_./:-]*\$\(/.test(suffix)) {
-					continue
-				}
-				const targetStart = offset + match.index + match[0].lastIndexOf(raw)
-				const ref = parseResourceLocation(
-					raw,
-					core.Range.create(targetStart, targetStart + raw.length),
-				)
-				// Macro lines are rewritten by substitution before execution and
-				// quoted payloads (usually SNBT) may never run as commands, so
-				// their references only get best-effort treatment.
-				if (isMacroLine) {
-					impDoc.setRefProvenance(ref, 'macro')
-				} else if (isInsideQuote(line, match.index)) {
-					impDoc.setRefProvenance(ref, 'nbt-string')
-				}
-				children.push(ref)
-			}
+			children.push(...scan.refs)
 		}
 		offset += line.length
 			+ (src.string.slice(offset + line.length, offset + line.length + 2) === '\r\n'
@@ -469,7 +396,9 @@ function discoverExportKeys(input: FileInput): string[] {
 		const category = match[1]!
 		const canonical = impDoc.canonicalizeLegacyDeclarationName(category, match[2]!)
 		if (canonical !== undefined) {
-			keys.add(toSymbolKey(category, [canonical]))
+			// Symbol table keys use the canonical (v4) category, so export keys
+			// must match it for the dependency graph to expand correctly.
+			keys.add(toSymbolKey(impDoc.getCanonicalSymbolCategory(category), [canonical]))
 		}
 	}
 	for (const match of input.content.matchAll(LegacyAliasExportPattern)) {
