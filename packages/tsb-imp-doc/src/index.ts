@@ -9,6 +9,10 @@ import { registerVisibilityCompleters } from './completer/visibility.js'
 import { conflictConfigValidator, visibilityConflict } from './linter/conflict.js'
 import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
 import { configValidator, privateVisibility } from './linter/private.js'
+import {
+	bestEffortConfigValidator,
+	privateBestEffortVisibility,
+} from './linter/privateBestEffort.js'
 import type { ImpDocAliasNode, ImpDocDeclarationNode, ImpDocNode } from './node/ImpDocNode.js'
 import { extendMcfunctionParser, impDoc } from './parser/impDoc.js'
 import { registerContractSignatureHelpProvider } from './signatureHelp/contract.js'
@@ -56,6 +60,11 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 	meta.registerLinter('impDocPrivate', {
 		configValidator,
 		linter: privateVisibility,
+		nodePredicate: node => node.type === 'file',
+	})
+	meta.registerLinter('impDocPrivateBestEffort', {
+		configValidator: bestEffortConfigValidator,
+		linter: privateBestEffortVisibility,
 		nodePredicate: node => node.type === 'file',
 	})
 	meta.registerLinter('impDocVisibilityConflict', {

@@ -25,7 +25,13 @@ import type { DiagnosticSeverity, LintDiagnostic } from './reporter.js'
 
 const CacheVersion = 2
 const ImpDocPrivateRule = 'impDocPrivate'
+const ImpDocPrivateBestEffortRule = 'impDocPrivateBestEffort'
 const UnresolvedRule = 'unresolved'
+/** Default severities applied unless the rule is configured in the overrides. */
+const DefaultLintSeverities: Readonly<Record<string, string>> = {
+	[ImpDocPrivateRule]: 'error',
+	[ImpDocPrivateBestEffortRule]: 'warning',
+}
 export const SerializeProfilerId = 'project#cache#serialize'
 export const SerializeManifestProfilerId = 'project#cache#serialize#manifest'
 const ExportUsageTypes = [
@@ -200,10 +206,32 @@ function parseResourceLocation(
 }
 
 /**
+ * Naive single-line scan that reports whether `index` sits inside an unclosed
+ * `'` / `"` quote. Backslash escapes are honoured; any nested structure beyond
+ * that is irrelevant for provenance classification.
+ */
+function isInsideQuote(line: string, index: number): boolean {
+	let quote: string | undefined
+	for (let i = 0; i < index; i++) {
+		const char = line[i]
+		if (quote === undefined) {
+			if (char === '"' || char === "'") {
+				quote = char
+			}
+		} else if (char === '\\') {
+			i++
+		} else if (char === quote) {
+			quote = undefined
+		}
+	}
+	return quote !== undefined
+}
+
+/**
  * Minimal base parser for the CI vertical slice. The IMP-Doc initializer wraps this parser and
  * replaces the emitted legacy comment nodes with its own ImpDocNode implementation.
  */
-const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
+export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 	const children: core.AstNode[] = []
 	let offset = 0
 	for (const line of src.string.split(/\r?\n/)) {
@@ -214,23 +242,51 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				range: core.Range.create(offset + leadingSpace, offset + line.length),
 			})
 		} else {
-			const dynamicPattern = /\bfunction[\t ]+\$\([^\s)]*\)?/g
+			const isMacroLine = line[leadingSpace] === '$'
+			const dynamicPattern = /\bfunction[\t ]+#?\$\([^\s)]*\)?/g
 			for (const match of line.matchAll(dynamicPattern)) {
+				const range = core.Range.create(
+					offset + match.index,
+					offset + match.index + match[0].length,
+				)
+				// A fully dynamic target can never be resolved statically, so it
+				// stays best-effort: a warning plus a provenance-tagged marker
+				// node instead of a hard error.
 				ctx.err.report(
 					'Unresolved dynamic function reference',
-					core.Range.create(offset + match.index, offset + match.index + match[0].length),
+					range,
+					core.ErrorSeverity.Warning,
 				)
+				const marker: core.AstNode = { type: 'tsb-imp-doc-cli:dynamic-ref', range }
+				impDoc.setRefProvenance(marker, 'dynamic-pattern')
+				children.push(marker)
 			}
 
 			const referencePattern =
 				/\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
 			for (const match of line.matchAll(referencePattern)) {
 				const raw = match[1]
+				// A `$(` in the same resource-location token means the actual target
+				// is completed by a macro substitution at runtime; the prefix alone
+				// would be a spurious reference, so no node is emitted for it.
+				const suffix = line.slice(match.index + match[0].length)
+				if (/^[A-Za-z0-9_./:-]*\$\(/.test(suffix)) {
+					continue
+				}
 				const targetStart = offset + match.index + match[0].lastIndexOf(raw)
-				children.push(parseResourceLocation(
+				const ref = parseResourceLocation(
 					raw,
 					core.Range.create(targetStart, targetStart + raw.length),
-				))
+				)
+				// Macro lines are rewritten by substitution before execution and
+				// quoted payloads (usually SNBT) may never run as commands, so
+				// their references only get best-effort treatment.
+				if (isMacroLine) {
+					impDoc.setRefProvenance(ref, 'macro')
+				} else if (isInsideQuote(line, match.index)) {
+					impDoc.setRefProvenance(ref, 'nbt-string')
+				}
+				children.push(ref)
 			}
 		}
 		offset += line.length
@@ -252,7 +308,7 @@ function createConfig(overrides: Record<string, unknown> | undefined): core.Conf
 		core.VanillaConfig,
 		{
 			env: { dependencies: [] },
-			lint: { [ImpDocPrivateRule]: 'error' },
+			lint: { ...DefaultLintSeverities },
 		},
 		overrides ?? {},
 	)
@@ -260,11 +316,13 @@ function createConfig(overrides: Record<string, unknown> | undefined): core.Conf
 	for (const rule of Object.keys(core.VanillaConfig.lint)) {
 		delete lint[rule]
 	}
-	if (
-		!(overrides?.['lint'] && typeof overrides['lint'] === 'object'
-			&& ImpDocPrivateRule in overrides['lint'])
-	) {
-		lint[ImpDocPrivateRule] = 'error'
+	for (const [rule, severity] of Object.entries(DefaultLintSeverities)) {
+		if (
+			!(overrides?.['lint'] && typeof overrides['lint'] === 'object'
+				&& rule in overrides['lint'])
+		) {
+			lint[rule] = severity
+		}
 	}
 	return config
 }
@@ -768,39 +826,49 @@ export async function runImpDocLint(
 	checkProfiler.finalize()
 
 	const lintConfig = config.lint as unknown as Record<string, unknown>
-	const lintValue = core.LinterConfigValue.destruct(
-		lintConfig[ImpDocPrivateRule] as Parameters<typeof core.LinterConfigValue.destruct>[0],
-	)
-	if (lintValue) {
-		const registration = meta.getLinter(ImpDocPrivateRule)
-		if (registration.configValidator(ImpDocPrivateRule, lintValue.ruleValue, logger)) {
-			const lintProfiler = projectData.profilers.get('project#lint', 'top-n', 50)
-			await core.mapLimit(states, options.parallel, async (state) => {
-				try {
-					const err = new core.LinterErrorReporter(
-						ImpDocPrivateRule,
-						lintValue.ruleSeverity,
-						projectData.ctx['errorSource'],
-					)
-					const ctx = core.LinterContext.create(projectData, {
-						doc: state.doc,
-						err,
-						ruleName: ImpDocPrivateRule,
-						ruleValue: lintValue.ruleValue,
-					})
-					core.traversePreOrder(
-						state.node,
-						() => true,
-						registration.nodePredicate,
-						(node) => registration.linter(core.StateProxy.create(node), ctx),
-					)
-					state.node.linterErrors = err.dump()
-				} finally {
-					lintProfiler.task(state.uri)
-				}
-			})
-			lintProfiler.finalize()
+	for (const ruleName of [ImpDocPrivateRule, ImpDocPrivateBestEffortRule]) {
+		const lintValue = core.LinterConfigValue.destruct(
+			lintConfig[ruleName] as Parameters<typeof core.LinterConfigValue.destruct>[0],
+		)
+		if (!lintValue) {
+			continue
 		}
+		const registration = meta.getLinter(ruleName)
+		if (!registration.configValidator(ruleName, lintValue.ruleValue, logger)) {
+			continue
+		}
+		const lintProfiler = projectData.profilers.get('project#lint', 'top-n', 50)
+		await core.mapLimit(states, options.parallel, async (state) => {
+			try {
+				const err = new core.LinterErrorReporter(
+					ruleName,
+					lintValue.ruleSeverity,
+					projectData.ctx['errorSource'],
+				)
+				const ctx = core.LinterContext.create(projectData, {
+					doc: state.doc,
+					err,
+					ruleName,
+					ruleValue: lintValue.ruleValue,
+				})
+				core.traversePreOrder(
+					state.node,
+					() => true,
+					registration.nodePredicate,
+					(node) => registration.linter(core.StateProxy.create(node), ctx),
+				)
+				// Diagnostics carry the rule that produced them, so they are
+				// attributed here instead of a shared post-pass over linterErrors.
+				const errors = err.dump()
+				state.node.linterErrors = [...state.node.linterErrors ?? [], ...errors]
+				for (const error of errors) {
+					diagnostics.push(toDiagnostic(state, error, ruleName))
+				}
+			} finally {
+				lintProfiler.task(state.uri)
+			}
+		})
+		lintProfiler.finalize()
 	}
 
 	for (const state of states) {
@@ -814,9 +882,6 @@ export async function runImpDocLint(
 			) {
 				diagnostics.push(toDiagnostic(state, error, UnresolvedRule))
 			}
-		}
-		for (const error of state.node.linterErrors ?? []) {
-			diagnostics.push(toDiagnostic(state, error, ImpDocPrivateRule))
 		}
 	}
 	sortDiagnostics(diagnostics)
