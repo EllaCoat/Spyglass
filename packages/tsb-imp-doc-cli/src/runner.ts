@@ -231,7 +231,7 @@ function isInsideQuote(line: string, index: number): boolean {
  * Minimal base parser for the CI vertical slice. The IMP-Doc initializer wraps this parser and
  * replaces the emitted legacy comment nodes with its own ImpDocNode implementation.
  */
-const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
+export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 	const children: core.AstNode[] = []
 	let offset = 0
 	for (const line of src.string.split(/\r?\n/)) {
@@ -243,7 +243,7 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 			})
 		} else {
 			const isMacroLine = line[leadingSpace] === '$'
-			const dynamicPattern = /\bfunction[\t ]+\$\([^\s)]*\)?/g
+			const dynamicPattern = /\bfunction[\t ]+#?\$\([^\s)]*\)?/g
 			for (const match of line.matchAll(dynamicPattern)) {
 				const range = core.Range.create(
 					offset + match.index,
@@ -266,10 +266,11 @@ const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				/\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
 			for (const match of line.matchAll(referencePattern)) {
 				const raw = match[1]
-				// A `$(` right after the static prefix means the actual target is
-				// completed by a macro substitution at runtime; the prefix alone
+				// A `$(` in the same resource-location token means the actual target
+				// is completed by a macro substitution at runtime; the prefix alone
 				// would be a spurious reference, so no node is emitted for it.
-				if (line.startsWith('$(', match.index + match[0].length)) {
+				const suffix = line.slice(match.index + match[0].length)
+				if (/^[A-Za-z0-9_./:-]*\$\(/.test(suffix)) {
 					continue
 				}
 				const targetStart = offset + match.index + match[0].lastIndexOf(raw)

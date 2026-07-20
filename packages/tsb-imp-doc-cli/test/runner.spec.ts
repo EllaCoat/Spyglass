@@ -1,10 +1,12 @@
+import * as core from '@spyglassmc/core'
+import { getRefProvenance } from '@spyglassmc/tsb-imp-doc'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import type { LintDiagnostic } from '../lib/reporter.js'
-import { runImpDocLint } from '../lib/runner.js'
+import { cliMcfunction, runImpDocLint } from '../lib/runner.js'
 import { scanMcfunctionFiles } from '../lib/scanner.js'
 
 interface DiagnosticDigest {
@@ -56,7 +58,10 @@ describe('runner best-effort reference provenance', () => {
 			),
 			writeFile(
 				partialDynamic,
-				'#> example:partial_dynamic\n\n$function example:generated/$(id)\n',
+				'#> example:partial_dynamic\n\n'
+					+ '$function example:$(id)\n'
+					+ '$function dir/$(id)\n'
+					+ '$execute if function example:missing_static run function example:$(id)\n',
 			),
 		])
 	})
@@ -102,6 +107,13 @@ describe('runner best-effort reference provenance', () => {
 					'Function “example:missing_macro” is referenced in a macro line but is not declared anywhere',
 			},
 			{
+				file: partialDynamic,
+				line: 5,
+				severity: 'warning',
+				message:
+					'Function “example:missing_static” is referenced in a macro line but is not declared anywhere',
+			},
+			{
 				file: quoteCaller,
 				line: 3,
 				severity: 'warning',
@@ -117,11 +129,20 @@ describe('runner best-effort reference provenance', () => {
 			},
 		])
 
-		// A static prefix completed by `$(...)` is never turned into a reference,
-		// so the partial dynamic file stays clean.
+		// Static prefixes completed by `$(...)` are skipped across `:` and `/`,
+		// while a separate static reference on the same line is retained.
 		assert.deepEqual(
-			cold.diagnostics.filter(diagnostic => diagnostic.file === partialDynamic),
-			[],
+			digest(
+				cold.diagnostics.filter(diagnostic => diagnostic.file === partialDynamic),
+				'impDocPrivateBestEffort',
+			),
+			[{
+				file: partialDynamic,
+				line: 5,
+				severity: 'warning',
+				message:
+					'Function “example:missing_static” is referenced in a macro line but is not declared anywhere',
+			}],
 		)
 
 		const warm = await run()
@@ -131,7 +152,10 @@ describe('runner best-effort reference provenance', () => {
 
 	it('downgrades fully dynamic function references to unresolved warnings', async () => {
 		const dynamicFile = join(functionsDir, 'dynamic.mcfunction')
-		await writeFile(dynamicFile, '#> example:dynamic\n\n$function $(target)\n')
+		await writeFile(
+			dynamicFile,
+			'#> example:dynamic\n\n$function $(target)\n$function #$(tag)\n',
+		)
 
 		const result = await run()
 		assert.deepEqual(
@@ -139,12 +163,33 @@ describe('runner best-effort reference provenance', () => {
 				result.diagnostics.filter(diagnostic => diagnostic.file === dynamicFile),
 				'unresolved',
 			),
-			[{
-				file: dynamicFile,
-				line: 3,
-				severity: 'warning',
-				message: 'Unresolved dynamic function reference',
-			}],
+			[
+				{
+					file: dynamicFile,
+					line: 3,
+					severity: 'warning',
+					message: 'Unresolved dynamic function reference',
+				},
+				{
+					file: dynamicFile,
+					line: 4,
+					severity: 'warning',
+					message: 'Unresolved dynamic function reference',
+				},
+			],
 		)
+
+		const parsed = cliMcfunction(
+			new core.Source('$function #$(tag)'),
+			{ err: new core.ErrorReporter() } as Parameters<typeof cliMcfunction>[1],
+		)
+		if (parsed === core.Failure) {
+			assert.fail('CLI mcfunction parser unexpectedly failed')
+		}
+		const markers = parsed.children.filter(
+			child => child.type === 'tsb-imp-doc-cli:dynamic-ref',
+		)
+		assert.equal(markers.length, 1)
+		assert.equal(getRefProvenance(markers[0]!), 'dynamic-pattern')
 	})
 })
