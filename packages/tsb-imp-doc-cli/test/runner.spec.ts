@@ -130,18 +130,26 @@ describe('runner best-effort reference provenance', () => {
 		])
 
 		// Static prefixes completed by `$(...)` are skipped across `:` and `/`,
-		// while a separate static reference on the same line is retained.
+		// while a separate static reference on the same line is retained. The
+		// whole file is pinned (not just one rule) so a regression that leaks a
+		// skipped prefix into `unresolved` or the strict rule also fails here.
 		assert.deepEqual(
-			digest(
-				cold.diagnostics.filter(diagnostic => diagnostic.file === partialDynamic),
-				'impDocPrivateBestEffort',
-			),
+			cold.diagnostics
+				.filter(diagnostic => diagnostic.file === partialDynamic)
+				.map(({ file, line, severity, message, rule }) => ({
+					file,
+					line,
+					severity,
+					message,
+					rule,
+				})),
 			[{
 				file: partialDynamic,
 				line: 5,
 				severity: 'warning',
 				message:
 					'Function “example:missing_static” is referenced in a macro line but is not declared anywhere',
+				rule: 'impDocPrivateBestEffort',
 			}],
 		)
 
