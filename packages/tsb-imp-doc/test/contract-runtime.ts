@@ -11,29 +11,13 @@ import { initialize as initializeImpDoc } from '../lib/index.js'
 // Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
 // like UriStore does for watched files) so that projectRoots, watcher entries, and
 // assertions all compare the same URI form. See core/common/util.ts#normalizeUriPathname.
-const FixtureRoot = core.fileUtil.ensureEndingSlash(
-	core.normalizeUri(new URL('./runtime/private-project/', import.meta.url).toString()),
-)
-const PackMcmeta = core.normalizeUri(
-	new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
-)
+function fixtureUri(fixture: string, path: string): string {
+	return core.normalizeUri(
+		new URL(`./runtime/${fixture}/${path}`, import.meta.url).toString(),
+	)
+}
 
-export const ContractRuntimeFiles = {
-	target: core.normalizeUri(
-		new URL(
-			'./runtime/private-project/data/contract/functions/target.mcfunction',
-			import.meta.url,
-		).toString(),
-	),
-	caller: core.normalizeUri(
-		new URL(
-			'./runtime/private-project/data/contract/functions/caller.mcfunction',
-			import.meta.url,
-		).toString(),
-	),
-} as const
-
-const Commands: je.dependency.McmetaCommands = {
+const DefaultCommands: je.dependency.McmetaCommands = {
 	type: 'root',
 	children: {
 		function: {
@@ -49,7 +33,7 @@ const Commands: je.dependency.McmetaCommands = {
 	},
 }
 
-class ContractFixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
+class ServiceFixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
 	implements core.FileWatcher
 {
 	readonly watchedFiles = new core.UriStore()
@@ -65,7 +49,7 @@ class ContractFixtureWatcher extends core.EventDispatcher<core.FileWatcherEventM
 	async close(): Promise<void> {}
 }
 
-function createConfig(): core.Config {
+function createDefaultConfig(): core.Config {
 	const config = core.ConfigService.merge(core.VanillaConfig, {
 		env: {
 			dependencies: [],
@@ -81,18 +65,56 @@ function createConfig(): core.Config {
 	return config
 }
 
-export interface ContractRuntime {
+export type ServiceRuntimeState = core.DocAndNode & { content: string }
+
+export interface ServiceRuntimeOptions<K extends string> {
+	/** Fixture project directory name under `test/runtime/`. */
+	fixture: string
+	/** Files to open through the Service, keyed by test-local name. Opened in key order. */
+	files: Readonly<Record<K, string>>
+	/**
+	 * Project-level default config. The on-disk `spyglass.json` of the fixture
+	 * project (if any) is merged on top of this by `ConfigService.load()`.
+	 */
+	defaultConfig?: core.Config
+	commands?: je.dependency.McmetaCommands
+	tempPrefix?: string
+}
+
+export interface ServiceRuntime<K extends string> {
 	service: core.Service
-	target: core.DocAndNode & { content: string }
-	caller: core.DocAndNode & { content: string }
+	/** Opened file URIs by test-local name. */
+	uris: Readonly<Record<K, string>>
+	/** Client-managed doc states by test-local name. */
+	states: Readonly<Record<K, ServiceRuntimeState>>
 	close: () => Promise<void>
 }
 
-export async function createContractRuntime(): Promise<ContractRuntime> {
-	const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-contract-'))
+/**
+ * Boots a full `core.Service` (Project init + ready + `onDidOpen`) over an
+ * on-disk fixture project. This is the Service-integration path (spike 5):
+ * config resolution, URI binding, bind order, and lint all run exactly as the
+ * language server would drive them, without the JSON-RPC transport layer.
+ */
+export async function createServiceRuntime<K extends string>(
+	options: ServiceRuntimeOptions<K>,
+): Promise<ServiceRuntime<K>> {
+	const fixtureRoot = core.fileUtil.ensureEndingSlash(
+		core.normalizeUri(new URL(`./runtime/${options.fixture}/`, import.meta.url).toString()),
+	)
+	const packMcmeta = fixtureUri(options.fixture, 'pack.mcmeta')
+	const uris = Object.fromEntries(
+		Object.entries<string>(options.files).map((
+			[name, path],
+		) => [name, fixtureUri(options.fixture, path)]),
+	) as Record<K, string>
+
+	const cacheDir = await mkdtemp(
+		join(tmpdir(), options.tempPrefix ?? 'spyglass-imp-doc-service-'),
+	)
 	const initialize: core.ProjectInitializer = async (ctx) => {
 		ctx.meta.registerUriBinder(je.binder.uriBinder)
-		je.mcf.initialize(ctx, Commands, '1.20.4')
+		je.mcf.initialize(ctx, options.commands ?? DefaultCommands, '1.20.4')
 		const impDoc = (await initializeImpDoc(ctx)) ?? {}
 		return { ...impDoc, loadedVersion: '1.20.4', errorSource: '1.20.4' }
 	}
@@ -107,24 +129,24 @@ export async function createContractRuntime(): Promise<ContractRuntime> {
 			},
 			project: {
 				cacheRoot: core.fileUtil.ensureEndingSlash(pathToFileURL(cacheDir).toString()),
-				defaultConfig: createConfig(),
+				defaultConfig: options.defaultConfig ?? createDefaultConfig(),
 				externals: NodeJsExternals,
 				initializers: [initialize],
-				projectRoots: [FixtureRoot],
+				projectRoots: [fixtureRoot],
 			},
 		})
 
 		await service.project.init()
 		await service.project.ready({
-			projectRootsWatcher: new ContractFixtureWatcher([
-				PackMcmeta,
-				...Object.values(ContractRuntimeFiles),
+			projectRootsWatcher: new ServiceFixtureWatcher([
+				packMcmeta,
+				...Object.values<string>(uris),
 			]),
 		})
 
-		const states = {} as Record<'target' | 'caller', core.DocAndNode & { content: string }>
-		for (const name of ['target', 'caller'] as const) {
-			const uri = ContractRuntimeFiles[name]
+		const states = {} as Record<K, ServiceRuntimeState>
+		for (const name of Object.keys(uris) as K[]) {
+			const uri = uris[name]
 			const content = await readFile(new URL(uri), 'utf8')
 			await service.project.onDidOpen(uri, 'mcfunction', 1, content)
 			const result = service.project.getClientManaged(uri)
@@ -135,7 +157,8 @@ export async function createContractRuntime(): Promise<ContractRuntime> {
 		const createdService = service
 		return {
 			service: createdService,
-			...states,
+			uris,
+			states,
 			close: async () => {
 				await createdService.project.close()
 				await rm(cacheDir, { recursive: true, force: true })
@@ -148,5 +171,34 @@ export async function createContractRuntime(): Promise<ContractRuntime> {
 		await service?.project.close().catch(() => {})
 		await rm(cacheDir, { recursive: true, force: true }).catch(() => {})
 		throw e
+	}
+}
+
+export const ContractRuntimeFiles = {
+	target: fixtureUri('private-project', 'data/contract/functions/target.mcfunction'),
+	caller: fixtureUri('private-project', 'data/contract/functions/caller.mcfunction'),
+} as const
+
+export interface ContractRuntime {
+	service: core.Service
+	target: core.DocAndNode & { content: string }
+	caller: core.DocAndNode & { content: string }
+	close: () => Promise<void>
+}
+
+export async function createContractRuntime(): Promise<ContractRuntime> {
+	const runtime = await createServiceRuntime({
+		fixture: 'private-project',
+		files: {
+			target: 'data/contract/functions/target.mcfunction',
+			caller: 'data/contract/functions/caller.mcfunction',
+		},
+		tempPrefix: 'spyglass-imp-doc-contract-',
+	})
+	return {
+		service: runtime.service,
+		target: runtime.states.target,
+		caller: runtime.states.caller,
+		close: runtime.close,
 	}
 }

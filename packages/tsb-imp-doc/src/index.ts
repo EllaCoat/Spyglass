@@ -1,10 +1,13 @@
 import type { ProjectInitializer } from '@spyglassmc/core'
 import { bindAlias } from './binder/alias.js'
 import { declaration as bindDeclaration } from './binder/declaration.js'
+import { bindEntity, clearPendingEntityReferencesForUri } from './binder/entity.js'
 import { impDoc as bindImpDoc } from './binder/impDoc.js'
 import { mcfunction as bindMcfunction } from './binder/mcfunction.js'
 import { getImpDocCacheContext } from './cachePolicy.js'
 import { checkAlias, impDoc as checkImpDoc } from './checker/impDoc.js'
+import { registerAliasCompleters } from './completer/alias.js'
+import { registerEntityCompleters } from './completer/entity.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
 import { conflictConfigValidator, visibilityConflict } from './linter/conflict.js'
 import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
@@ -40,20 +43,27 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 
 	// parser-only な CLI (= tsb-imp-doc-cli) は completer を登録しないので
 	// wrapper もスキップ。 Language Server 経路では je.initialize 後に本
-	// initialize が呼ばれるため、 3 completer が揃う。
+	// initialize が呼ばれるため、 base completer が揃う。
 	if (mcfunction.completer) {
 		registerVisibilityCompleters(meta)
+		registerAliasCompleters(meta)
+		registerEntityCompleters(meta)
 	}
 
 	meta.registerParser<ImpDocNode>('impDoc', impDoc)
 	meta.registerBinder<ImpDocNode>('impDoc', bindImpDoc)
 	meta.registerBinder('mcfunction:entry', bindMcfunction)
+	// entity usage-site soft ref (v3 parity)。 CLI / LS 両経路で bind 結果を
+	// 揃える (= 同一 ImpDocVersion cache 下で bind 出力が経路依存に divergence
+	// しないよう) ため completer gate の外で登録する。
+	meta.registerBinder('mcfunction:entity', bindEntity)
 	meta.registerBinder<ImpDocAliasNode>('impDoc:alias', bindAlias)
 	meta.registerBinder<ImpDocDeclarationNode>(
 		'impDoc:declaration',
 		bindDeclaration,
 	)
 	meta.registerUriSymbolClearer((uri, ctx) => {
+		clearPendingEntityReferencesForUri(ctx.symbols, uri)
 		clearImpDocMetadataForUri(ctx.symbols, uri, ctx.queueLint)
 	})
 	meta.registerChecker<ImpDocNode>('impDoc', checkImpDoc)

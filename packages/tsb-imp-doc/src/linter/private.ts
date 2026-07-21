@@ -106,6 +106,11 @@ export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => 
 		if (!symbol) {
 			return
 		}
+		// Legacy entity references are soft navigation links only. v3 did not run
+		// strict visibility lint for this plugin-local category.
+		if (symbol.category === 'entity') {
+			return
+		}
 		// Best-effort provenance (macro line / quoted string) hands the
 		// reference over to the warning-level impDocPrivateBestEffort rule.
 		if (getRefProvenance(candidate) !== undefined) {

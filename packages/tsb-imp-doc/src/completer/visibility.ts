@@ -1,5 +1,6 @@
 import * as core from '@spyglassmc/core'
 import { getImpDocSymbolData } from '../node/ImpDocNode.js'
+import { getDocumentResource } from '../util/documentFunction.js'
 import { getVisibilityEntries, matchesVisibility } from '../util/withinPattern.js'
 
 /**
@@ -14,44 +15,19 @@ interface ScoreHolderCompletionNode extends core.AstNode {
 }
 
 /**
- * caller の function ID を `ctx.doc.uri` から解決。 URI binder は function file を
- * definition として登録するため、 raw `function` map を走査して同 URI の symbol を探す。
- */
-export function getCallerFunctionID(
-	ctx: core.CompleterContext,
-): string | undefined {
-	const functions = ctx.symbols.lookup('function', []).parentMap
-	let caller: string | undefined
-
-	for (const symbol of Object.values(functions ?? {})) {
-		if (!symbol) {
-			continue
-		}
-		if (!symbol.definition?.some(location => location.uri === ctx.doc.uri)) {
-			continue
-		}
-
-		// 同一 URI に異なる function ID が付いていたら fail closed (= 候補なし)。
-		if (caller !== undefined && caller !== symbol.identifier) {
-			return undefined
-		}
-		caller = symbol.identifier
-	}
-
-	return caller
-}
-
-/**
  * caller の visibility 判定を満たす IMP-Doc 管理 symbol の identifier を列挙。
  * `getVisibleSymbols()` は Restricted を無条件除外するため、 raw `lookup` の parentMap
- * から取得して自前で filter する。
+ * から取得して自前で filter する。 caller は generic caller API
+ * (`getDocumentResource`) で解決するので、 JSON / worldgen 文書からの completion でも
+ * `@within` の file type 判定が働く。
  */
-function getAllowedImpDocIdentifiers(
+export function getAllowedImpDocIdentifiers(
 	category: string,
+	node: core.DeepReadonly<core.AstNode> | undefined,
 	ctx: core.CompleterContext,
 ): string[] {
 	const rawMap = ctx.symbols.lookup(category, []).parentMap
-	const caller = getCallerFunctionID(ctx)
+	const caller = getDocumentResource(ctx, node as core.AstNode | undefined)
 	const ans: string[] = []
 
 	for (const [identifier, symbol] of Object.entries(rawMap ?? {})) {
@@ -71,7 +47,7 @@ function getAllowedImpDocIdentifiers(
 			!entries.some(entry => entry.type === 'public')
 			&& (
 				caller === undefined
-				|| !entries.some(entry => matchesVisibility(entry, caller, 'function'))
+				|| !entries.some(entry => matchesVisibility(entry, caller.resourceID, caller.fileType))
 			)
 		) {
 			continue
@@ -83,56 +59,6 @@ function getAllowedImpDocIdentifiers(
 	return ans
 }
 
-/**
- * resource_location の label を default namespace / implicit path / lint 設定に沿って
- * 展開する。 core built-in の logic (`packages/core/src/processor/completer/builtin.ts`
- * 相当) を最小 subset で複製。 upstream 変更との drift は Phase 5 で解消候補。
- */
-function getResourceLabels(
-	identifier: string,
-	node: core.DeepReadonly<core.ResourceLocationNode>,
-	ctx: core.CompleterContext,
-): string[] {
-	let id = identifier
-
-	if (node.options.implicitPath) {
-		const sep = id.indexOf(core.ResourceLocation.NamespacePathSep)
-		const path = id.slice(sep + 1)
-		if (!path.startsWith(node.options.implicitPath)) {
-			return []
-		}
-		id = id.slice(0, sep + 1)
-			+ path.slice(node.options.implicitPath.length)
-	}
-
-	const config = core.LinterConfigValue.destruct(
-		ctx.config.lint.idOmitDefaultNamespace,
-	)
-	const includeCanonical = node.options.requireCanonical
-		|| config?.ruleValue !== true
-	const includeShort = !node.options.requireCanonical
-		&& config?.ruleValue !== false
-	const includeEmptyNamespace = !node.options.requireCanonical
-		&& node.namespace === ''
-
-	const defaultPrefix = `${core.ResourceLocation.DefaultNamespace}:`
-	let labels = id.startsWith(defaultPrefix)
-		? [
-			...(includeCanonical ? [id] : []),
-			...(includeShort ? [id.slice(defaultPrefix.length)] : []),
-			...(includeEmptyNamespace
-				? [id.slice(core.ResourceLocation.DefaultNamespace.length)]
-				: []),
-		]
-		: [id]
-
-	if (node.options.namespacePathSep === '.') {
-		labels = labels.map(label => label.replace(core.ResourceLocation.NamespacePathSep, '.'))
-	}
-
-	return labels
-}
-
 function completeResourceLocation(
 	node: core.DeepReadonly<core.ResourceLocationNode>,
 	ctx: core.CompleterContext,
@@ -141,19 +67,30 @@ function completeResourceLocation(
 		return []
 	}
 
-	// IMP-Doc は `tag/<category>` を stamp しないため tag 参照は候補外。 label に `#`
-	// prefix が付かず node range が typed `#` を含む broken insert になるのを避ける。
-	if (node.isTag) {
-		return []
-	}
+	// base completer (`core/processor/completer/builtin.ts#resourceLocation`) と同じ
+	// pool 構成 (plain は requireTag で除外、 tag は allowTag で `#` prefix 付与) と
+	// 同じ label 正規化 helper を使い、 tag prefix / namespace 規則の drift を防ぐ。
+	const labels = [
+		...(!node.options.requireTag
+			? core.completer.normalizeResourceLocationLabels(
+				getAllowedImpDocIdentifiers(node.options.category, node, ctx),
+				node,
+				ctx,
+			)
+			: []),
+		...(node.options.allowTag
+			? core.completer.normalizeResourceLocationLabels(
+				getAllowedImpDocIdentifiers(`tag/${node.options.category}`, node, ctx),
+				node,
+				ctx,
+			).map(label => `${core.ResourceLocation.TagPrefix}${label}`)
+			: []),
+	]
 
-	return getAllowedImpDocIdentifiers(node.options.category, ctx).flatMap(
-		identifier =>
-			getResourceLabels(identifier, node, ctx).map(label =>
-				core.CompletionItem.create(label, node, {
-					kind: core.CompletionKind.Function,
-				})
-			),
+	return labels.map(label =>
+		core.CompletionItem.create(label, node, {
+			kind: core.CompletionKind.Function,
+		})
 	)
 }
 
@@ -161,7 +98,7 @@ function completeSymbol(
 	node: core.DeepReadonly<core.SymbolNode>,
 	ctx: core.CompleterContext,
 ): core.CompletionItem[] {
-	return getAllowedImpDocIdentifiers(node.options.category, ctx).map(
+	return getAllowedImpDocIdentifiers(node.options.category, node, ctx).map(
 		identifier =>
 			core.CompletionItem.create(identifier, node, {
 				kind: core.CompletionKind.Variable,
@@ -250,12 +187,12 @@ export function registerVisibilityCompleters(meta: core.MetaRegistry): void {
 				}
 			}
 			const scoreRange = node.fakeName ?? node
-			const additions = getAllowedImpDocIdentifiers('score_holder', ctx).map(
-				identifier =>
+			const additions = getAllowedImpDocIdentifiers('score_holder', node, ctx)
+				.map(identifier =>
 					core.CompletionItem.create(identifier, scoreRange, {
 						kind: core.CompletionKind.Variable,
-					}),
-			)
+					})
+				)
 			return dedupeCompletionItems([...baseItems, ...additions])
 		},
 	)
