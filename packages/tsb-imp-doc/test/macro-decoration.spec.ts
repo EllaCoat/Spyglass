@@ -144,6 +144,8 @@ describe('IMP-Doc random sequence reference scanner', () => {
 		const cases = [
 			'return run random reset example:return_sequence',
 			'execute as @s if entity @s run return run random value 1..2 example:nested_sequence',
+			'execute if stopwatch example:timer ..10 run random reset example:if_stopwatch_sequence',
+			'execute unless stopwatch example:timer 11.. run random reset example:unless_stopwatch_sequence',
 		]
 		for (const line of cases) {
 			const lineStart = 37
@@ -158,6 +160,20 @@ describe('IMP-Doc random sequence reference scanner', () => {
 					lineStart + line.lastIndexOf(raw),
 					lineStart + line.length,
 				),
+			)
+		}
+	})
+
+	it('handles deeply nested redirects without using the call stack', () => {
+		const depth = 20_000
+		for (const redirect of ['return run ', 'execute run ']) {
+			const line = redirect.repeat(depth) + 'random reset example:deep_sequence'
+			const [ref] = scanLineRandomSequenceRefs(line, 0, false)
+
+			assert.ok(ref)
+			assert.equal(
+				core.ResourceLocationNode.toString(ref, 'full'),
+				'example:deep_sequence',
 			)
 		}
 	})

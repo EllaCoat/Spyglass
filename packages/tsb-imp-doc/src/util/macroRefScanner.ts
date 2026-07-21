@@ -251,6 +251,8 @@ function skipExecuteCondition(
 				? advanceCommandTokens(tokens, index, 7)
 				: undefined
 		}
+		case 'stopwatch':
+			return advanceCommandTokens(tokens, index, 4)
 		default:
 			return undefined
 	}
@@ -324,27 +326,31 @@ function findRandomCommandStart(
 	tokens: readonly CommandToken[],
 	index: number,
 ): number | undefined {
-	const token = tokens[index]
-	if (!token) {
-		return undefined
+	let commandIndex = index
+	while (commandIndex < tokens.length) {
+		const token = tokens[commandIndex]!
+		const value = line.slice(token.start, token.end)
+		if (value === 'random') {
+			return token.start
+		}
+		if (value === 'return') {
+			const run = tokens[commandIndex + 1]
+			if (!run || line.slice(run.start, run.end) !== 'run') {
+				return undefined
+			}
+			commandIndex += 2
+			continue
+		}
+		if (value !== 'execute') {
+			return undefined
+		}
+		const run = findExecuteRun(line, tokens, commandIndex + 1)
+		if (run === undefined) {
+			return undefined
+		}
+		commandIndex = run + 1
 	}
-	const value = line.slice(token.start, token.end)
-	if (value === 'random') {
-		return token.start
-	}
-	if (value === 'return') {
-		const run = tokens[index + 1]
-		return run && line.slice(run.start, run.end) === 'run'
-			? findRandomCommandStart(line, tokens, index + 2)
-			: undefined
-	}
-	if (value !== 'execute') {
-		return undefined
-	}
-	const run = findExecuteRun(line, tokens, index + 1)
-	return run === undefined
-		? undefined
-		: findRandomCommandStart(line, tokens, run + 1)
+	return undefined
 }
 
 /**
