@@ -720,20 +720,17 @@ describe('IMP-Doc private visibility runtime — getCaller characterization', ()
 		return { ...state, content }
 	}
 
-	it('resolves the declaration fallback in symbol-map insertion order, not location-entry order', async () => {
+	it('fails closed when the declaration fallback has multiple function candidates', async () => {
 		const callerUri = fixtureUri('data/order/functions/decl_caller.mcfunction')
 		const elsewhereUri = fixtureUri('data/order/functions/elsewhere.mcfunction')
-		// `order:second` enters the function symbol map first (via a location at a
-		// different URI), while its declaration at `callerUri` is entered only after
-		// `order:first`. The legacy getCaller scans the symbol map in insertion
-		// order, so the caller must resolve to `order:second` even though
-		// `order:first` contributed a location to `callerUri` earlier.
+		// Force symbol-map and location-entry order to disagree. Both declarations
+		// still claim `callerUri`, so neither order may determine the caller ID.
 		enterFunction('declaration', 'order:second', elsewhereUri)
 		enterFunction('declaration', 'order:first', callerUri)
 		enterFunction('declaration', 'order:second', callerUri)
 
 		const state = await lintSyntheticCaller(callerUri)
-		assertSingleViolation(state, 'order:second')
+		assertNoViolation(state)
 	})
 
 	it('prefers a definition over an earlier-inserted declaration', async () => {

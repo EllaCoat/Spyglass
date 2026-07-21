@@ -120,7 +120,14 @@ export const LEGACY_MISC_TYPES = [
 	nativeNamespaced('storage'),
 	category('tag', 'plain-variable', 'tag', false, 'native', 'symbol'),
 	category('team', 'plain-variable', 'team', false, 'native', 'symbol'),
-	category('sequence', 'plain-variable', 'random_sequence', false, 'mapped', 'symbol'),
+	category(
+		'sequence',
+		'plain-variable',
+		'random_sequence',
+		false,
+		'mapped',
+		'resource-location',
+	),
 ] as const satisfies readonly LegacyCategorySpec[]
 
 export const LEGACY_ALIAS_TYPES = [

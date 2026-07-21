@@ -36,15 +36,18 @@ describe('legacy category manifest', () => {
 		assert.equal(LEGACY_WITHIN_TARGET_IDS.length, 48)
 	})
 
-	it('records the exceptional mappings and legacy identifier families', () => {
+	it('routes sequence through the canonical resource-location consumer', () => {
 		assert.deepEqual(getLegacyCategorySpec('sequence'), {
 			id: 'sequence',
 			family: 'plain-variable',
 			v4Category: 'random_sequence',
 			namespaced: false,
 			nativeSupport: 'mapped',
-			consumerKind: 'symbol',
+			consumerKind: 'resource-location',
 		})
+	})
+
+	it('records the exceptional mappings and legacy identifier families', () => {
 		assert.deepEqual(getLegacyCategorySpec('worldgen/configured_decorator'), {
 			id: 'worldgen/configured_decorator',
 			family: 'namespaced',

@@ -23,7 +23,7 @@ const DynamicRefPattern = /\bfunction[\t ]+#?\$\([^\s)]*\)?/g
 
 /** A static `function <id>` / `function #<tag>` reference target. */
 const StaticRefPattern =
-	/\bfunction[\t ]+(#[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?|[A-Za-z0-9_.-]+(?::[A-Za-z0-9_./-]+)?)/g
+	/\bfunction[\t ]+(#?(?:[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+|[A-Za-z0-9_./-]+))/g
 
 /**
  * A `$(` completing the matched resource-location token across `:` and `/`,

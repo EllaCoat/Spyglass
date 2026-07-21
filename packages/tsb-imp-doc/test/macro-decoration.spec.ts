@@ -7,7 +7,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { pathToFileURL } from 'node:url'
-import { getRefProvenance, initialize as initializeImpDoc } from '../lib/index.js'
+import {
+	getRefProvenance,
+	initialize as initializeImpDoc,
+	scanLineFunctionRefs,
+} from '../lib/index.js'
 
 // Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
 // like UriStore does for watched files) so that projectRoots, watcher entries, and
@@ -107,6 +111,32 @@ function nestedRefs(macro: core.AstNode): core.ResourceLocationNode[] {
 	}
 	return refs
 }
+
+describe('IMP-Doc function reference scanner', () => {
+	it('captures slash-delimited paths in default-namespace functions and tags', () => {
+		for (const raw of ['foo/bar', '#foo/bar']) {
+			const line = `execute run function ${raw}`
+			const lineStart = 37
+			const result = scanLineFunctionRefs(line, lineStart, false)
+			const targetStart = lineStart + line.indexOf(raw)
+
+			assert.deepEqual(result.dynamicRanges, [])
+			assert.equal(result.refs.length, 1)
+			assert.deepEqual(result.refs[0], {
+				type: 'resource_location',
+				range: core.Range.create(targetStart, targetStart + raw.length),
+				namespace: undefined,
+				path: ['foo', 'bar'],
+				isTag: raw.startsWith('#'),
+				options: {
+					category: 'function',
+					allowTag: true,
+					usageType: 'reference',
+				},
+			})
+		}
+	})
+})
 
 describe('IMP-Doc macro decoration on the language-server path', () => {
 	let project: core.Project | undefined

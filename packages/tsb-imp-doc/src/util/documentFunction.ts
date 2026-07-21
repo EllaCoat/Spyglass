@@ -43,24 +43,19 @@ function getFunctionSymbols(ctx: DocumentFunctionContext): Symbol[] {
 }
 
 /**
- * Select a match in the function symbol map's insertion order. This preserves
- * the legacy fallback for headerless documents while keeping indexed and full
- * scan lookups consistent.
+ * Selects the first non-empty priority tier only when it identifies exactly
+ * one function. An ambiguous higher-priority tier stops resolution instead of
+ * guessing by insertion order or falling through to a weaker signal.
  */
-function selectInSymbolMapOrder(
-	ctx: DocumentFunctionContext,
-	matches: readonly Symbol[],
+function selectUnambiguousFunctionTier(
+	tiers: readonly (readonly Symbol[])[],
 ): Symbol | undefined {
-	if (matches.length <= 1) {
-		return matches[0]
-	}
-	const identifiers = new Set(matches.map(symbol => symbol.identifier))
-	for (const symbol of Object.values(ctx.symbols.lookup('function', []).parentMap ?? {})) {
-		if (symbol && identifiers.has(symbol.identifier)) {
-			return symbol
+	for (const matches of tiers) {
+		if (matches.length > 0) {
+			return matches.length === 1 ? matches[0] : undefined
 		}
 	}
-	return matches[0]
+	return undefined
 }
 
 /**
@@ -68,6 +63,7 @@ function selectInSymbolMapOrder(
  * priority for the language-server path. The CLI only contributes declaration
  * locations, so its parsed IMP-Doc function header (or persisted `headerUri`)
  * distinguishes the document function from caller-local `#declare` symbols.
+ * Multiple candidates in the first applicable priority tier fail closed.
  */
 export function getDocumentFunction(
 	ctx: DocumentFunctionContext,
@@ -96,10 +92,12 @@ export function getDocumentFunction(
 		}
 	}
 
-	return selectInSymbolMapOrder(ctx, definitions)
-		?? selectInSymbolMapOrder(ctx, headerMatches)
-		?? selectInSymbolMapOrder(ctx, trackedHeaderMatches)
-		?? selectInSymbolMapOrder(ctx, declarations)
+	return selectUnambiguousFunctionTier([
+		definitions,
+		headerMatches,
+		trackedHeaderMatches,
+		declarations,
+	])
 }
 
 /**
