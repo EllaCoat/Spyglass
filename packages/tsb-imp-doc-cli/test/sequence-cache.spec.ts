@@ -109,6 +109,39 @@ describe('sequence canonical category across cache lifecycles', () => {
 		assert.equal(cache.graph.dependents[sequenceKey], undefined)
 	})
 
+	it('tracks a random_sequence consumer through execute.run', async () => {
+		const consumer = join(functionsDir, 'consumer.mcfunction')
+		const sequence = 'example:private_sequence'
+		const sequenceKey = toSymbolKey('random_sequence', [sequence])
+		await Promise.all([
+			writeFile(
+				declarer,
+				'#> example:declares\n# @public\n\n'
+					+ '#> Private sequence\n# @private\n'
+					+ `    #declare sequence ${sequence}\n`,
+			),
+			writeFile(
+				consumer,
+				'#> example:consumer\n# @public\n\n'
+					+ `execute as @s run random value 1..2 ${sequence}\n`,
+			),
+		])
+
+		const result = await run()
+		assert.equal(result.diagnostics.length, 1)
+		assert.equal(result.diagnostics[0]?.file, consumer)
+		assert.equal(result.diagnostics[0]?.rule, 'impDocPrivate')
+		assert.match(
+			result.diagnostics[0]?.message ?? '',
+			/Symbol “example:private_sequence” in category “random_sequence” is private/,
+		)
+
+		const cache = await readCache()
+		assert.ok(cache.manifest.files[consumer]?.references.includes(sequenceKey))
+		assert.deepEqual(cache.graph.references[consumer], [sequenceKey])
+		assert.deepEqual(cache.graph.dependents[sequenceKey], [consumer])
+	})
+
 	it('connects a bare declaration to its default-namespace consumer', async () => {
 		const consumer = join(functionsDir, 'consumer.mcfunction')
 		const bareSequence = 'bare_sequence'

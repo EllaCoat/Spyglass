@@ -11,6 +11,7 @@ import {
 	getRefProvenance,
 	initialize as initializeImpDoc,
 	scanLineFunctionRefs,
+	scanLineRandomSequenceRefs,
 } from '../lib/index.js'
 
 // Canonicalize fixture URIs with core.normalizeUri (lowercases Windows drive letters,
@@ -134,6 +135,40 @@ describe('IMP-Doc function reference scanner', () => {
 					usageType: 'reference',
 				},
 			})
+		}
+	})
+})
+
+describe('IMP-Doc random sequence reference scanner', () => {
+	it('follows return.run and nested execute.run redirects', () => {
+		const cases = [
+			'return run random reset example:return_sequence',
+			'execute as @s if entity @s run return run random value 1..2 example:nested_sequence',
+		]
+		for (const line of cases) {
+			const lineStart = 37
+			const [ref] = scanLineRandomSequenceRefs(line, lineStart, false)
+			const raw = line.slice(line.lastIndexOf(' ') + 1)
+
+			assert.ok(ref)
+			assert.equal(core.ResourceLocationNode.toString(ref, 'full'), raw)
+			assert.deepEqual(
+				ref.range,
+				core.Range.create(
+					lineStart + line.lastIndexOf(raw),
+					lineStart + line.length,
+				),
+			)
+		}
+	})
+
+	it('ignores redirect-like text inside an execute argument', () => {
+		const lines = [
+			'execute if data storage example:data {command:"run random value 1..2 example:false"} run say ok',
+			'execute as @s run say run random value 1..2 example:false',
+		]
+		for (const line of lines) {
+			assert.deepEqual(scanLineRandomSequenceRefs(line, 0, false), [])
 		}
 	})
 })

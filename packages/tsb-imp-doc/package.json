@@ -1,6 +1,6 @@
 {
   "name": "@spyglassmc/tsb-imp-doc",
-  "version": "0.0.9-consumer-parity.1",
+  "version": "0.0.9-consumer-parity.2",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",

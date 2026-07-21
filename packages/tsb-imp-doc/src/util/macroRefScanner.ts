@@ -29,6 +29,11 @@ const StaticRefPattern =
 const RandomSequenceRefPattern =
 	/^random[\t ]+(?:(?:value|roll)[\t ]+\S+|reset)[\t ]+((?:[a-z0-9_.-]+:)?[a-z0-9_./-]+)/
 
+interface CommandToken {
+	start: number
+	end: number
+}
+
 /**
  * A `$(` completing the matched resource-location token across `:` and `/`,
  * which means the actual target is decided by macro substitution at runtime.
@@ -100,6 +105,246 @@ function isInsideQuote(line: string, index: number): boolean {
 		}
 	}
 	return quote !== undefined
+}
+
+/**
+ * Splits a command into top-level space-delimited tokens. Whitespace in quoted
+ * strings and balanced selector / NBT / JSON / macro payloads stays inside its
+ * surrounding token, so a payload containing `run random ...` cannot be
+ * mistaken for a command redirect.
+ */
+function tokenizeCommand(line: string, start: number): CommandToken[] {
+	const tokens: CommandToken[] = []
+	const closers: string[] = []
+	let tokenStart: number | undefined
+	let quote: string | undefined
+
+	for (let i = start; i < line.length; i++) {
+		const char = line[i]!
+		if (tokenStart === undefined) {
+			if (char === ' ' || char === '\t') {
+				continue
+			}
+			tokenStart = i
+		}
+
+		if (quote !== undefined) {
+			if (char === '\\') {
+				i++
+			} else if (char === quote) {
+				quote = undefined
+			}
+			continue
+		}
+
+		if (char === '"' || char === "'") {
+			quote = char
+		} else if (char === '[') {
+			closers.push(']')
+		} else if (char === '{') {
+			closers.push('}')
+		} else if (char === '(') {
+			closers.push(')')
+		} else if (char === closers.at(-1)) {
+			closers.pop()
+		} else if ((char === ' ' || char === '\t') && closers.length === 0) {
+			tokens.push({ start: tokenStart, end: i })
+			tokenStart = undefined
+		}
+	}
+
+	if (tokenStart !== undefined) {
+		tokens.push({ start: tokenStart, end: line.length })
+	}
+	return tokens
+}
+
+function commandTokenValue(
+	line: string,
+	tokens: readonly CommandToken[],
+	index: number,
+): string | undefined {
+	const token = tokens[index]
+	return token ? line.slice(token.start, token.end) : undefined
+}
+
+function advanceCommandTokens(
+	tokens: readonly CommandToken[],
+	index: number,
+	count: number,
+): number | undefined {
+	return tokens[index + count - 1] ? index + count : undefined
+}
+
+/** Returns the token after a complete `execute store ...` subcommand. */
+function skipExecuteStore(
+	line: string,
+	tokens: readonly CommandToken[],
+	index: number,
+): number | undefined {
+	const resultKind = commandTokenValue(line, tokens, index + 1)
+	if (resultKind !== 'result' && resultKind !== 'success') {
+		return undefined
+	}
+
+	switch (commandTokenValue(line, tokens, index + 2)) {
+		case 'block':
+			return advanceCommandTokens(tokens, index, 9)
+		case 'bossbar':
+		case 'score':
+			return advanceCommandTokens(tokens, index, 5)
+		case 'entity':
+		case 'storage':
+			return advanceCommandTokens(tokens, index, 7)
+		default:
+			return undefined
+	}
+}
+
+/** Returns the token after a complete `execute if|unless ...` subcommand. */
+function skipExecuteCondition(
+	line: string,
+	tokens: readonly CommandToken[],
+	index: number,
+): number | undefined {
+	switch (commandTokenValue(line, tokens, index + 1)) {
+		case 'biome':
+		case 'block':
+			return advanceCommandTokens(tokens, index, 6)
+		case 'blocks':
+			return advanceCommandTokens(tokens, index, 12)
+		case 'data': {
+			const target = commandTokenValue(line, tokens, index + 2)
+			if (target === 'block') {
+				return advanceCommandTokens(tokens, index, 7)
+			}
+			return target === 'entity' || target === 'storage'
+				? advanceCommandTokens(tokens, index, 5)
+				: undefined
+		}
+		case 'dimension':
+		case 'entity':
+		case 'function':
+		case 'predicate':
+			return advanceCommandTokens(tokens, index, 3)
+		case 'items': {
+			const target = commandTokenValue(line, tokens, index + 2)
+			if (target === 'block') {
+				return advanceCommandTokens(tokens, index, 8)
+			}
+			return target === 'entity'
+				? advanceCommandTokens(tokens, index, 6)
+				: undefined
+		}
+		case 'loaded':
+			return advanceCommandTokens(tokens, index, 5)
+		case 'score': {
+			const comparison = commandTokenValue(line, tokens, index + 4)
+			if (comparison === 'matches') {
+				return advanceCommandTokens(tokens, index, 6)
+			}
+			return comparison === '<'
+					|| comparison === '<='
+					|| comparison === '='
+					|| comparison === '>='
+					|| comparison === '>'
+				? advanceCommandTokens(tokens, index, 7)
+				: undefined
+		}
+		default:
+			return undefined
+	}
+}
+
+/**
+ * Walks the vanilla `execute` subcommand grammar up to its `run` literal. The
+ * standalone CLI intentionally has no versioned command tree, so unknown
+ * subcommands fail closed instead of turning later command-looking text into a
+ * strict reference.
+ */
+function findExecuteRun(
+	line: string,
+	tokens: readonly CommandToken[],
+	start: number,
+): number | undefined {
+	let index = start
+	while (index < tokens.length) {
+		const subcommand = commandTokenValue(line, tokens, index)
+		if (subcommand === 'run') {
+			return index
+		}
+
+		let next: number | undefined
+		switch (subcommand) {
+			case 'align':
+			case 'anchored':
+			case 'as':
+			case 'at':
+			case 'in':
+			case 'on':
+			case 'summon':
+				next = advanceCommandTokens(tokens, index, 2)
+				break
+			case 'facing':
+				next = advanceCommandTokens(tokens, index, 4)
+				break
+			case 'positioned':
+				next = commandTokenValue(line, tokens, index + 1) === 'as'
+						|| commandTokenValue(line, tokens, index + 1) === 'over'
+					? advanceCommandTokens(tokens, index, 3)
+					: advanceCommandTokens(tokens, index, 4)
+				break
+			case 'rotated':
+				next = advanceCommandTokens(tokens, index, 3)
+				break
+			case 'store':
+				next = skipExecuteStore(line, tokens, index)
+				break
+			case 'if':
+			case 'unless':
+				next = skipExecuteCondition(line, tokens, index)
+				break
+			default:
+				return undefined
+		}
+		if (next === undefined) {
+			return undefined
+		}
+		index = next
+	}
+	return undefined
+}
+
+/**
+ * Finds a `random` command position after following vanilla command redirects.
+ * `execute.run` and `return.run` both redirect to the root command tree.
+ */
+function findRandomCommandStart(
+	line: string,
+	tokens: readonly CommandToken[],
+	index: number,
+): number | undefined {
+	const token = tokens[index]
+	if (!token) {
+		return undefined
+	}
+	const value = line.slice(token.start, token.end)
+	if (value === 'random') {
+		return token.start
+	}
+	if (value === 'return') {
+		const run = tokens[index + 1]
+		return run && line.slice(run.start, run.end) === 'run'
+			? findRandomCommandStart(line, tokens, index + 2)
+			: undefined
+	}
+	if (value !== 'execute') {
+		return undefined
+	}
+	const run = findExecuteRun(line, tokens, index + 1)
+	return run === undefined
+		? undefined
+		: findRandomCommandStart(line, tokens, run + 1)
 }
 
 /**
@@ -179,16 +424,25 @@ export function scanLineRandomSequenceRefs(
 		return []
 	}
 
-	const match = RandomSequenceRefPattern.exec(line.slice(commandStart))
+	const randomCommandStart = findRandomCommandStart(
+		line,
+		tokenizeCommand(line, commandStart),
+		0,
+	)
+	if (randomCommandStart === undefined) {
+		return []
+	}
+
+	const match = RandomSequenceRefPattern.exec(line.slice(randomCommandStart))
 	if (!match) {
 		return []
 	}
 	const raw = match[1]!
-	const matchEnd = commandStart + match[0].length
+	const matchEnd = randomCommandStart + match[0].length
 	if (MacroSuffixPattern.test(line.slice(matchEnd))) {
 		return []
 	}
-	const targetStart = lineStart + commandStart + match[0].lastIndexOf(raw)
+	const targetStart = lineStart + randomCommandStart + match[0].lastIndexOf(raw)
 	const ref = parseRandomSequenceRefNode(
 		raw,
 		core.Range.create(targetStart, targetStart + raw.length),
