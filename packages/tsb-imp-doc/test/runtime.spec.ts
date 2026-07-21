@@ -96,6 +96,60 @@ const Commands: je.dependency.McmetaCommands = {
 				},
 			},
 		},
+		// P4-3b alias / entity completion runtime 用の最小 command 群。
+		kill: {
+			type: 'literal',
+			children: {
+				targets: {
+					type: 'argument',
+					parser: 'minecraft:entity',
+					properties: { amount: 'multiple', type: 'entities' },
+					executable: true,
+				},
+			},
+		},
+		ban: {
+			type: 'literal',
+			children: {
+				targets: {
+					type: 'argument',
+					parser: 'minecraft:game_profile',
+					executable: true,
+				},
+			},
+		},
+		// `teleport` は je の tree patch が `destination` を削除するため、 vanilla
+		// patch の影響を受けない custom literal を使う。
+		tpvec: {
+			type: 'literal',
+			children: {
+				destination: {
+					type: 'argument',
+					parser: 'minecraft:vec3',
+					executable: true,
+				},
+			},
+		},
+		spreadplayers: {
+			type: 'literal',
+			children: {
+				center: {
+					type: 'argument',
+					parser: 'minecraft:vec2',
+					executable: true,
+				},
+			},
+		},
+		uuidcheck: {
+			type: 'literal',
+			children: {
+				id: {
+					type: 'argument',
+					parser: 'minecraft:uuid',
+					executable: true,
+				},
+			},
+		},
 	},
 }
 
@@ -742,5 +796,212 @@ describe('IMP-Doc private visibility runtime — getCaller characterization', ()
 
 		const state = await lintSyntheticCaller(callerUri)
 		assertSingleViolation(state, 'order:def')
+	})
+})
+
+const AliasRuntimeFiles = {
+	aliases: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/owner/functions/aliases.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+	entityUser: core.normalizeUri(
+		new URL(
+			'./runtime/private-project/data/owner/functions/entity_user.mcfunction',
+			import.meta.url,
+		).toString(),
+	),
+} as const
+
+const EntityAliasExpansion = '@e[tag=Runtime, limit=1]'
+const VectorAliasExpansion = '1.0 2.0 3.0'
+const UuidAliasExpansion = '12345678-1234-5678-1234-567812345678'
+
+function createAliasProject(cacheDir: string): core.Project {
+	return new core.Project({
+		cacheRoot: core.fileUtil.ensureEndingSlash(
+			pathToFileURL(cacheDir).toString(),
+		),
+		defaultConfig: createConfig(),
+		externals: NodeJsExternals,
+		initializers: [initializeRuntime],
+		logger: {
+			error: () => {},
+			info: () => {},
+			log: () => {},
+			warn: () => {},
+		},
+		projectRoots: [FixtureRoot],
+	})
+}
+
+function createAliasWatcher(): FixtureWatcher {
+	const packMcmeta = core.normalizeUri(
+		new URL('./runtime/private-project/pack.mcmeta', import.meta.url).toString(),
+	)
+	return new FixtureWatcher([packMcmeta, ...Object.values(AliasRuntimeFiles)])
+}
+
+describe('IMP-Doc alias and entity completion runtime (P4-3b)', () => {
+	let project: core.Project | undefined
+	let cacheDir: string | undefined
+	let syntheticCount = 0
+
+	before(async () => {
+		cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-alias-'))
+		project = createAliasProject(cacheDir)
+		await project.init()
+		await project.ready({ projectRootsWatcher: createAliasWatcher() })
+	})
+
+	after(async () => {
+		await project?.close()
+		if (cacheDir) {
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
+	/**
+	 * Opens a synthetic mcfunction whose cursor position is marked with `|`,
+	 * completes at that offset through the full completer chain, and closes the
+	 * document again.
+	 */
+	async function completeSynthetic(contentWithCursor: string): Promise<core.CompletionItem[]> {
+		assert.ok(project)
+		const offset = contentWithCursor.indexOf('|')
+		assert.notEqual(offset, -1)
+		const content = contentWithCursor.replace('|', '')
+		const uri = core.normalizeUri(
+			new URL(
+				`./runtime/private-project/data/owner/functions/completion_${syntheticCount++}.mcfunction`,
+				import.meta.url,
+			).toString(),
+		)
+		await project.onDidOpen(uri, 'mcfunction', 1, content)
+		const state = project.getClientManaged(uri)
+		assert.ok(state)
+		const ctx = core.CompleterContext.create(project, { doc: state.doc, offset })
+		const items = core.completer.file(state.node, ctx)
+		await project.onDidClose(uri)
+		return items
+	}
+
+	function byLabel(
+		items: readonly core.CompletionItem[],
+		label: string,
+	): core.CompletionItem[] {
+		return items.filter(item => item.label === label)
+	}
+
+	it('offers the entity alias, declared entity names, and base selector items at the untyped position', async () => {
+		const items = await completeSynthetic('kill |')
+
+		const alias = byLabel(items, 'cached_entity')
+		assert.equal(alias.length, 1)
+		assert.equal(alias[0].insertText, EntityAliasExpansion)
+		assert.equal(alias[0].detail, EntityAliasExpansion)
+		// CompletionKind.Snippet = 15 (const enum、 数値照合)。
+		assert.equal(alias[0].kind, 15)
+
+		assert.equal(byLabel(items, 'runtime_entity').length, 1)
+		assert.ok(
+			items.some(item => item.label.startsWith('@')),
+			'base selector variables must be preserved',
+		)
+		// wrong-parser negative: uuid / vector alias は entity 位置に出さない。
+		assert.equal(byLabel(items, 'cached_uuid').length, 0)
+		assert.equal(byLabel(items, 'cached_vector').length, 0)
+	})
+
+	it('offers the vector alias at vec3 but not at vec2', async () => {
+		const vec3Items = await completeSynthetic('tpvec |')
+		const alias = byLabel(vec3Items, 'cached_vector')
+		assert.equal(alias.length, 1)
+		assert.equal(alias[0].insertText, VectorAliasExpansion)
+		assert.equal(byLabel(vec3Items, 'cached_entity').length, 0)
+		assert.equal(byLabel(vec3Items, 'cached_uuid').length, 0)
+
+		const vec2Items = await completeSynthetic('spreadplayers |')
+		// 位置自体は生きている (= base vector 候補は出る) ことを positive control
+		// で固定した上で、 vec2 に vector alias が漏れないことを確認する。
+		assert.ok(vec2Items.some(item => item.label === '~ ~'))
+		assert.equal(byLabel(vec2Items, 'cached_vector').length, 0)
+	})
+
+	it('offers the uuid alias through the java-edition uuid completion mock', async () => {
+		const items = await completeSynthetic('uuidcheck |')
+		const alias = byLabel(items, 'cached_uuid')
+		assert.equal(alias.length, 1)
+		assert.equal(alias[0].insertText, UuidAliasExpansion)
+		assert.equal(byLabel(items, 'cached_entity').length, 0)
+		assert.equal(byLabel(items, 'cached_vector').length, 0)
+	})
+
+	it('offers the entity alias at game_profile positions too (shared v3 parser identity)', async () => {
+		// v3 は game_profile も EntityArgumentParser (identity = entity) で parse
+		// するため alias/entity が提示されていた。 v4 の mock node も同一 type
+		// (`mcfunction:entity_selector`) で区別できないため、 この挙動を pin する
+		// (Plan §4 4-3b 検証の「game profile 等へ提示しない」 とは意図的に異なる)。
+		const items = await completeSynthetic('ban |')
+		assert.equal(byLabel(items, 'cached_entity').length, 1)
+	})
+
+	it('keeps aliases out of partially typed arguments', async () => {
+		const entityItems = await completeSynthetic('kill cach|ed')
+		assert.equal(byLabel(entityItems, 'cached_entity').length, 0)
+		// 部分入力でも宣言済み entity name の候補は出る (real-node consumer)。
+		assert.equal(byLabel(entityItems, 'runtime_entity').length, 1)
+
+		const vectorItems = await completeSynthetic('tpvec 1.0|')
+		assert.equal(byLabel(vectorItems, 'cached_vector').length, 0)
+
+		const uuidItems = await completeSynthetic('uuidcheck 1234|')
+		assert.equal(byLabel(uuidItems, 'cached_uuid').length, 0)
+	})
+})
+
+describe('IMP-Doc alias completion after cache reload (P4-3b)', () => {
+	it('serves alias snippets from restored symbol data', async () => {
+		const cacheDir = await mkdtemp(join(tmpdir(), 'spyglass-imp-doc-alias-reload-'))
+		try {
+			// Cold run: bind the fixture and persist the symbol cache.
+			const cold = createAliasProject(cacheDir)
+			try {
+				await cold.init()
+				await cold.ready({ projectRootsWatcher: createAliasWatcher() })
+			} finally {
+				await cold.close()
+			}
+
+			// Warm run: unchanged files restore alias symbols from the cache.
+			const warm = createAliasProject(cacheDir)
+			try {
+				await warm.init()
+				await warm.ready({ projectRootsWatcher: createAliasWatcher() })
+
+				const uri = core.normalizeUri(
+					new URL(
+						'./runtime/private-project/data/owner/functions/completion_reload.mcfunction',
+						import.meta.url,
+					).toString(),
+				)
+				await warm.onDidOpen(uri, 'mcfunction', 1, 'kill \n')
+				const state = warm.getClientManaged(uri)
+				assert.ok(state)
+				const ctx = core.CompleterContext.create(warm, {
+					doc: state.doc,
+					offset: 'kill '.length,
+				})
+				const items = core.completer.file(state.node, ctx)
+				const alias = items.filter(item => item.label === 'cached_entity')
+				assert.equal(alias.length, 1)
+				assert.equal(alias[0].insertText, EntityAliasExpansion)
+			} finally {
+				await warm.close()
+			}
+		} finally {
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
 	})
 })

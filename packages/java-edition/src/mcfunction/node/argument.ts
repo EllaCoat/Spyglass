@@ -128,6 +128,8 @@ export interface EntitySelectorNode extends core.AstNode {
 	type: 'mcfunction:entity_selector'
 	children: [core.LiteralNode, ...([] | [EntitySelectorArgumentsNode])]
 	variable: EntitySelectorVariable
+	/** Parser identity set only on command-argument completion mocks. */
+	completionOrigin?: 'minecraft:entity' | 'minecraft:game_profile'
 	arguments?: EntitySelectorArgumentsNode
 	currentEntity?: boolean
 	dimensionLimited?: boolean
@@ -145,13 +147,18 @@ export namespace EntitySelectorNode {
 		return ((node as EntitySelectorNode | undefined)?.type === 'mcfunction:entity_selector')
 	}
 
-	export function mock(range: core.RangeLike, options: core.LiteralOptions): EntitySelectorNode {
+	export function mock(
+		range: core.RangeLike,
+		options: core.LiteralOptions,
+		completionOrigin?: EntitySelectorNode['completionOrigin'],
+	): EntitySelectorNode {
 		const literal = core.LiteralNode.mock(range, options)
 		return {
 			type: 'mcfunction:entity_selector',
 			range: core.Range.get(range),
 			children: [literal],
 			variable: 'e',
+			...(completionOrigin ? { completionOrigin } : {}),
 		}
 	}
 
@@ -596,12 +603,29 @@ export namespace TimeNode {
 export interface UuidNode extends core.AstNode {
 	type: 'mcfunction:uuid'
 	bits: [bigint, bigint]
+	/** Parser identity set only on command-argument completion mocks. */
+	completionOrigin?: 'minecraft:uuid'
+}
+export namespace UuidNode {
+	export function mock(
+		range: core.RangeLike,
+		completionOrigin?: UuidNode['completionOrigin'],
+	): UuidNode {
+		return {
+			type: 'mcfunction:uuid',
+			range: core.Range.get(range),
+			bits: [0n, 0n],
+			...(completionOrigin ? { completionOrigin } : {}),
+		}
+	}
 }
 
 export interface VectorNode extends core.SequenceNode<CoordinateNode> {
 	type: 'mcfunction:vector'
 	options: VectorNode.Options
 	system: CoordinateSystem
+	/** Parser identity set only on command-argument completion mocks. */
+	completionOrigin?: 'minecraft:vec3'
 }
 export namespace VectorNode {
 	export interface Options {
@@ -610,13 +634,18 @@ export namespace VectorNode {
 		noLocal?: boolean
 	}
 
-	export function mock(range: core.RangeLike, options: Options): VectorNode {
+	export function mock(
+		range: core.RangeLike,
+		options: Options,
+		completionOrigin?: VectorNode['completionOrigin'],
+	): VectorNode {
 		return {
 			type: 'mcfunction:vector',
 			range: core.Range.get(range),
 			children: [],
 			options,
 			system: CoordinateSystem.World,
+			...(completionOrigin ? { completionOrigin } : {}),
 		}
 	}
 }

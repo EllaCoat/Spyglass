@@ -14,6 +14,7 @@ import {
 	stampVisibility,
 	trackDeclarationVisibility,
 } from '../util/withinPattern.js'
+import { resolvePendingEntityReferences } from './entity.js'
 
 function enclosingImpDoc(node: core.AstNode): ImpDocNode | undefined {
 	let parent = node.parent
@@ -107,6 +108,9 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 		// v3 union entry として記録するだけにする。
 		stampVisibility(symbol, visibility, candidate)
 		trackDeclarationVisibility(ctx.symbols, symbol, candidate.uri)
+		if (category === 'entity') {
+			resolvePendingEntityReferences(ctx, name)
+		}
 
 		// desc は (uri, range) 辞書順先頭の declaration entry が担う (= 再解析で
 		// 非決定的に変わることを防ぐ、 canonical 1 本時代からの determinism 維持)。

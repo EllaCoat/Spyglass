@@ -166,52 +166,29 @@ export function record<K extends AstNode, V extends AstNode, N extends RecordBas
 	}
 }
 
-export const resourceLocation: Completer<ResourceLocationNode> = (node, ctx) => {
+/**
+ * Normalizes a pool of full resource location identifiers into completion labels,
+ * applying the node's implicit path, the `idOmitDefaultNamespace` lint rule, and
+ * the namespace-path separator. Kept as a pure helper so plugins wrapping the
+ * built-in completer share the exact same label rules (no drift).
+ */
+export function normalizeResourceLocationLabels(
+	pool: readonly string[],
+	node: DeepReadonly<ResourceLocationNode>,
+	ctx: CompleterContext,
+): string[] {
 	const config = LinterConfigValue.destruct(ctx.config.lint.idOmitDefaultNamespace)
 
 	const includeEmptyNamespace = !node.options.requireCanonical && node.namespace === ''
 	const includeDefaultNamespace = node.options.requireCanonical || config?.ruleValue !== true
 	const excludeDefaultNamespace = !node.options.requireCanonical && config?.ruleValue !== false
 
-	const getPool = (category: string) => {
-		const symbols = ctx.symbols.getVisibleSymbols(category, ctx.doc.uri)
-		const declarations = Object.entries(symbols).flatMap(([key, symbol]) =>
-			SymbolUtil.isDeclared(symbol) ? [key] : []
-		)
-		return optimizePool(declarations)
-	}
-	const optimizePool = (pool: readonly string[]) => {
-		const defaultNsPrefix = ResourceLocation.DefaultNamespace + ResourceLocation.NamespacePathSep
-		const defaultNsIds: string[] = []
-		const otherIds: string[] = []
-		for (const id of filterPool(pool)) {
-			if (id.startsWith(defaultNsPrefix)) {
-				defaultNsIds.push(id)
-			} else {
-				otherIds.push(id)
-			}
-		}
-		const ans = [
-			...otherIds,
-			...(includeDefaultNamespace ? defaultNsIds : []),
-			...(excludeDefaultNamespace
-				? defaultNsIds.map((id) => id.slice(defaultNsPrefix.length))
-				: []),
-			...(includeEmptyNamespace
-				? defaultNsIds.map((id) => id.slice(ResourceLocation.DefaultNamespace.length))
-				: []),
-		]
-		if (node.options.namespacePathSep === '.') {
-			return ans.map((v) => v.replace(ResourceLocation.NamespacePathSep, '.'))
-		}
-		return ans
-	}
-	const filterPool = (pool: readonly string[]) => {
+	const filterPool = (rawPool: readonly string[]) => {
 		if (!node.options.implicitPath) {
-			return pool
+			return rawPool
 		}
 		const ans = []
-		for (const id of pool) {
+		for (const id of rawPool) {
 			const sep = id.indexOf(ResourceLocation.NamespacePathSep)
 			const path = id.slice(sep + 1)
 			if (path.startsWith(node.options.implicitPath)) {
@@ -221,8 +198,43 @@ export const resourceLocation: Completer<ResourceLocationNode> = (node, ctx) => 
 		return ans
 	}
 
+	const defaultNsPrefix = ResourceLocation.DefaultNamespace + ResourceLocation.NamespacePathSep
+	const defaultNsIds: string[] = []
+	const otherIds: string[] = []
+	for (const id of filterPool(pool)) {
+		if (id.startsWith(defaultNsPrefix)) {
+			defaultNsIds.push(id)
+		} else {
+			otherIds.push(id)
+		}
+	}
+	const ans = [
+		...otherIds,
+		...(includeDefaultNamespace ? defaultNsIds : []),
+		...(excludeDefaultNamespace
+			? defaultNsIds.map((id) => id.slice(defaultNsPrefix.length))
+			: []),
+		...(includeEmptyNamespace
+			? defaultNsIds.map((id) => id.slice(ResourceLocation.DefaultNamespace.length))
+			: []),
+	]
+	if (node.options.namespacePathSep === '.') {
+		return ans.map((v) => v.replace(ResourceLocation.NamespacePathSep, '.'))
+	}
+	return ans
+}
+
+export const resourceLocation: Completer<ResourceLocationNode> = (node, ctx) => {
+	const getPool = (category: string) => {
+		const symbols = ctx.symbols.getVisibleSymbols(category, ctx.doc.uri)
+		const declarations = Object.entries(symbols).flatMap(([key, symbol]) =>
+			SymbolUtil.isDeclared(symbol) ? [key] : []
+		)
+		return normalizeResourceLocationLabels(declarations, node, ctx)
+	}
+
 	const pool = node.options.pool
-		? optimizePool(node.options.pool)
+		? normalizeResourceLocationLabels(node.options.pool, node, ctx)
 		: [
 			...(!node.options.requireTag
 				? getPool(node.options.category)

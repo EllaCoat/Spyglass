@@ -35,6 +35,8 @@ function mockCtx(offset: number): core.CompleterContext {
 					}
 					: {},
 			}),
+			// generic caller API (`getDocumentResource`) が引く URI 逆引き index。
+			getSymbolCandidatesAtUri: () => [],
 		} as unknown as core.SymbolUtil,
 		config: {} as core.Config,
 	} as unknown as core.CompleterContext
@@ -122,19 +124,18 @@ describe('IMP-Doc score_holder guard (P5c0 review)', () => {
 	})
 })
 
-describe('IMP-Doc resource_location tag guard (P5c0 review)', () => {
-	// isTag=true では IMP-Doc は候補追加しない (# prefix broken insert 回避)。
-	it('excludes IMP-Doc identifiers when the resource_location node is a tag reference', () => {
+describe('IMP-Doc resource_location tag completion (P4-3b)', () => {
+	function setupTagCompleter() {
 		const meta = new core.MetaRegistry()
 		meta.registerCompleter<core.ResourceLocationNode>('resource_location', () => [])
 		meta.registerCompleter<core.SymbolNode>('symbol', () => [])
 		meta.registerCompleter<core.AstNode>('mcfunction:score_holder', () => [])
 		registerVisibilityCompleters(meta)
-		const completer = meta.getCompleter<core.ResourceLocationNode>(
-			'resource_location',
-		)
+		return meta.getCompleter<core.ResourceLocationNode>('resource_location')
+	}
 
-		const ctx = {
+	function tagCtx(): core.CompleterContext {
+		return {
 			doc: { uri: 'test://caller.mcfunction' },
 			offset: 0,
 			symbols: {
@@ -152,24 +153,41 @@ describe('IMP-Doc resource_location tag guard (P5c0 review)', () => {
 						}
 						: {},
 				}),
+				getSymbolCandidatesAtUri: () => [],
 			} as unknown as core.SymbolUtil,
-			config: {} as core.Config,
+			config: { lint: {} } as unknown as core.Config,
 		} as unknown as core.CompleterContext
+	}
 
+	// P5c0 の「isTag は候補追加しない」 guard は P4-3b の tag lookup 実装で撤去。
+	// label に `#` prefix を付けて追加するため broken insert は起きない。
+	it('adds # prefixed IMP-Doc tag identifiers when the node allows tags', () => {
+		const completer = setupTagCompleter()
 		const node = {
 			type: 'resource_location',
 			range: core.Range.create(0, 5),
 			children: [],
 			isTag: true,
+			options: { category: 'function', allowTag: true },
+			raw: '',
+		} as unknown as core.DeepReadonly<core.ResourceLocationNode>
+
+		const items = completer(node, tagCtx())
+		assert.equal(items.filter(i => i.label === '#test:tag').length, 1)
+		assert.equal(items.filter(i => i.label === 'test:tag').length, 0)
+	})
+
+	it('adds no tag identifiers when the node does not allow tags', () => {
+		const completer = setupTagCompleter()
+		const node = {
+			type: 'resource_location',
+			range: core.Range.create(0, 5),
+			children: [],
 			options: { category: 'function' },
 			raw: '',
 		} as unknown as core.DeepReadonly<core.ResourceLocationNode>
 
-		const items = completer(node, ctx)
-		assert.equal(
-			items.filter(i => i.label === 'test:tag').length,
-			0,
-			'IMP-Doc identifiers must not be added for tag references',
-		)
+		const items = completer(node, tagCtx())
+		assert.equal(items.filter(i => i.label.includes('test:tag')).length, 0)
 	})
 })

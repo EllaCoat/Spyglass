@@ -65,6 +65,7 @@ import {
 	ObjectiveCriteriaNode,
 	ParticleNode,
 	ScoreHolderNode,
+	UuidNode,
 	VectorNode,
 } from '../node/index.js'
 import type { ArgumentTreeNode } from '../tree/index.js'
@@ -87,8 +88,11 @@ export const getMockNodes: mcf.completer.MockNodesGetter = (
 		case 'minecraft:float_range':
 		case 'minecraft:message':
 		case 'minecraft:time':
-		case 'minecraft:uuid':
 			return []
+		case 'minecraft:uuid':
+			// No completer is registered for `mcfunction:uuid` in this package, so the
+			// mock only produces items when a plugin (e.g. an alias provider) does.
+			return UuidNode.mock(range, 'minecraft:uuid')
 		case 'brigadier:string':
 			return treeNode.properties.type === 'phrase'
 				? StringNode.mock(range, BrigadierStringOptions)
@@ -119,7 +123,7 @@ export const getMockNodes: mcf.completer.MockNodesGetter = (
 		case 'minecraft:game_profile':
 			return EntitySelectorNode.mock(range, {
 				pool: EntitySelectorAtVariable.filterAvailable(ctx),
-			})
+			}, treeNode.parser)
 		case 'minecraft:heightmap':
 			return LiteralNode.mock(range, { pool: HeightmapValues })
 		case 'minecraft:entity_anchor':
@@ -206,7 +210,7 @@ export const getMockNodes: mcf.completer.MockNodesGetter = (
 		case 'minecraft:vec2':
 			return VectorNode.mock(range, { dimension: 2, integersOnly: true })
 		case 'minecraft:vec3':
-			return VectorNode.mock(range, { dimension: 3 })
+			return VectorNode.mock(range, { dimension: 3 }, 'minecraft:vec3')
 		case 'spyglassmc:criterion':
 			const advancementNode = prevNodes.length > 0
 				? prevNodes[prevNodes.length - 1].children[0]
