@@ -52,13 +52,14 @@ export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
 
 	// impDoc binder を明示登録すると fallback は impDoc で停止するため、
 	// declaration / alias + attached mcfunction command node の binder を明示 dispatch する。
+	// binder 未登録 type (= `mcfunction:macro` 等) も getBinder の fallback 経由で
+	// 降ろす: hasBinder guard で skip すると macro 配下に nest した参照 node が
+	// 全件 unbound になり best-effort existence check が誤爆する (spike 2)。
 	for (const child of node.children ?? []) {
-		if (ctx.meta.hasBinder(child.type)) {
-			const childBinder = ctx.meta.getBinder(child.type)
-			const result = childBinder(child, ctx)
-			if (result instanceof Promise) {
-				await result
-			}
+		const childBinder = ctx.meta.getBinder(child.type)
+		const result = childBinder(child, ctx)
+		if (result instanceof Promise) {
+			await result
 		}
 	}
 })

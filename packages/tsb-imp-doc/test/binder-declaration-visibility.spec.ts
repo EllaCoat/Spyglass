@@ -11,6 +11,8 @@ import type {
 	ImpDocValue,
 } from '../lib/index.js'
 import {
+	canonicalizeLegacyDeclarationSymbolName,
+	getCanonicalSymbolCategory,
 	getImpDocSymbolData,
 	impDoc,
 	LEGACY_DECLARABLE_TYPES,
@@ -193,17 +195,29 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 		for (const spec of LEGACY_DECLARABLE_TYPES) {
 			const nodes = declarations.filter(node => node.category === spec.id)
 			assert.equal(nodes.length, 2, spec.id)
-			const name = nodes[0]!.name.raw
-			const symbol = symbols.lookup(spec.id, [name]).symbol
+			const name = canonicalizeLegacyDeclarationSymbolName(
+				spec.id,
+				nodes[0]!.name.raw,
+			)!
+			const symbol = symbols
+				.lookup(getCanonicalSymbolCategory(spec.id), [name])
+				.symbol
 			assert.ok(symbol, spec.id)
 			assert.equal(nodes[0]?.symbol, symbol, spec.id)
 			assert.equal(nodes[1]?.symbol, symbol, spec.id)
 			assert.equal(symbol.declaration?.length, 2, spec.id)
 		}
 
-		assert.ok(symbols.lookup('sequence', ['Sequence.One']).symbol)
+		// `sequence` declarations consolidate into the canonical
+		// `random_sequence` table; no duplicate symbol stays behind in the
+		// legacy `sequence` table.
+		assert.ok(symbols.lookup('random_sequence', ['minecraft:Sequence.One']).symbol)
 		assert.equal(
 			symbols.lookup('random_sequence', ['Sequence.One']).symbol,
+			undefined,
+		)
+		assert.equal(
+			symbols.lookup('sequence', ['Sequence.One']).symbol,
 			undefined,
 		)
 	})
@@ -230,9 +244,15 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 		)
 
 		for (const node of declarations) {
+			const name = canonicalizeLegacyDeclarationSymbolName(
+				node.category,
+				node.name.raw,
+			)!
 			assert.equal(
 				node.symbol,
-				symbols.lookup(node.category, [node.name.raw]).symbol,
+				symbols
+					.lookup(getCanonicalSymbolCategory(node.category), [name])
+					.symbol,
 				node.category,
 			)
 		}

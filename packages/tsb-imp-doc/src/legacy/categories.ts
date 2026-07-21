@@ -1,10 +1,27 @@
 /* eslint-disable no-restricted-syntax -- LegacyCategorySpec intentionally uses null for no v4 mapping. */
+/**
+ * The v4 consumer node route that surfaces a legacy category to completion /
+ * hover / definition wrappers:
+ * - `resource-location`: core `resource_location` nodes
+ * - `symbol`: core `symbol` nodes (plain variable identifiers)
+ * - `score-holder`: java-edition `mcfunction:score_holder` nodes
+ * - `entity`: plugin-local usage-site route (Phase 4-3b)
+ * - `alias`: `#alias` snippet completion (Phase 4-3b)
+ */
+export type LegacyConsumerKind =
+	| 'resource-location'
+	| 'symbol'
+	| 'score-holder'
+	| 'entity'
+	| 'alias'
+
 export interface LegacyCategorySpec {
 	readonly id: string
 	readonly family: 'namespaced' | 'entity-like' | 'plain-variable' | 'alias'
 	readonly v4Category: string | null
 	readonly namespaced: boolean
 	readonly nativeSupport: 'native' | 'mapped' | 'plugin-local' | 'not-in-v4'
+	readonly consumerKind: LegacyConsumerKind
 }
 
 type CategoryWithId<Id extends string, V4Category extends string | null> =
@@ -20,20 +37,21 @@ function category<
 	v4Category: V4Category,
 	namespaced: boolean,
 	nativeSupport: LegacyCategorySpec['nativeSupport'],
+	consumerKind: LegacyConsumerKind,
 ): CategoryWithId<Id, V4Category> {
-	return { id, family, v4Category, namespaced, nativeSupport }
+	return { id, family, v4Category, namespaced, nativeSupport, consumerKind }
 }
 
 function nativeNamespaced<const Id extends string>(
 	id: Id,
 ): CategoryWithId<Id, Id> {
-	return category(id, 'namespaced', id, true, 'native')
+	return category(id, 'namespaced', id, true, 'native', 'resource-location')
 }
 
 function missingNamespaced<const Id extends string>(
 	id: Id,
 ): CategoryWithId<Id, null> {
-	return category(id, 'namespaced', null, true, 'not-in-v4')
+	return category(id, 'namespaced', null, true, 'not-in-v4', 'resource-location')
 }
 
 export const LEGACY_FILE_TYPES = [
@@ -94,19 +112,28 @@ export const LEGACY_WORLDGEN_FILE_TYPES = [
 
 export const LEGACY_MISC_TYPES = [
 	nativeNamespaced('bossbar'),
-	category('entity', 'entity-like', 'entity', false, 'native'),
-	category('objective', 'plain-variable', 'objective', false, 'native'),
-	category('score_holder', 'entity-like', 'score_holder', false, 'native'),
+	// core `DatapackCategories` has no `entity` category, so the symbol table is
+	// plugin-local; usage-site consumers arrive with Phase 4-3b (spike 1).
+	category('entity', 'entity-like', 'entity', false, 'plugin-local', 'entity'),
+	category('objective', 'plain-variable', 'objective', false, 'native', 'symbol'),
+	category('score_holder', 'entity-like', 'score_holder', false, 'native', 'score-holder'),
 	nativeNamespaced('storage'),
-	category('tag', 'plain-variable', 'tag', false, 'native'),
-	category('team', 'plain-variable', 'team', false, 'native'),
-	category('sequence', 'plain-variable', 'random_sequence', false, 'mapped'),
+	category('tag', 'plain-variable', 'tag', false, 'native', 'symbol'),
+	category('team', 'plain-variable', 'team', false, 'native', 'symbol'),
+	category(
+		'sequence',
+		'plain-variable',
+		'random_sequence',
+		false,
+		'mapped',
+		'resource-location',
+	),
 ] as const satisfies readonly LegacyCategorySpec[]
 
 export const LEGACY_ALIAS_TYPES = [
-	category('alias/entity', 'alias', 'alias/entity', false, 'plugin-local'),
-	category('alias/uuid', 'alias', 'alias/uuid', false, 'plugin-local'),
-	category('alias/vector', 'alias', 'alias/vector', false, 'plugin-local'),
+	category('alias/entity', 'alias', 'alias/entity', false, 'plugin-local', 'alias'),
+	category('alias/uuid', 'alias', 'alias/uuid', false, 'plugin-local', 'alias'),
+	category('alias/vector', 'alias', 'alias/vector', false, 'plugin-local', 'alias'),
 ] as const satisfies readonly LegacyCategorySpec[]
 
 export const LEGACY_DECLARABLE_TYPES = [
@@ -143,6 +170,16 @@ const LegacyCategoryById: ReadonlyMap<string, LegacyCategorySpec> = new Map(
 	[...LEGACY_DECLARABLE_TYPES, ...LEGACY_ALIAS_TYPES]
 		.map(spec => [spec.id, spec] as const),
 )
+const LegacySpecsByCanonical = new Map<string, LegacyCategorySpec[]>()
+for (const spec of [...LEGACY_DECLARABLE_TYPES, ...LEGACY_ALIAS_TYPES]) {
+	const canonical = spec.v4Category ?? spec.id
+	const specs = LegacySpecsByCanonical.get(canonical)
+	if (specs) {
+		specs.push(spec)
+	} else {
+		LegacySpecsByCanonical.set(canonical, [spec])
+	}
+}
 
 export function isLegacyFileType(id: string): id is LegacyFileTypeId {
 	return LegacyFileTypeIdSet.has(id)
@@ -158,4 +195,25 @@ export function getLegacyCategorySpec(
 	id: string,
 ): LegacyCategorySpec | undefined {
 	return LegacyCategoryById.get(id)
+}
+
+/**
+ * The canonical symbol-table category for a legacy category id: `sequence`
+ * consolidates into v4's `random_sequence` table, categories without a v4
+ * native table (`v4Category = null`) keep their legacy id as a plugin-local
+ * table, and unknown ids pass through unchanged (lossless TSB extensions).
+ */
+export function getCanonicalSymbolCategory(id: string): string {
+	return LegacyCategoryById.get(id)?.v4Category ?? id
+}
+
+/**
+ * Reverse lookup from a canonical (v4) symbol category to the legacy category
+ * specs it serves, e.g. `random_sequence` resolves back to the `sequence`
+ * spec. Categories that map onto themselves return their own spec.
+ */
+export function getLegacySpecsByCanonicalCategory(
+	category: string,
+): readonly LegacyCategorySpec[] {
+	return LegacySpecsByCanonical.get(category) ?? []
 }

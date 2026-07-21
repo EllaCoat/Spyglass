@@ -1,9 +1,7 @@
 import type { AstNode, Linter, LinterContext, Logger, StateProxy } from '@spyglassmc/core'
 import { ResourceLocationNode } from '@spyglassmc/core'
-import type { ImpDocVisibility } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, getRefProvenance } from '../node/ImpDocNode.js'
-import { getVisibilityEntries, matchesVisibility } from '../util/withinPattern.js'
-import { getCaller } from './private.js'
+import { describeVisibilityScope, findVisibilityViolation, getCaller } from './private.js'
 
 export function bestEffortConfigValidator(
 	_ruleName: string,
@@ -29,10 +27,12 @@ function visit(node: AstNode, fn: (node: AstNode) => void): void {
 /**
  * Warning-level counterpart of `impDocPrivate` for references whose runtime
  * semantics cannot be fully resolved statically (provenance-tagged macro-line
- * and quoted-string references, see `ImpDocRefProvenance`). On top of the
- * strict rule's visibility union check (v3 parity, any-match) it also flags
- * targets without any declaration or definition, because such references never
- * surface through the resolved-symbol diagnostics.
+ * and quoted-string references, see `ImpDocRefProvenance`). Provenance tagging
+ * stays scoped to function references extracted from macro / NBT contexts
+ * (P4-2c policy). On top of the strict rule's visibility union check (v3
+ * parity, any-match) it also flags targets without any declaration or
+ * definition, because such references never surface through the
+ * resolved-symbol diagnostics.
  */
 export const privateBestEffortVisibility: Linter<AstNode> = (node, ctx: LinterContext) => {
 	const caller = getCaller(ctx, node)
@@ -69,34 +69,17 @@ export const privateBestEffortVisibility: Linter<AstNode> = (node, ctx: LinterCo
 			return
 		}
 
-		const data = getImpDocSymbolData(symbol?.data)
-		const entries = getVisibilityEntries(data)
-		// metadata 無しは defensive に許可。 v3 union parity: definition /
-		// declaration のどれか 1 entry でも caller を許可すれば OK (any-match)。
-		if (
-			entries.length === 0
-			|| entries.some(entry => matchesVisibility(entry, caller, 'function'))
-		) {
-			return
-		}
-		// public entry は any-match で必ず許可済みなので、 ここに残る entry は
-		// 全て restricted。 message には entries 順 (= definition 優先、 次いで
-		// (uri, range) 昇順) の先頭を代表として使う。
-		const visibility = entries.find(
-			(entry): entry is Exclude<ImpDocVisibility, { type: 'public' }> => entry.type !== 'public',
+		const visibility = findVisibilityViolation(
+			getImpDocSymbolData(symbol?.data),
+			caller,
 		)
 		if (!visibility) {
 			return
 		}
 
-		const scope = visibility.type === 'private' || visibility.type === 'denied'
-			? `private to “${visibility.owner}”`
-			: visibility.type === 'internal'
-			? `internal to the namespace of “${visibility.owner}”`
-			: `restricted by “${visibility.owner}”`
-
+		const scope = describeVisibilityScope(visibility)
 		ctx.err.lint(
-			`Function “${target}” is ${scope} and cannot be called from “${caller}” (referenced in ${origin})`,
+			`Function “${target}” is ${scope} and cannot be called from “${caller.resourceID}” (referenced in ${origin})`,
 			candidate,
 		)
 	})

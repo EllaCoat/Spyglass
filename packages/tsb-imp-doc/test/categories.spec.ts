@@ -2,7 +2,9 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
+	getCanonicalSymbolCategory,
 	getLegacyCategorySpec,
+	getLegacySpecsByCanonicalCategory,
 	isLegacyFileType,
 	isLegacyWithinTarget,
 	LEGACY_ALIAS_TYPES,
@@ -34,30 +36,78 @@ describe('legacy category manifest', () => {
 		assert.equal(LEGACY_WITHIN_TARGET_IDS.length, 48)
 	})
 
-	it('records the exceptional mappings and legacy identifier families', () => {
+	it('routes sequence through the canonical resource-location consumer', () => {
 		assert.deepEqual(getLegacyCategorySpec('sequence'), {
 			id: 'sequence',
 			family: 'plain-variable',
 			v4Category: 'random_sequence',
 			namespaced: false,
 			nativeSupport: 'mapped',
+			consumerKind: 'resource-location',
 		})
+	})
+
+	it('records the exceptional mappings and legacy identifier families', () => {
 		assert.deepEqual(getLegacyCategorySpec('worldgen/configured_decorator'), {
 			id: 'worldgen/configured_decorator',
 			family: 'namespaced',
 			v4Category: null,
 			namespaced: true,
 			nativeSupport: 'not-in-v4',
+			consumerKind: 'resource-location',
 		})
-		assert.equal(getLegacyCategorySpec('entity')?.family, 'entity-like')
+		// spike 1: core `DatapackCategories` has no `entity` category, so the
+		// v3 `entity` misc type is plugin-local, not native.
+		assert.deepEqual(getLegacyCategorySpec('entity'), {
+			id: 'entity',
+			family: 'entity-like',
+			v4Category: 'entity',
+			namespaced: false,
+			nativeSupport: 'plugin-local',
+			consumerKind: 'entity',
+		})
 		assert.equal(getLegacyCategorySpec('score_holder')?.family, 'entity-like')
+		assert.equal(getLegacyCategorySpec('score_holder')?.consumerKind, 'score-holder')
 		for (const id of ['objective', 'tag', 'team'] as const) {
 			assert.equal(getLegacyCategorySpec(id)?.family, 'plain-variable')
+			assert.equal(getLegacyCategorySpec(id)?.consumerKind, 'symbol')
 		}
 		for (const spec of LEGACY_ALIAS_TYPES) {
 			assert.equal(spec.family, 'alias')
 			assert.equal(spec.nativeSupport, 'plugin-local')
+			assert.equal(spec.consumerKind, 'alias')
 		}
+		for (const spec of LEGACY_DECLARABLE_TYPES) {
+			if (spec.family === 'namespaced') {
+				assert.equal(spec.consumerKind, 'resource-location', spec.id)
+			}
+		}
+	})
+
+	it('maps every category onto one canonical symbol category', () => {
+		assert.equal(getCanonicalSymbolCategory('sequence'), 'random_sequence')
+		assert.equal(getCanonicalSymbolCategory('function'), 'function')
+		assert.equal(
+			getCanonicalSymbolCategory('worldgen/configured_decorator'),
+			'worldgen/configured_decorator',
+		)
+		// Unknown ids stay lossless (TSB dialect extensions).
+		assert.equal(
+			getCanonicalSymbolCategory('alias/selectorTemplate'),
+			'alias/selectorTemplate',
+		)
+
+		assert.deepEqual(
+			getLegacySpecsByCanonicalCategory('random_sequence').map(spec => spec.id),
+			['sequence'],
+		)
+		// No canonical table is named `sequence` anymore.
+		assert.deepEqual(getLegacySpecsByCanonicalCategory('sequence'), [])
+		assert.deepEqual(
+			getLegacySpecsByCanonicalCategory('function').map(spec => spec.id),
+			['function'],
+		)
+		assert.deepEqual(getLegacySpecsByCanonicalCategory('unknown'), [])
 	})
 
 	it('exposes constant-time membership and lookup helpers', () => {

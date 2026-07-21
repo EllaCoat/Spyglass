@@ -16,6 +16,7 @@ import type {
 	ImpDocValue,
 } from '../node/ImpDocNode.js'
 import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
+import { scanLineFunctionRefs } from '../util/macroRefScanner.js'
 
 const DeclarationCategoryIds: ReadonlySet<string> = new Set(
 	LEGACY_DECLARABLE_TYPES.map(spec => spec.id),
@@ -656,6 +657,34 @@ function overlapsAnyDeclarationLine(
 }
 
 /**
+ * Nests static function references scanned from a `mcfunction:macro` line as
+ * children of the `mcfunction:macro/other` segment that contains them. Nesting
+ * keeps `AstNode.findChildIndex`'s binary-search invariant intact (a sibling
+ * overlay node overlapping the macro range would break it, spike 2), so hover
+ * and `findDeepestChild` remain deterministic. Fully dynamic `$(...)` targets
+ * are left untouched: macro substitution is legitimate LSP-side syntax and
+ * receives no diagnostic here.
+ */
+function decorateMacroRefs(node: core.AstNode, src: core.Source): void {
+	const line = src.string.slice(node.range.start, node.range.end)
+	const scan = scanLineFunctionRefs(line, node.range.start, true)
+	for (const ref of scan.refs) {
+		const host = node.children?.find(child =>
+			child.type === 'mcfunction:macro/other'
+			&& child.range.start <= ref.range.start
+			&& ref.range.end <= child.range.end
+		)
+		// A ref crossing a segment boundary would break the child-range
+		// invariant; scanned static targets never touch `$(`, so a missing
+		// host only occurs on malformed macro lines and is safely dropped.
+		if (!host) {
+			continue
+		}
+		;(host.children ??= []).push(ref)
+	}
+}
+
+/**
  * Adapts an already configured mcfunction language parser by replacing legacy `#>` comment runs
  * with first-class `ImpDocNode`s while retaining semantic command nodes attached to declaration
  * blocks.
@@ -673,6 +702,11 @@ export function extendMcfunctionParser(
 		const children: core.AstNode[] = []
 		for (let i = 0; i < originalChildren.length; i++) {
 			const child = originalChildren[i]
+			if (child.type === 'mcfunction:macro') {
+				decorateMacroRefs(child, src)
+				children.push(child)
+				continue
+			}
 			if (child.type !== 'comment' || !src.slice(child).trimStart().startsWith('#>')) {
 				children.push(child)
 				continue
@@ -693,6 +727,9 @@ export function extendMcfunctionParser(
 					break
 				}
 				i++
+				if (candidate.type === 'mcfunction:macro') {
+					decorateMacroRefs(candidate, src)
+				}
 				if (overlapsAnyDeclarationLine(candidate, component.declaration)) {
 					attachedNodes.push(candidate)
 				}

@@ -25,6 +25,8 @@ export * from './legacy/syntax.js'
 export { getContractCheckSeverity, type ImpDocContractCheckSeverity } from './linter/contract.js'
 export * from './node/ImpDocNode.js'
 export * from './parser/impDoc.js'
+export * from './util/documentFunction.js'
+export * from './util/macroRefScanner.js'
 export * from './util/withinPattern.js'
 export { ImpDocVersion } from './version.js'
 

@@ -38,6 +38,25 @@ export function canonicalizeLegacyDeclarationName(
 	return raw
 }
 
+/**
+ * Canonical symbol-table key for a parsed legacy declaration. The AST keeps
+ * v3's lossless spelling for non-namespaced families, while categories served
+ * by v4 resource-location consumers use the same default-namespace expansion
+ * as those consumers when they enter the symbol table.
+ */
+export function canonicalizeLegacyDeclarationSymbolName(
+	category: string,
+	raw: string,
+): string | undefined {
+	const name = canonicalizeLegacyDeclarationName(category, raw)
+	if (name === undefined) {
+		return undefined
+	}
+	return getLegacyCategorySpec(category)?.consumerKind === 'resource-location'
+		? core.ResourceLocation.lengthen(name)
+		: name
+}
+
 export interface LegacyAliasNameParserContext {
 	err: core.ErrorReporter
 }
