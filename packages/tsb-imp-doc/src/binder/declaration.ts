@@ -1,5 +1,6 @@
 import * as core from '@spyglassmc/core'
 import { getCanonicalSymbolCategory } from '../legacy/categories.js'
+import { canonicalizeLegacyDeclarationSymbolName } from '../legacy/syntax.js'
 import type {
 	ImpDocDeclarationNode,
 	ImpDocDeclarationSource,
@@ -74,10 +75,14 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 
 		// `sequence` などの mapped category は canonical (v4) symbol table に集約する。
 		const category = getCanonicalSymbolCategory(node.category)
+		const name = canonicalizeLegacyDeclarationSymbolName(
+			node.category,
+			node.name.raw,
+		) ?? node.name.raw
 		ctx.symbols.query(
 			ctx.doc,
 			category,
-			node.name.raw,
+			name,
 		).enter({
 			usage: {
 				type: 'declaration',
@@ -88,7 +93,7 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 		// Restricted query() は symbol を隠すため、 enter 後は raw lookup で取得。
 		const symbol = ctx.symbols.lookup(
 			category,
-			[node.name.raw],
+			[name],
 			node,
 		).symbol
 		if (!symbol) {

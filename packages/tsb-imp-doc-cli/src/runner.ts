@@ -396,10 +396,13 @@ function discoverExportKeys(input: FileInput): string[] {
 	}
 	for (const match of input.content.matchAll(LegacyDeclarationExportPattern)) {
 		const category = match[1]!
-		const canonical = impDoc.canonicalizeLegacyDeclarationName(category, match[2]!)
+		const canonical = impDoc.canonicalizeLegacyDeclarationSymbolName(
+			category,
+			match[2]!,
+		)
 		if (canonical !== undefined) {
-			// Symbol table keys use the canonical (v4) category, so export keys
-			// must match it for the dependency graph to expand correctly.
+			// Symbol table keys use the canonical (v4) category and consumer-side
+			// name, so discovered exports must match both for graph expansion.
 			keys.add(toSymbolKey(impDoc.getCanonicalSymbolCategory(category), [canonical]))
 		}
 	}

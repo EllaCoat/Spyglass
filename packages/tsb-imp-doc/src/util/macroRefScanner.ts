@@ -27,7 +27,7 @@ const StaticRefPattern =
 
 /** A static optional sequence argument to the vanilla `random` command. */
 const RandomSequenceRefPattern =
-	/\brandom[\t ]+(?:(?:value|roll)[\t ]+\S+|reset)[\t ]+((?:[a-z0-9_.-]+:)?[a-z0-9_./-]+)/g
+	/^random[\t ]+(?:(?:value|roll)[\t ]+\S+|reset)[\t ]+((?:[a-z0-9_.-]+:)?[a-z0-9_./-]+)/
 
 /**
  * A `$(` completing the matched resource-location token across `:` and `/`,
@@ -164,24 +164,37 @@ export function scanLineRandomSequenceRefs(
 	lineStart: number,
 	isMacroLine: boolean,
 ): core.ResourceLocationNode[] {
-	const refs: core.ResourceLocationNode[] = []
-	for (const match of line.matchAll(RandomSequenceRefPattern)) {
-		const raw = match[1]!
-		const suffix = line.slice(match.index + match[0].length)
-		if (MacroSuffixPattern.test(suffix)) {
-			continue
-		}
-		const targetStart = lineStart + match.index + match[0].lastIndexOf(raw)
-		const ref = parseRandomSequenceRefNode(
-			raw,
-			core.Range.create(targetStart, targetStart + raw.length),
-		)
-		if (isMacroLine) {
-			setRefProvenance(ref, 'macro')
-		} else if (isInsideQuote(line, match.index)) {
-			setRefProvenance(ref, 'nbt-string')
-		}
-		refs.push(ref)
+	const firstTokenStart = line.search(/[^\t ]/)
+	if (firstTokenStart < 0) {
+		return []
 	}
-	return refs
+
+	// `$` is the mcfunction macro-line marker, not part of the command token.
+	// Requiring it when the caller classified the line as a macro also keeps a
+	// malformed/mismatched call from scanning arbitrary text later in the line.
+	const commandStart = isMacroLine
+		? line[firstTokenStart] === '$' ? firstTokenStart + 1 : undefined
+		: firstTokenStart
+	if (commandStart === undefined) {
+		return []
+	}
+
+	const match = RandomSequenceRefPattern.exec(line.slice(commandStart))
+	if (!match) {
+		return []
+	}
+	const raw = match[1]!
+	const matchEnd = commandStart + match[0].length
+	if (MacroSuffixPattern.test(line.slice(matchEnd))) {
+		return []
+	}
+	const targetStart = lineStart + commandStart + match[0].lastIndexOf(raw)
+	const ref = parseRandomSequenceRefNode(
+		raw,
+		core.Range.create(targetStart, targetStart + raw.length),
+	)
+	if (isMacroLine) {
+		setRefProvenance(ref, 'macro')
+	}
+	return [ref]
 }

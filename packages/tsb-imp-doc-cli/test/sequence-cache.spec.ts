@@ -58,16 +58,17 @@ describe('sequence canonical category across cache lifecycles', () => {
 
 	function assertCanonicalOnly(cache: RawCache): void {
 		assert.ok(
-			cache.symbols['random_sequence']?.['Seq.One'],
+			cache.symbols['random_sequence']?.['minecraft:Seq.One'],
 			'expected the declaration to land in the canonical random_sequence table',
 		)
+		assert.equal(cache.symbols['random_sequence']?.['Seq.One'], undefined)
 		assert.equal(
 			cache.symbols['sequence'],
 			undefined,
 			'expected no duplicate symbol to remain in the legacy sequence table',
 		)
 		const keys = cache.manifest.files[declarer]?.exports.map(entry => entry.key) ?? []
-		assert.ok(keys.includes(toSymbolKey('random_sequence', ['Seq.One'])))
+		assert.ok(keys.includes(toSymbolKey('random_sequence', ['minecraft:Seq.One'])))
 		assert.equal(keys.includes(toSymbolKey('sequence', ['Seq.One'])), false)
 	}
 
@@ -80,6 +81,73 @@ describe('sequence canonical category across cache lifecycles', () => {
 		assert.equal(warm.cacheHit, true)
 		assert.deepEqual(warm.diagnostics, cold.diagnostics)
 		assertCanonicalOnly(await readCache())
+	})
+
+	it('ignores random-looking text outside the command position', async () => {
+		const consumer = join(functionsDir, 'consumer.mcfunction')
+		const sequence = 'example:private_sequence'
+		const sequenceKey = toSymbolKey('random_sequence', [sequence])
+		await Promise.all([
+			writeFile(
+				declarer,
+				'#> example:declares\n# @public\n\n'
+					+ '#> Private sequence\n# @private\n'
+					+ `    #declare sequence ${sequence}\n`,
+			),
+			writeFile(
+				consumer,
+				'#> example:consumer\n# @public\n\n'
+					+ `say random value 1..2 ${sequence}\n`,
+			),
+		])
+
+		const result = await run()
+		assert.deepEqual(result.diagnostics, [])
+		const cache = await readCache()
+		assert.deepEqual(cache.manifest.files[consumer]?.references, [])
+		assert.deepEqual(cache.graph.references[consumer], [])
+		assert.equal(cache.graph.dependents[sequenceKey], undefined)
+	})
+
+	it('connects a bare declaration to its default-namespace consumer', async () => {
+		const consumer = join(functionsDir, 'consumer.mcfunction')
+		const bareSequence = 'bare_sequence'
+		const sequence = `minecraft:${bareSequence}`
+		const sequenceKey = toSymbolKey('random_sequence', [sequence])
+		await Promise.all([
+			writeFile(
+				declarer,
+				'#> example:declares\n# @public\n\n'
+					+ '#> Bare private sequence\n# @private\n'
+					+ `    #declare sequence ${bareSequence}\n`,
+			),
+			writeFile(
+				consumer,
+				'#> example:consumer\n# @public\n\n'
+					+ `random value 1..2 ${bareSequence}\n`,
+			),
+		])
+
+		const result = await run()
+		assert.equal(result.diagnostics.length, 1)
+		assert.equal(result.diagnostics[0]?.file, consumer)
+		assert.equal(result.diagnostics[0]?.rule, 'impDocPrivate')
+		assert.match(
+			result.diagnostics[0]?.message ?? '',
+			/Symbol “minecraft:bare_sequence” in category “random_sequence” is private/,
+		)
+
+		const cache = await readCache()
+		assert.ok(cache.symbols['random_sequence']?.[sequence])
+		assert.equal(cache.symbols['random_sequence']?.[bareSequence], undefined)
+		assert.ok(
+			cache.manifest.files[declarer]?.exports.some(
+				entry => entry.key === sequenceKey,
+			),
+		)
+		assert.ok(cache.manifest.files[consumer]?.references.includes(sequenceKey))
+		assert.deepEqual(cache.graph.references[consumer], [sequenceKey])
+		assert.deepEqual(cache.graph.dependents[sequenceKey], [consumer])
 	})
 
 	it('reprocesses a random_sequence consumer when its producer adds a declaration', async () => {
