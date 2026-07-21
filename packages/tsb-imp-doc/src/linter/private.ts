@@ -69,16 +69,15 @@ interface UsageOptionsNode extends AstNode {
 
 /**
  * Only reference usages are linted: declaration / definition sites carry the
- * same bound symbol but must not be reported against themselves. A node
- * qualifies when its own options declare a reference usage (`undefined`
- * defaults to `reference` on entering, so only explicit non-reference usage
- * types disqualify), or when the symbol records a reference at exactly this
- * URI and range.
+ * same bound symbol but must not be reported against themselves. Parser nodes
+ * with options default to `reference`, so only an explicit non-reference usage
+ * type disqualifies them. Metadata-free nodes are ambiguous and fall back to
+ * an exact URI-and-range match in the symbol's reference locations.
  */
 function isReferenceUsage(node: AstNode, uri: string): boolean {
-	const usageType = (node as UsageOptionsNode).options?.usageType
-	if (usageType !== undefined) {
-		return usageType === 'reference'
+	const options = (node as UsageOptionsNode).options
+	if (options !== undefined) {
+		return options.usageType === undefined || options.usageType === 'reference'
 	}
 	return node.symbol?.reference?.some(location => {
 		const range = location.range

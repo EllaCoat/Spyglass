@@ -25,6 +25,10 @@ const DynamicRefPattern = /\bfunction[\t ]+#?\$\([^\s)]*\)?/g
 const StaticRefPattern =
 	/\bfunction[\t ]+(#?(?:[A-Za-z0-9_.-]+:[A-Za-z0-9_./-]+|[A-Za-z0-9_./-]+))/g
 
+/** A static optional sequence argument to the vanilla `random` command. */
+const RandomSequenceRefPattern =
+	/\brandom[\t ]+(?:(?:value|roll)[\t ]+\S+|reset)[\t ]+((?:[a-z0-9_.-]+:)?[a-z0-9_./-]+)/g
+
 /**
  * A `$(` completing the matched resource-location token across `:` and `/`,
  * which means the actual target is decided by macro substitution at runtime.
@@ -53,6 +57,24 @@ export function parseFunctionRefNode(
 		options: {
 			category: 'function',
 			allowTag: true,
+			usageType: 'reference',
+		},
+	}
+}
+
+function parseRandomSequenceRefNode(
+	raw: string,
+	range: core.Range,
+): core.ResourceLocationNode {
+	const separator = raw.indexOf(':')
+	return {
+		type: 'resource_location',
+		range,
+		namespace: separator >= 0 ? raw.slice(0, separator) : undefined,
+		path: raw.slice(separator + 1).split('/'),
+		isTag: false,
+		options: {
+			category: 'random_sequence',
 			usageType: 'reference',
 		},
 	}
@@ -130,4 +152,36 @@ export function scanLineFunctionRefs(
 	}
 
 	return { dynamicRanges, refs }
+}
+
+/**
+ * Scans the optional sequence argument of vanilla `random` commands for the
+ * standalone CLI parser. The full Java Edition parser already emits the same
+ * `random_sequence` resource-location node on the language-server path.
+ */
+export function scanLineRandomSequenceRefs(
+	line: string,
+	lineStart: number,
+	isMacroLine: boolean,
+): core.ResourceLocationNode[] {
+	const refs: core.ResourceLocationNode[] = []
+	for (const match of line.matchAll(RandomSequenceRefPattern)) {
+		const raw = match[1]!
+		const suffix = line.slice(match.index + match[0].length)
+		if (MacroSuffixPattern.test(suffix)) {
+			continue
+		}
+		const targetStart = lineStart + match.index + match[0].lastIndexOf(raw)
+		const ref = parseRandomSequenceRefNode(
+			raw,
+			core.Range.create(targetStart, targetStart + raw.length),
+		)
+		if (isMacroLine) {
+			setRefProvenance(ref, 'macro')
+		} else if (isInsideQuote(line, match.index)) {
+			setRefProvenance(ref, 'nbt-string')
+		}
+		refs.push(ref)
+	}
+	return refs
 }

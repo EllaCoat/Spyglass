@@ -9,7 +9,13 @@ import { scanMcfunctionFiles } from '../lib/scanner.js'
 
 interface RawCache {
 	contextHash: string
-	manifest: { files: Record<string, { exports: { key: string }[] }> }
+	manifest: {
+		files: Record<string, { exports: { key: string }[]; references: string[] }>
+	}
+	graph: {
+		references: Record<string, string[]>
+		dependents: Record<string, string[]>
+	}
 	symbols: Record<string, Record<string, unknown>>
 }
 
@@ -74,6 +80,68 @@ describe('sequence canonical category across cache lifecycles', () => {
 		assert.equal(warm.cacheHit, true)
 		assert.deepEqual(warm.diagnostics, cold.diagnostics)
 		assertCanonicalOnly(await readCache())
+	})
+
+	it('reprocesses a random_sequence consumer when its producer adds a declaration', async () => {
+		const consumer = join(functionsDir, 'consumer.mcfunction')
+		const sequence = 'example:dependency_sequence'
+		const sequenceKey = toSymbolKey('random_sequence', [sequence])
+		await Promise.all([
+			writeFile(
+				declarer,
+				'#> example:declares\n# @public\n\nsay no sequence yet\n',
+			),
+			writeFile(
+				consumer,
+				'#> example:consumer\n# @public\n\n'
+					+ `random value 1..2 ${sequence}\n`,
+			),
+		])
+
+		const cold = await run()
+		assert.equal(cold.fullScan, true)
+		assert.equal(cold.filesProcessed, 2)
+		assert.equal(
+			cold.diagnostics.some(diagnostic => diagnostic.rule === 'impDocPrivate'),
+			false,
+		)
+		const coldCache = await readCache()
+		assert.ok(coldCache.manifest.files[consumer]?.references.includes(sequenceKey))
+		assert.ok(coldCache.graph.references[consumer]?.includes(sequenceKey))
+		assert.deepEqual(coldCache.graph.dependents[sequenceKey], [consumer])
+
+		await writeFile(
+			declarer,
+			'#> example:declares\n# @public\n\n'
+				+ '#> Sequence declaration\n# @private\n'
+				+ `    #declare sequence ${sequence}\n\n`
+				+ 'say declares\n',
+		)
+		const incremental = await run()
+		assert.equal(incremental.fullScan, false)
+		assert.equal(incremental.cacheHit, false)
+		assert.equal(
+			incremental.filesProcessed,
+			2,
+			'the canonical discovered export key must expand to the cached consumer',
+		)
+		assert.equal(incremental.diagnostics.length, 1)
+		assert.equal(incremental.diagnostics[0]?.file, consumer)
+		assert.equal(incremental.diagnostics[0]?.rule, 'impDocPrivate')
+		assert.match(
+			incremental.diagnostics[0]?.message ?? '',
+			/Symbol “example:dependency_sequence” in category “random_sequence” is private/,
+		)
+
+		const updatedCache = await readCache()
+		assert.ok(updatedCache.symbols['random_sequence']?.[sequence])
+		assert.equal(updatedCache.symbols['sequence'], undefined)
+		assert.ok(
+			updatedCache.manifest.files[declarer]?.exports.some(
+				entry => entry.key === sequenceKey,
+			),
+		)
+		assert.deepEqual(updatedCache.graph.dependents[sequenceKey], [consumer])
 	})
 
 	it('drops a stale cache whose context hash predates the consolidation', async () => {

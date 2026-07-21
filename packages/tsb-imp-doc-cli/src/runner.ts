@@ -23,7 +23,8 @@ import {
 } from './manifest.js'
 import type { DiagnosticSeverity, LintDiagnostic } from './reporter.js'
 
-const CacheVersion = 2
+// v3 adds native random_sequence references to the per-file dependency graph.
+const CacheVersion = 3
 const ImpDocPrivateRule = 'impDocPrivate'
 const ImpDocPrivateBestEffortRule = 'impDocPrivateBestEffort'
 const UnresolvedRule = 'unresolved'
@@ -185,8 +186,8 @@ function runnerError(file: string, error: unknown): LintDiagnostic {
 /**
  * Minimal base parser for the CI vertical slice. The IMP-Doc initializer wraps this parser and
  * replaces the emitted legacy comment nodes with its own ImpDocNode implementation.
- * Reference extraction and provenance classification live in the shared
- * line-level scanner (`@spyglassmc/tsb-imp-doc` `scanLineFunctionRefs`).
+ * Reference extraction and provenance classification live in shared
+ * line-level scanners from `@spyglassmc/tsb-imp-doc`.
  */
 export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 	const children: core.AstNode[] = []
@@ -201,6 +202,7 @@ export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 		} else {
 			const isMacroLine = line[leadingSpace] === '$'
 			const scan = impDoc.scanLineFunctionRefs(line, offset, isMacroLine)
+			const sequenceRefs = impDoc.scanLineRandomSequenceRefs(line, offset, isMacroLine)
 			for (const range of scan.dynamicRanges) {
 				// A fully dynamic target can never be resolved statically, so it
 				// stays best-effort: a warning plus a provenance-tagged marker
@@ -214,7 +216,7 @@ export const cliMcfunction: core.Parser<CliMcfunctionNode> = (src, ctx) => {
 				impDoc.setRefProvenance(marker, 'dynamic-pattern')
 				children.push(marker)
 			}
-			children.push(...scan.refs)
+			children.push(...scan.refs, ...sequenceRefs)
 		}
 		offset += line.length
 			+ (src.string.slice(offset + line.length, offset + line.length + 2) === '\r\n'

@@ -240,6 +240,55 @@ describe('impDocPrivate generic caller and category coverage', () => {
 		)
 	})
 
+	it('keeps usageType-less option nodes on the constant-time reference fast path', () => {
+		const harness = createHarness()
+		harness.enterCaller('function', 'example:caller', FunctionCallerUri)
+		const target = harness.enterTarget('function', 'example:private')
+		stampVisibility(target, { type: 'private', owner: 'example:private' })
+
+		const references = Array.from({ length: 64 }, (_, index) => {
+			const node = refNode('function', 'example:private')
+			const start = index * 32
+			node.range = { start, end: start + 'example:private'.length }
+			delete node.options.usageType
+			harness.enterReference('function', 'example:private', node, FunctionCallerUri)
+			return node
+		})
+
+		const locations = target.reference
+		let referenceReads = 0
+		Object.defineProperty(target, 'reference', {
+			configurable: true,
+			get: () => {
+				referenceReads += 1
+				return locations
+			},
+		})
+
+		assert.equal(harness.lint(fileNode(...references), FunctionCallerUri).length, 64)
+		assert.equal(
+			referenceReads,
+			0,
+			'options-bearing nodes must not read the shared symbol.reference array',
+		)
+	})
+
+	it('uses exact symbol reference locations for metadata-free nodes', () => {
+		const harness = createHarness()
+		harness.enterCaller('function', 'example:caller', FunctionCallerUri)
+		const target = harness.enterTarget('objective', 'Obj.One')
+		stampVisibility(target, { type: 'private', owner: 'example:owner' })
+		const reference: core.AstNode = {
+			type: 'legacy:reference',
+			range: { start: 20, end: 27 },
+		}
+		harness.enterReference('objective', 'Obj.One', reference, FunctionCallerUri)
+
+		const errors = harness.lint(fileNode(reference), FunctionCallerUri)
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0].range.start, reference.range.start)
+	})
+
 	it('never lints declaration or definition sites', () => {
 		const harness = createHarness()
 		harness.enterCaller('function', 'example:caller', FunctionCallerUri)
