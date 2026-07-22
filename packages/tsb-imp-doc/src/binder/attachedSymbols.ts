@@ -1,7 +1,7 @@
 import * as core from '@spyglassmc/core'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
-import { getDocumentFunction } from '../util/documentFunction.js'
+import { getDocumentFunctionFromUri } from '../util/documentFunction.js'
 import {
 	fallbackVisibility,
 	parseVisibility,
@@ -56,7 +56,7 @@ export function stampAttachedSymbols(node: ImpDocNode, ctx: core.BinderContext):
 		return
 	}
 
-	const owner = getDocumentFunction(ctx, node)?.identifier
+	const owner = getDocumentFunctionFromUri(ctx, node)?.identifier
 		?? (node.functionID?.raw ? core.ResourceLocation.lengthen(node.functionID.raw) : undefined)
 	if (!owner) {
 		return

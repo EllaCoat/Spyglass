@@ -148,6 +148,55 @@ describe('IMP-Doc attached binder (P4-3c)', () => {
 		assert.equal(getImpDocSymbolData(referencedSymbol.data), undefined)
 	})
 
+	it('falls back to functionID without a global scan when the URI index has no candidates', () => {
+		const definitionRange = { start: 100, end: 120 }
+		const table = core.SymbolTable.link({
+			objective: {
+				'attached.synthetic_objective': {
+					definition: [{ uri: Uri, range: definitionRange }],
+				},
+			},
+		} as core.UnlinkedSymbolTable)
+		const symbols = new core.SymbolUtil(table)
+		// Deliberately do not build the URI reverse cache: this models an
+		// unregistered client-managed / synthetic document.
+		assert.deepEqual(symbols.getSymbolCandidatesAtUri(Uri), [])
+		const definedSymbol = symbols.lookup('objective', ['attached.synthetic_objective']).symbol
+		assert.ok(definedSymbol)
+
+		const definitionCandidate: core.AstNode = {
+			type: 'symbol',
+			range: definitionRange,
+			symbol: definedSymbol,
+		}
+		const doc: ImpDocNode = {
+			type: 'impDoc',
+			range: { start: 0, end: 130 },
+			annotations: [annotation('@private')],
+			contract: EmptyContract,
+			functionID: value(Owner),
+			children: [definitionCandidate],
+			attachedNodes: [definitionCandidate],
+			plainText: 'Synthetic attached objective doc',
+			raw: '',
+		}
+		core.AstNode.setParents(doc)
+		const ctx = {
+			doc: { uri: Uri },
+			err: new core.ErrorReporter(),
+			symbols,
+		} as unknown as core.BinderContext
+
+		forbidGlobalSymbolScan(symbols)
+		assert.doesNotThrow(() => stampAttachedSymbols(doc, ctx))
+
+		const entry = getImpDocSymbolData(definedSymbol.data)?.declarations?.[0]
+		assert.ok(entry)
+		assert.equal(entry.owner, Owner)
+		assert.equal(entry.visibility.type, 'private')
+		assert.equal((entry.visibility as { owner: string }).owner, Owner)
+	})
+
 	it('is a no-op when the IMP-Doc component has no attached commands', () => {
 		const symbols = new core.SymbolUtil(core.SymbolTable.link({} as core.UnlinkedSymbolTable))
 		symbols.buildCache()
