@@ -1,12 +1,31 @@
 import * as core from '@spyglassmc/core'
+import type * as je from '@spyglassmc/java-edition'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { stampAttachedSymbols } from '../lib/binder/attachedSymbols.js'
-import { getImpDocSymbolData } from '../lib/index.js'
+import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../lib/index.js'
 import type { ImpDocAnnotation, ImpDocContract, ImpDocNode, ImpDocValue } from '../lib/index.js'
+import { createServiceRuntime } from './contract-runtime.ts'
 
 const Owner = 'attached:owner'
 const Uri = 'file:///data/attached/functions/owner.mcfunction'
+
+const Commands: je.dependency.McmetaCommands = {
+	type: 'root',
+	children: {
+		attach_define: {
+			type: 'literal',
+			children: {
+				target: {
+					type: 'argument',
+					parser: 'minecraft:resource_location',
+					properties: { category: 'attached_probe', usageType: 'definition' },
+					executable: true,
+				},
+			},
+		},
+	},
+}
 
 const EmptyContract: ImpDocContract = {
 	inputs: [],
@@ -48,6 +67,26 @@ function forbidGlobalSymbolScan(symbols: core.SymbolUtil): void {
 	}
 	guarded.query = () => {
 		throw new Error('stampAttachedSymbols must not call SymbolUtil.query()')
+	}
+}
+
+function findEnclosingImpDoc(root: core.AstNode, offset: number): ImpDocNode {
+	let node: core.AstNode | undefined = core.AstNode.findDeepestChild({
+		node: root,
+		needle: offset,
+		predicate: () => true,
+	}) as core.AstNode | undefined
+	while (node && !ImpDocNodeUtil.is(node)) {
+		node = node.parent
+	}
+	assert.ok(node)
+	return node
+}
+
+function clearAttachedSymbols(node: core.AstNode): void {
+	delete node.symbol
+	for (const child of node.children ?? []) {
+		clearAttachedSymbols(child)
 	}
 }
 
@@ -148,53 +187,72 @@ describe('IMP-Doc attached binder (P4-3c)', () => {
 		assert.equal(getImpDocSymbolData(referencedSymbol.data), undefined)
 	})
 
-	it('falls back to functionID without a global scan when the URI index has no candidates', () => {
-		const definitionRange = { start: 100, end: 120 }
-		const table = core.SymbolTable.link({
-			objective: {
-				'attached.synthetic_objective': {
-					definition: [{ uri: Uri, range: definitionRange }],
+	it('restores the sibling header owner without a global scan for real parser output', async () => {
+		const runtime = await createServiceRuntime({
+			fixture: 'attached-lifecycle-project',
+			files: { owner: 'data/attached/functions/owner.mcfunction' },
+			commands: Commands,
+			tempPrefix: 'spyglass-imp-doc-attached-owner-',
+		})
+		try {
+			const state = runtime.states.owner
+			const header = findEnclosingImpDoc(
+				state.node,
+				state.content.indexOf(Owner) + 1,
+			)
+			const attached = findEnclosingImpDoc(
+				state.node,
+				state.content.indexOf('Attached probe target') + 1,
+			)
+			assert.notStrictEqual(attached, header)
+			assert.equal(header.functionID?.raw, Owner)
+			assert.equal(header.declaration, undefined)
+			assert.equal(attached.functionID, undefined)
+			assert.ok(attached.declaration)
+			assert.equal(attached.attachedNodes?.length, 1)
+
+			const targetOffset = state.content.indexOf('attached:restricted_probe') + 1
+			const target = core.AstNode.findDeepestChild({
+				node: state.node,
+				needle: targetOffset,
+				predicate: () => true,
+			}) as core.AstNode
+			for (const root of attached.attachedNodes ?? []) {
+				clearAttachedSymbols(root)
+			}
+
+			const table = core.SymbolTable.link({
+				attached_probe: {
+					'attached:restricted_probe': {
+						definition: [{ uri: runtime.uris.owner, range: target.range }],
+					},
 				},
-			},
-		} as core.UnlinkedSymbolTable)
-		const symbols = new core.SymbolUtil(table)
-		// Deliberately do not build the URI reverse cache: this models an
-		// unregistered client-managed / synthetic document.
-		assert.deepEqual(symbols.getSymbolCandidatesAtUri(Uri), [])
-		const definedSymbol = symbols.lookup('objective', ['attached.synthetic_objective']).symbol
-		assert.ok(definedSymbol)
+			} as core.UnlinkedSymbolTable)
+			const symbols = new core.SymbolUtil(table)
+			assert.deepEqual(symbols.getSymbolCandidatesAtUri(runtime.uris.owner), [])
+			const definedSymbol = symbols.lookup(
+				'attached_probe',
+				['attached:restricted_probe'],
+			).symbol
+			assert.ok(definedSymbol)
+			target.symbol = definedSymbol
 
-		const definitionCandidate: core.AstNode = {
-			type: 'symbol',
-			range: definitionRange,
-			symbol: definedSymbol,
+			const ctx = {
+				doc: state.doc,
+				err: new core.ErrorReporter(),
+				symbols,
+			} as unknown as core.BinderContext
+			forbidGlobalSymbolScan(symbols)
+			assert.doesNotThrow(() => stampAttachedSymbols(attached, ctx))
+
+			const entry = getImpDocSymbolData(definedSymbol.data)?.declarations?.[0]
+			assert.ok(entry)
+			assert.equal(entry.owner, Owner)
+			assert.equal(entry.visibility.type, 'private')
+			assert.equal((entry.visibility as { owner: string }).owner, Owner)
+		} finally {
+			await runtime.close()
 		}
-		const doc: ImpDocNode = {
-			type: 'impDoc',
-			range: { start: 0, end: 130 },
-			annotations: [annotation('@private')],
-			contract: EmptyContract,
-			functionID: value(Owner),
-			children: [definitionCandidate],
-			attachedNodes: [definitionCandidate],
-			plainText: 'Synthetic attached objective doc',
-			raw: '',
-		}
-		core.AstNode.setParents(doc)
-		const ctx = {
-			doc: { uri: Uri },
-			err: new core.ErrorReporter(),
-			symbols,
-		} as unknown as core.BinderContext
-
-		forbidGlobalSymbolScan(symbols)
-		assert.doesNotThrow(() => stampAttachedSymbols(doc, ctx))
-
-		const entry = getImpDocSymbolData(definedSymbol.data)?.declarations?.[0]
-		assert.ok(entry)
-		assert.equal(entry.owner, Owner)
-		assert.equal(entry.visibility.type, 'private')
-		assert.equal((entry.visibility as { owner: string }).owner, Owner)
 	})
 
 	it('is a no-op when the IMP-Doc component has no attached commands', () => {
