@@ -739,6 +739,7 @@ export function extendMcfunctionParser(
 				...(component.declaration?.aliases ?? []),
 				...attachedNodes,
 			].sort((a, b) => a.range.start - b.range.start)
+			component.attachedNodes = attachedNodes
 			component.children = [...component.annotations, ...bodyNodes]
 			children.push(component)
 		}
