@@ -9,6 +9,9 @@ import { createServiceRuntime } from './contract-runtime.ts'
 
 const Owner = 'attached:owner'
 const Uri = 'file:///data/attached/functions/owner.mcfunction'
+const IndexedOwner = 'attached:indexed_owner'
+const DeclaredBefore = 'attached:declared_before'
+const IndexedTarget = 'attached:restricted_probe_after_declaration'
 
 const Commands: je.dependency.McmetaCommands = {
 	type: 'root',
@@ -250,6 +253,98 @@ describe('IMP-Doc attached binder (P4-3c)', () => {
 			assert.equal(entry.owner, Owner)
 			assert.equal(entry.visibility.type, 'private')
 			assert.equal((entry.visibility as { owner: string }).owner, Owner)
+		} finally {
+			await runtime.close()
+		}
+	})
+
+	it('ignores an indexed declaration-only function before the attached block', async () => {
+		const runtime = await createServiceRuntime({
+			fixture: 'attached-lifecycle-project',
+			files: { owner: 'data/attached/functions/indexed_owner.mcfunction' },
+			commands: Commands,
+			tempPrefix: 'spyglass-imp-doc-attached-indexed-owner-',
+		})
+		try {
+			const state = runtime.states.owner
+			const header = findEnclosingImpDoc(
+				state.node,
+				state.content.indexOf(IndexedOwner) + 1,
+			)
+			const declaring = findEnclosingImpDoc(
+				state.node,
+				state.content.indexOf(DeclaredBefore) + 1,
+			)
+			const attached = findEnclosingImpDoc(
+				state.node,
+				state.content.indexOf('Attached probe target after') + 1,
+			)
+			assert.notStrictEqual(header, declaring)
+			assert.notStrictEqual(declaring, attached)
+			assert.ok(header.range.start < declaring.range.start)
+			assert.ok(declaring.range.start < attached.range.start)
+			assert.equal(header.functionID?.raw, IndexedOwner)
+			assert.equal(declaring.declaration?.declarations[0]?.category, 'function')
+			assert.equal(declaring.declaration?.declarations[0]?.name.raw, DeclaredBefore)
+			assert.equal(attached.functionID, undefined)
+			assert.ok(attached.attachedNodes?.length)
+
+			const targetOffset = state.content.indexOf(IndexedTarget) + 1
+			const target = core.AstNode.findDeepestChild({
+				node: state.node,
+				needle: targetOffset,
+				predicate: () => true,
+			}) as core.AstNode
+			for (const root of attached.attachedNodes) {
+				clearAttachedSymbols(root)
+			}
+
+			const declarationRange = declaring.declaration.declarations[0]!.name.range
+			const table = core.SymbolTable.link({
+				function: {
+					[DeclaredBefore]: {
+						declaration: [{ uri: runtime.uris.owner, range: declarationRange }],
+					},
+				},
+				attached_probe: {
+					[IndexedTarget]: {
+						definition: [{ uri: runtime.uris.owner, range: target.range }],
+					},
+				},
+			} as core.UnlinkedSymbolTable)
+			const symbols = new core.SymbolUtil(table)
+			symbols.buildCache()
+			const indexedFunctions = symbols.getSymbolCandidatesAtUri(runtime.uris.owner)
+				.filter(symbol => symbol.category === 'function')
+			assert.deepEqual(
+				indexedFunctions.map(symbol => symbol.identifier),
+				[DeclaredBefore],
+			)
+			assert.equal(indexedFunctions[0]?.definition, undefined)
+			assert.equal(
+				indexedFunctions[0]?.declaration?.some(
+					location => location.uri === runtime.uris.owner,
+				),
+				true,
+			)
+			const definedSymbol = symbols.lookup('attached_probe', [IndexedTarget]).symbol
+			assert.ok(definedSymbol)
+			target.symbol = definedSymbol
+
+			const ctx = {
+				doc: state.doc,
+				err: new core.ErrorReporter(),
+				symbols,
+			} as unknown as core.BinderContext
+			forbidGlobalSymbolScan(symbols)
+			assert.doesNotThrow(() => stampAttachedSymbols(attached, ctx))
+
+			const entry = getImpDocSymbolData(definedSymbol.data)?.declarations?.[0]
+			assert.ok(entry)
+			assert.equal(entry.owner, IndexedOwner)
+			assert.notEqual(entry.owner, DeclaredBefore)
+			assert.equal(entry.visibility.type, 'private')
+			assert.equal((entry.visibility as { owner: string }).owner, IndexedOwner)
 		} finally {
 			await runtime.close()
 		}

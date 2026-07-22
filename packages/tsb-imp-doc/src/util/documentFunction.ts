@@ -126,15 +126,19 @@ export function getDocumentFunctionFromUri(
 /**
  * Resolves only the owner ID needed by attached declaration blocks without a
  * global symbol scan. Real parser output stores `functionID` on the document's
- * first IMP-Doc sibling, not on the later attached block passed as `node`, so
- * an empty URI index falls back to the header found from the document root.
+ * first IMP-Doc sibling, not on the later attached block passed as `node`.
+ * Only a definition at this URI establishes an indexed owner: a function
+ * merely declared by this document can name an unrelated resource and must
+ * fall back to the header found from the document root.
  */
 export function getDocumentFunctionOwnerFromUri(
 	ctx: DocumentFunctionContext,
 	node?: AstNode,
 ): string | undefined {
-	return getDocumentFunctionFromUri(ctx, node)?.identifier
-		?? getDocumentHeaderFunctionId(node)
+	const indexed = getDocumentFunctionFromUri(ctx, node)
+	return indexed?.definition?.some(location => location.uri === ctx.doc.uri)
+		? indexed.identifier
+		: getDocumentHeaderFunctionId(node)
 }
 
 /**
