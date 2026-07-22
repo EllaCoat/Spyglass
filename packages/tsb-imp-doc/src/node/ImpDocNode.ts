@@ -210,6 +210,14 @@ export interface ImpDocNode extends AstNode {
 	plainText: string
 	raw: string
 	visibility?: ImpDocVisibility
+	/**
+	 * Real (non-commented) mcfunction command nodes nested directly beneath
+	 * this IMP-Doc block's declaration lines (Phase 4-3c attached binder).
+	 * Same node references as the matching entries in `children`; this field
+	 * exists only so the binder can walk the attached subtree without
+	 * re-deriving it from `children`. Never serialized with the symbol cache.
+	 */
+	attachedNodes?: AstNode[]
 }
 
 export namespace ImpDocNode {

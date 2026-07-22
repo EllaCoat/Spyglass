@@ -35,6 +35,7 @@ function addToDeclarationVisibilityIndex(
 	symbol: CoreSymbol,
 	uri: string,
 ): void {
+	symbol = StateProxy.dereference(symbol)
 	let symbols = index.get(uri)
 	if (!symbols) {
 		symbols = new Set()
@@ -628,7 +629,7 @@ export function stampVisibility(
  * canonical declaration desc only takes over once the header is gone. Callers
  * that purge the header delete `headerUri` before calling this.
  */
-function restoreCanonicalDeclarationDesc(
+export function restoreCanonicalDeclarationDesc(
 	symbol: CoreSymbol,
 	impDoc: ImpDocSymbolData,
 ): void {
@@ -746,6 +747,14 @@ export function clearImpDocMetadataForUri(
 	// removed URI stays absent.
 	index.delete(uri)
 	for (const symbol of affected) {
+		// The clear hook runs before core removes this URI's locations, so the
+		// symbol still exposes the live reference documents that may carry an
+		// impDocPrivate diagnostic derived from this metadata. Re-lint those
+		// documents after the current bind/delete finishes.
+		const referenceUris = symbol.reference
+			?.map(location => location.uri)
+			.filter(referenceUri => referenceUri !== uri)
+			?? []
 		const before = getImpDocSymbolData(symbol.data)
 		const beforeDeclarations = [...before?.declarations ?? []]
 			.sort(compareDeclarationSource)
@@ -761,9 +770,15 @@ export function clearImpDocMetadataForUri(
 		// declaration document that becomes the canonical owner after the clear
 		// would never be queued for an implicit lint (Terra r4 MUST-1).
 		const nextOwner = getCanonicalDeclarationOwnerUri(symbol, afterDeclarations, uri)
-		for (const ownerUri of new Set([previousOwner, nextOwner])) {
-			if (ownerUri) {
-				queueLint?.(ownerUri)
+		for (
+			const affectedUri of new Set([
+				...referenceUris,
+				previousOwner,
+				nextOwner,
+			])
+		) {
+			if (affectedUri) {
+				queueLint?.(affectedUri)
 			}
 		}
 	}

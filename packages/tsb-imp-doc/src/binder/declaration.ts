@@ -11,6 +11,7 @@ import { getDocumentFunction } from '../util/documentFunction.js'
 import {
 	fallbackVisibility,
 	parseVisibility,
+	restoreCanonicalDeclarationDesc,
 	stampVisibility,
 	trackDeclarationVisibility,
 } from '../util/withinPattern.js'
@@ -112,20 +113,12 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			resolvePendingEntityReferences(ctx, name)
 		}
 
-		// desc は (uri, range) 辞書順先頭の declaration entry が担う (= 再解析で
-		// 非決定的に変わることを防ぐ、 canonical 1 本時代からの determinism 維持)。
-		// ただし function header が生きている間 (`headerUri` あり) は header 側
-		// desc が優先。 bind 順序依存の last-bind-wins を避ける。
+		// desc は attached-only symbol と同じ canonical helper で決める。
+		// function header が生きている間 (`headerUri` あり) は header 側 desc が
+		// 優先し、それ以外は (uri, range) 辞書順先頭の declaration entry が担う。
 		const data = getImpDocSymbolData(symbol.data)
-		const first = data?.declarations?.[0]
-		if (
-			data?.headerUri === undefined
-			&& first
-			&& first.uri === candidate.uri
-			&& first.range.start === candidate.range.start
-			&& first.range.end === candidate.range.end
-		) {
-			symbol.desc = candidate.description
+		if (data) {
+			restoreCanonicalDeclarationDesc(symbol, data)
 		}
 
 		// core の getDeclaredLocation() が同じ canonical を返すよう整列。

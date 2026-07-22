@@ -8,6 +8,7 @@ import {
 	stampVisibility,
 	trackHeaderVisibility,
 } from '../util/withinPattern.js'
+import { stampAttachedSymbols } from './attachedSymbols.js'
 import { bindContract, getCurrentFunctionSymbol } from './contract.js'
 
 /**
@@ -62,4 +63,9 @@ export const impDoc = core.AsyncBinder.create<ImpDocNode>(async (node, ctx) => {
 			await result
 		}
 	}
+
+	// attached command が bind した symbol への doc/visibility stamp (Phase 4-3c)。
+	// child dispatch (= attached node の bind) が終わった後でなければ symbol が
+	// まだ付いていないため、 この位置で呼ぶ。
+	stampAttachedSymbols(node, ctx)
 })

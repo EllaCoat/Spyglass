@@ -33,13 +33,17 @@ function getDocumentHeaderFunctionId(node: AstNode | undefined): string | undefi
 function getFunctionSymbols(ctx: DocumentFunctionContext): Symbol[] {
 	const indexed = ctx.symbols.getSymbolCandidatesAtUri(ctx.doc.uri)
 	if (indexed.length > 0) {
-		return indexed.filter(
-			symbol => symbol.category === 'function' && symbol.path.length === 1,
-		)
+		return filterFunctionSymbols(indexed)
 	}
 
 	return Object.values(ctx.symbols.lookup('function', []).parentMap ?? {})
 		.filter((symbol): symbol is Symbol => symbol !== undefined)
+}
+
+function filterFunctionSymbols(symbols: readonly Symbol[]): Symbol[] {
+	return symbols.filter(
+		symbol => symbol.category === 'function' && symbol.path.length === 1,
+	)
 }
 
 /**
@@ -65,9 +69,10 @@ function selectUnambiguousFunctionTier(
  * distinguishes the document function from caller-local `#declare` symbols.
  * Multiple candidates in the first applicable priority tier fail closed.
  */
-export function getDocumentFunction(
+function selectDocumentFunction(
 	ctx: DocumentFunctionContext,
-	node?: AstNode,
+	node: AstNode | undefined,
+	functionSymbols: readonly Symbol[],
 ): Symbol | undefined {
 	const uri = ctx.doc.uri
 	const headerFunctionId = getDocumentHeaderFunctionId(node)
@@ -76,7 +81,7 @@ export function getDocumentFunction(
 	const trackedHeaderMatches: Symbol[] = []
 	const declarations: Symbol[] = []
 
-	for (const symbol of getFunctionSymbols(ctx)) {
+	for (const symbol of functionSymbols) {
 		if (symbol.definition?.some(location => location.uri === uri)) {
 			definitions.push(symbol)
 		}
@@ -98,6 +103,53 @@ export function getDocumentFunction(
 		trackedHeaderMatches,
 		declarations,
 	])
+}
+
+/**
+ * Resolves the document function strictly through the URI reverse index. An
+ * unindexed client-managed / synthetic document returns immediately instead
+ * of falling back to a workspace-wide function symbol scan.
+ */
+export function getDocumentFunctionFromUri(
+	ctx: DocumentFunctionContext,
+	node?: AstNode,
+): Symbol | undefined {
+	const candidates = filterFunctionSymbols(
+		ctx.symbols.getSymbolCandidatesAtUri(ctx.doc.uri),
+	)
+	if (candidates.length === 0) {
+		return undefined
+	}
+	return selectDocumentFunction(ctx, node, candidates)
+}
+
+/**
+ * Resolves only the owner ID needed by attached declaration blocks without a
+ * global symbol scan. Real parser output stores `functionID` on the document's
+ * first IMP-Doc sibling, not on the later attached block passed as `node`.
+ * Only a definition at this URI establishes an indexed owner: a function
+ * merely declared by this document can name an unrelated resource and must
+ * fall back to the header found from the document root.
+ */
+export function getDocumentFunctionOwnerFromUri(
+	ctx: DocumentFunctionContext,
+	node?: AstNode,
+): string | undefined {
+	const indexed = getDocumentFunctionFromUri(ctx, node)
+	return indexed?.definition?.some(location => location.uri === ctx.doc.uri)
+		? indexed.identifier
+		: getDocumentHeaderFunctionId(node)
+}
+
+/**
+ * Full document-function resolution, including the legacy global fallback
+ * required by unindexed declaration-only CLI symbol tables.
+ */
+export function getDocumentFunction(
+	ctx: DocumentFunctionContext,
+	node?: AstNode,
+): Symbol | undefined {
+	return selectDocumentFunction(ctx, node, getFunctionSymbols(ctx))
 }
 
 /**

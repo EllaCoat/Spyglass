@@ -1,4 +1,4 @@
-import { type AstNode, ErrorReporter, ErrorSeverity, Failure, Source } from '@spyglassmc/core'
+import { AstNode, ErrorReporter, ErrorSeverity, Failure, Source } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
 import { describe, it } from 'node:test'
@@ -405,6 +405,61 @@ describe('IMP-Doc parser', () => {
 				['tag', 'foo/bar'],
 			],
 		)
+	})
+
+	it('excludes declaration-line comments from attached nodes and preserves declaration offsets', () => {
+		const content = '#> fixture:index\n# @public\n\n#> declarations\n# @public\n'
+			+ '    #declare storage fixture:data\n'
+			+ '    #alias vector fixture_vector 1.0 2.0 3.0\n'
+			+ '    say attached\n'
+		const baseParser = (src: Source): AstNode => {
+			const children: AstNode[] = []
+			for (const match of src.string.matchAll(/^[\t ]*#/gm)) {
+				const hashStart = match.index + match[0].length - 1
+				const lineEnd = src.string.indexOf('\n', hashStart)
+				children.push({
+					type: 'comment',
+					range: {
+						start: hashStart,
+						end: lineEnd < 0 ? src.string.length : lineEnd,
+					},
+				})
+			}
+			const commandStart = src.string.indexOf('say attached')
+			children.push({
+				type: 'command',
+				range: { start: commandStart, end: commandStart + 'say attached'.length },
+			})
+			children.sort((a, b) => a.range.start - b.range.start)
+			src.cursor = src.string.length
+			return {
+				type: 'fixture:mcfunction',
+				range: { start: 0, end: src.string.length },
+				children,
+			}
+		}
+		const src = new Source(content)
+		const err = new ErrorReporter()
+		const result = extendMcfunctionParser(baseParser)(src, createParserContext(err))
+		if (result === Failure) {
+			assert.fail('adapted mcfunction parse should not be Failure')
+		}
+		const docs = result.children?.filter(ImpDocNode.is) ?? []
+		const declarationDoc = docs[1]
+		assert.ok(declarationDoc)
+		assert.deepEqual(err.errors, [])
+		assert.deepEqual(declarationDoc.attachedNodes?.map(node => node.type), ['command'])
+
+		const declarationNameStart = content.indexOf('fixture:data')
+		const declarationNode = AstNode.findDeepestChild({
+			node: declarationDoc,
+			needle: declarationNameStart + 1,
+		})
+		assert.equal(declarationNode?.type, 'impDoc:declaration')
+		assert.deepEqual(declarationNode?.range, {
+			start: content.indexOf('#declare storage fixture:data'),
+			end: declarationNameStart + 'fixture:data'.length,
+		})
 	})
 
 	it('leaves an immediate command line outside the function header component', () => {
