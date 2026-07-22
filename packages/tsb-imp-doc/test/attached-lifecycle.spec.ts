@@ -182,6 +182,13 @@ describe('IMP-Doc attached binder runtime (P4-3c happy path)', () => {
 		}
 		assert.ok(head?.symbol)
 		assert.equal(head.symbol.category, 'attached_probe')
+		assert.equal(
+			head.symbol.desc,
+			getImpDocSymbolData(head.symbol.data)?.declarations?.[0]?.description,
+		)
+		const hover = runtime.service.getHover(ownerState.node, ownerState.doc, nameStart + 1)
+		assert.ok(hover)
+		assert.match(hover.markdown, /Attached probe target/)
 	})
 
 	it('reports impDocPrivate for a denied caller referencing the attached target', () => {
@@ -196,7 +203,7 @@ describe('IMP-Doc attached binder runtime (P4-3c happy path)', () => {
 })
 
 describe('IMP-Doc attached binder URI lifecycle (P4-3c edit/delete/warm reload)', () => {
-	it('replaces (not duplicates) the entry when the owning document is re-bound after an edit', async () => {
+	it('replaces the entry and re-lints an open reference when visibility changes', async () => {
 		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-attached-edit-project-'),
 		)
@@ -211,19 +218,26 @@ describe('IMP-Doc attached binder URI lifecycle (P4-3c edit/delete/warm reload)'
 				'data/attached/functions/owner.mcfunction',
 				OwnerContent,
 			)
+			const caller = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/other/functions/caller.mcfunction',
+				CallerContent,
+			)
 			const projectRootUri = core.fileUtil.ensureEndingSlash(
 				core.normalizeUri(pathToFileURL(projectRoot).toString()),
 			)
 			project = createRuntimeProject(cacheDir, projectRootUri)
 			await project.init()
 			await project.ready({
-				projectRootsWatcher: new FixtureWatcher([pack.uri, owner.uri]),
+				projectRootsWatcher: new FixtureWatcher([pack.uri, owner.uri, caller.uri]),
 			})
 			// `onDidChange` only affects client-managed documents; open the file
 			// first so the later edit actually reaches a rebind (matching
 			// `declaration-union.spec.ts`'s "URI purge across a warm cache reload"
 			// / implicit-owner-lint edit tests).
 			await project.onDidOpen(owner.uri, 'mcfunction', 1, OwnerContent)
+			await project.onDidOpen(caller.uri, 'mcfunction', 1, CallerContent)
+			assert.equal(project.getClientManaged(caller.uri)?.node.linterErrors?.length, 1)
 
 			const before_ = getImpDocSymbolData(
 				project.symbols.lookup('attached_probe', ['attached:restricted_probe']).symbol?.data,
@@ -241,6 +255,11 @@ describe('IMP-Doc attached binder URI lifecycle (P4-3c edit/delete/warm reload)'
 			)
 			assert.equal(afterEdit?.declarations?.length, 1)
 			assert.equal(afterEdit?.declarations?.[0]?.visibility.type, 'public')
+			assert.deepEqual(
+				project.getClientManaged(caller.uri)?.node.linterErrors,
+				[],
+				'the reference-side impDocPrivate diagnostic must be rebuilt and cleared',
+			)
 		} finally {
 			await project?.close()
 			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })

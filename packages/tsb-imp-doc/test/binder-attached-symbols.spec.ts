@@ -139,6 +139,7 @@ describe('IMP-Doc attached binder (P4-3c)', () => {
 		assert.deepEqual(entry.range, definitionRange)
 		assert.equal(entry.owner, Owner)
 		assert.match(entry.description ?? '', /^Attached objective doc/)
+		assert.equal(definedSymbol.desc, entry.description)
 		assert.equal(entry.visibility.type, 'private')
 		assert.equal((entry.visibility as { owner: string }).owner, Owner)
 

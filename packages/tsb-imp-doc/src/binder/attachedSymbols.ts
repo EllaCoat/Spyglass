@@ -1,10 +1,11 @@
 import * as core from '@spyglassmc/core'
 import type { ImpDocNode } from '../node/ImpDocNode.js'
-import { ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
+import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
 import { getDocumentFunction } from '../util/documentFunction.js'
 import {
 	fallbackVisibility,
 	parseVisibility,
+	restoreCanonicalDeclarationDesc,
 	stampVisibility,
 	trackDeclarationVisibility,
 } from '../util/withinPattern.js'
@@ -68,10 +69,10 @@ export function stampAttachedSymbols(node: ImpDocNode, ctx: core.BinderContext):
 	for (const root of attached) {
 		visit(root, candidate => {
 			// symbol 無しの node が大半なので存在 check を先頭に置き定数コストで抜ける。
-			const symbol = candidate.symbol
-			if (!symbol) {
+			if (!candidate.symbol) {
 				return
 			}
+			const symbol = core.StateProxy.dereference(candidate.symbol)
 			if (!isDefinitionOrDeclarationSite(symbol, ctx.doc.uri, candidate.range)) {
 				return
 			}
@@ -81,6 +82,10 @@ export function stampAttachedSymbols(node: ImpDocNode, ctx: core.BinderContext):
 				owner,
 				description,
 			})
+			const data = getImpDocSymbolData(symbol.data)
+			if (data) {
+				restoreCanonicalDeclarationDesc(symbol, data)
+			}
 			trackDeclarationVisibility(ctx.symbols, symbol, ctx.doc.uri)
 		})
 	}

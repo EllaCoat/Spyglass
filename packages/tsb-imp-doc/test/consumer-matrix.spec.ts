@@ -40,6 +40,18 @@ function refTextFor(spec: LegacyCategorySpec, name: string): string {
 	return spec.consumerKind === 'resource-location' && isTagCategory(spec.id) ? `#${name}` : name
 }
 
+/** Fixed permutation: reproducible while exercising cross-cell state in non-manifest order. */
+function permutedDeclarableTypes(): LegacyCategorySpec[] {
+	const result = [...LEGACY_DECLARABLE_TYPES]
+	let seed = 0x43c
+	for (let i = result.length - 1; i > 0; i--) {
+		seed = (seed * 1_664_525 + 1_013_904_223) >>> 0
+		const j = seed % (i + 1)
+		;[result[i], result[j]] = [result[j]!, result[i]!]
+	}
+	return result
+}
+
 function symbolParserFor(id: string): string {
 	if (id === 'tag') {
 		return 'spyglassmc:tag'
@@ -247,7 +259,7 @@ describe('55+3 consumer matrix (P4-3c freeze)', () => {
 		assert.ok(naCells.every(cell => cell.reason === naReason))
 	})
 
-	for (const spec of LEGACY_DECLARABLE_TYPES) {
+	for (const spec of permutedDeclarableTypes()) {
 		const literal = literalFor(spec)
 		const publicName = declaredName(spec, 'public')
 		const restrictedName = declaredName(spec, 'restricted')
@@ -320,31 +332,30 @@ describe('55+3 consumer matrix (P4-3c freeze)', () => {
 			})
 
 			it('reference', async () => {
-				// `getSymbolLocations` resolves the symbol at the query offset first and
-				// then returns *that symbol's* locations for the requested usage types,
-				// so querying from the synthetic reference site itself (instead of the
-				// `#declare` line's own offset in `_index.d.mcfunction`) still exercises
-				// "find references" and returns the synthetic ref site as one of the
-				// results -- while sidestepping a pre-existing `parser/impDoc.ts`
-				// `attachedNodes` quirk (out of Phase 4-3c's attached-binder scope):
-				// every `#declare`/`#alias` line's own outer-tokenizer comment node also
-				// satisfies `overlapsAnyDeclarationLine`, so it re-enters `children` as a
-				// sibling of the real `impDoc:declaration` node at the same range and can
-				// win `findDeepestChild`'s offset lookup at that exact declare position.
-				const content = `${literal} ${publicRef}`
-				const offset = literal.length + 1
-				const state = await setCallerContent('allowed', content)
+				const marker = `# reference cell: ${spec.id}\n`
+				const content = `${marker}${literal} ${publicRef}`
+				await setCallerContent('allowed', content)
+				const expectedRange = {
+					start: marker.length + literal.length + 1,
+					end: content.length,
+				}
+				const indexState = runtime!.states.index
+				const declarationOffset = indexState.content.indexOf(publicName)
+				assert.notEqual(declarationOffset, -1)
 				const refUri = runtime!.uris.allowed
 				const locations = await runtime!.service.getSymbolLocations(
-					state.node,
-					state.doc,
-					offset,
+					indexState.node,
+					indexState.doc,
+					declarationOffset + 1,
 					['reference'],
 				)
 				assert.ok(locations?.locations?.length, `reference should resolve for ${publicName}`)
-				assert.ok(
-					locations!.locations!.some(loc => loc.uri === refUri),
-					'reference must point at the allowed consumer carrier',
+				assert.deepEqual(
+					locations!.locations!
+						.filter(loc => loc.uri === refUri)
+						.map(loc => loc.range),
+					[expectedRange],
+					'reference must match this cell marker and carrier range exactly',
 				)
 			})
 

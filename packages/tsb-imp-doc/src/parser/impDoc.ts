@@ -730,7 +730,10 @@ export function extendMcfunctionParser(
 				if (candidate.type === 'mcfunction:macro') {
 					decorateMacroRefs(candidate, src)
 				}
-				if (overlapsAnyDeclarationLine(candidate, component.declaration)) {
+				if (
+					candidate.type !== 'comment'
+					&& overlapsAnyDeclarationLine(candidate, component.declaration)
+				) {
 					attachedNodes.push(candidate)
 				}
 			}
