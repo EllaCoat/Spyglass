@@ -73,6 +73,29 @@
 				}
 			]
 		},
+		"ImpDocBooleanLint": {
+			"anyOf": [
+				{
+					"type": "null"
+				},
+				{
+					"enum": [ true ]
+				},
+				{
+					"$ref": "#/definitions/Severity"
+				},
+				{
+					"type": "array",
+					"minItems": 2,
+					"maxItems": 2,
+					"items": [
+						{ "$ref": "#/definitions/Severity" },
+						{ "enum": [ true ] }
+					],
+					"default": [ "warning", true ]
+				}
+			]
+		},
 		"QuoteConfig": {
 			"title": "QuoteConfig",
 			"type": "object",
@@ -119,7 +142,11 @@
 				},
 				{
 					"type": "array",
-					"items": { "type": "string" }
+					"items": { "type": "string" },
+					"not": {
+						"minItems": 1,
+						"items": [ { "$ref": "#/definitions/Severity" } ]
+					}
 				},
 				{
 					"type": "array",
@@ -354,15 +381,15 @@
 				},
 				"impDocPrivate": {
 					"description": "Report references that violate IMP-Doc `@private` / `@within` visibility. Fork-only rule.",
-					"$ref": "#/definitions/BooleanLint"
+					"$ref": "#/definitions/ImpDocBooleanLint"
 				},
 				"impDocPrivateBestEffort": {
 					"description": "Warning-level counterpart of `impDocPrivate` for references whose caller cannot be resolved exactly. Fork-only rule.",
-					"$ref": "#/definitions/BooleanLint"
+					"$ref": "#/definitions/ImpDocBooleanLint"
 				},
 				"impDocVisibilityConflict": {
 					"description": "Report symbols declared with conflicting IMP-Doc visibility in more than one place. Fork-only rule.",
-					"$ref": "#/definitions/BooleanLint"
+					"$ref": "#/definitions/ImpDocBooleanLint"
 				},
 				"impDocContractCheck": {
 					"description": "Semantic checks for typed IMP-Doc function contracts. Fork-only rule. Defaults to `off`.",
