@@ -12,6 +12,7 @@
   "code-action.create-undeclared-file": "Create %0% %1% in the same pack",
   "code-action.id-omit-default-namespace": "Omit default namespace",
   "code-action.id-zombified-piglin-datafix": "Change this ID to Zombified Piglin's",
+  "code-action.nbt-byte-to-literal": "Convert to a boolean literal",
   "code-action.nbt-compound-sort-keys": "Sort NBT compound tag",
   "code-action.nbt-type-to-byte": "Convert to an NBT byte tag",
   "code-action.nbt-type-to-double": "Convert to an NBT double tag",
