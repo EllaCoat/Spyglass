@@ -1,16 +1,17 @@
 {
-  "name": "datapack-language-server",
-  "version": "0.1.0-PLACEHOLDER",
+  "name": "tsb-spyglass",
+  "version": "0.4.2",
   "type": "commonjs",
   "main": "dist/extension.js",
   "author": "Spyglass Contributors",
-  "publisher": "SPGoding",
+  "publisher": "ellacoat",
   "license": "MIT",
   "scripts": {
     "build": "wireit",
     "build:dev": "wireit",
-    "release": "vsce publish && ovsx publish",
-    "release:dry": "echo \"DO NOT PUBLISH (DRY)\"",
+    "package:vsix": "vsce package --no-dependencies",
+    "release": "node -e \"console.error('tsb-spyglass is a local canary fork: publishing is disabled. Use npm run package:vsix instead.'); process.exit(1)\"",
+    "release:dry": "echo \"DO NOT PUBLISH (DRY) - tsb-spyglass is a local canary fork\"",
     "watch": "npm run build:dev --watch"
   },
   "wireit": {
@@ -56,16 +57,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/SpyglassMC/Spyglass.git"
+    "url": "https://github.com/EllaCoat/Spyglass.git"
   },
-  "homepage": "https://spyglassmc.com",
+  "homepage": "https://github.com/EllaCoat/Spyglass",
   "bugs": {
-    "url": "https://github.com/SpyglassMC/Spyglass/issues"
+    "url": "https://github.com/EllaCoat/Spyglass/issues"
   },
   "engines": {
     "vscode": "^1.101.0"
   },
-  "displayName": "%spyglassmc.displayName%",
+  "displayName": "TSB Spyglass (Local Canary)",
   "description": "%spyglassmc.description%",
   "icon": "icon.png",
   "categories": [

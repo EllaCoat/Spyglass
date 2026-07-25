@@ -1,15 +1,52 @@
-# Datapack Helper Plus by Spyglass
+# TSB Spyglass (Local Canary)
 
-<div align="center"><img src="https://raw.githubusercontent.com/SpyglassMC/logo/main/banner.png"></div>
+Unofficial fork of [Spyglass](https://github.com/SpyglassMC/Spyglass) that adds IMP-Doc support (`#>` doc comments, `@private` / `@public` / `@within` / `@internal` / `@user` visibility, `#declare`, `#alias`) so that a Datapack Helper Plus v3 project can move to Spyglass v4 without losing the annotations it depends on.
 
-[![Discord](https://img.shields.io/discord/666020457568403505?logo=discord&style=flat-square)](https://discord.gg/EbdseuS)
-[![VSCode Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/SPGoding.datapack-language-server.svg?logo=visual-studio-code&style=flat-square)](https://marketplace.visualstudio.com/items?itemName=SPGoding.datapack-language-server)
-[![VSCode Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/SPGoding.datapack-language-server.svg?logo=visual-studio-code&style=flat-square)](https://marketplace.visualstudio.com/items?itemName=SPGoding.datapack-language-server)
-[![VSCode Marketplace Rating](https://img.shields.io/visual-studio-marketplace/stars/SPGoding.datapack-language-server.svg?logo=visual-studio-code&style=flat-square)](https://marketplace.visualstudio.com/items?itemName=SPGoding.datapack-language-server)
-[![GitHub Stars](https://img.shields.io/github/stars/SpyglassMC/Spyglass.svg?style=flat-square)](https://github.com/SpyglassMC/Spyglass)
-[![License](https://img.shields.io/github/license/SpyglassMC/vscode-datapack.svg?style=flat-square)](https://github.com/SPGoding/vscode-datapack-helper-plus/blob/master/LICENSE)
+**This is not an official Spyglass build and is not affiliated with the upstream project.** It is distributed as a locally built VSIX only, never through the Marketplace or Open VSX.
 
-Spyglass aims at improving users' editing experience of Minecraft data packs by providing IntelliSense features like real-time error reporting, auto-completion, semantic coloring, and code navigation tools.
+| | |
+|---|---|
+| Extension ID | `ellacoat.tsb-spyglass` |
+| Upstream ID | `SPGoding.datapack-language-server` |
+| Source | <https://github.com/EllaCoat/Spyglass> |
+
+Everything below the *Required setup* section is upstream documentation and applies unchanged.
+
+## Installing
+
+```
+code --install-extension tsb-spyglass-<version>.vsix
+```
+
+Or: Extensions view → `...` menu → *Install from VSIX…*.
+
+This extension declares `MinecraftCommands.syntax-mcfunction` in `extensionDependencies`, and VS Code resolves that dependency from the Marketplace while installing the VSIX. Install `syntax-mcfunction` once while online before attempting an offline VSIX install.
+
+## Required setup
+
+### 1. Do not run this alongside upstream Spyglass
+
+The fork keeps the upstream command IDs and configuration namespace (`spyglassmc.*`) and registers the same language IDs. With both enabled in one window the two language servers compete for the same documents, so **disable or uninstall `SPGoding.datapack-language-server`** before enabling this one.
+
+Extensions view → search `Spyglass` → upstream entry → *Disable*, or *Disable (Workspace)* to keep the fork scoped to one project.
+
+### 2. Turn off extension auto-update
+
+A locally installed VSIX has no Marketplace counterpart, so VS Code will not replace it on its own. Disabling auto-update guarantees that a future Marketplace extension sharing the publisher name cannot overwrite the canary build:
+
+```json
+{
+  "extensions.autoUpdate": false
+}
+```
+
+### 3. Open the project as a multi-root workspace
+
+IMP-Doc `@within` and `#declare` resolution needs every referenced pack inside the same project. Open the Core and Asset repositories together as a multi-root workspace and put a byte-identical `spyglass.json` at the root of each folder. Configuration is merged with later roots winning, so a drifting copy silently overrides the other one.
+
+### 4. Version policy
+
+The version is bumped on every rebuild that changes the packaged bytes, so a given `tsb-spyglass-<version>.vsix` corresponds to exactly one build. Publishing scripts (`npm run release`) are deliberately wired to fail; use `npm run package:vsix` instead.
 
 ## Configuration
 > Full documentation: https://spyglassmc.com/user/config
