@@ -50,6 +50,88 @@
 			},
 			"additionalProperties": false
 		},
+		"Severity": {
+			"enum": [ "hint", "information", "warning", "error" ]
+		},
+		"BooleanLint": {
+			"anyOf": [
+				{
+					"type": [ "boolean", "null" ]
+				},
+				{
+					"$ref": "#/definitions/Severity"
+				},
+				{
+					"type": "array",
+					"minItems": 2,
+					"maxItems": 2,
+					"items": [
+						{ "$ref": "#/definitions/Severity" },
+						{ "type": "boolean" }
+					],
+					"default": [ "warning", true ]
+				}
+			]
+		},
+		"QuoteConfig": {
+			"title": "QuoteConfig",
+			"type": "object",
+			"properties": {
+				"always": {
+					"type": "boolean",
+					"description": "Whether the string must be quoted (`true`) or must not be quoted (`false`). A value that cannot be written unquoted is always required to be quoted regardless of this setting."
+				},
+				"avoidEscape": {
+					"type": [ "boolean", "null" ],
+					"description": "When `true`, the other quotation mark is used instead of the preferred one if the value contains the preferred one. Equivalent to the legacy `prefer double` / `prefer single` quote types."
+				},
+				"type": {
+					"enum": [ "double", "single" ],
+					"description": "The preferred quotation mark. Omit to skip checking the quotation mark type."
+				}
+			},
+			"additionalProperties": false
+		},
+		"QuoteLint": {
+			"anyOf": [
+				{
+					"type": "null"
+				},
+				{
+					"$ref": "#/definitions/QuoteConfig"
+				},
+				{
+					"type": "array",
+					"minItems": 2,
+					"maxItems": 2,
+					"items": [
+						{ "$ref": "#/definitions/Severity" },
+						{ "$ref": "#/definitions/QuoteConfig" }
+					],
+					"default": [ "warning", { "always": true, "type": "double", "avoidEscape": true } ]
+				}
+			]
+		},
+		"SelectorSortKeysLint": {
+			"anyOf": [
+				{
+					"type": "null"
+				},
+				{
+					"type": "array",
+					"items": { "type": "string" }
+				},
+				{
+					"type": "array",
+					"minItems": 2,
+					"maxItems": 2,
+					"items": [
+						{ "$ref": "#/definitions/Severity" },
+						{ "type": "array", "items": { "type": "string" } }
+					]
+				}
+			]
+		},
 		"Complex": {
 			"title": "Complex",
 			"type": "object",
@@ -241,6 +323,50 @@
 				},
 				"nameOfTeam": {
 					"$ref": "#/definitions/NameLint"
+				},
+				"commandStringQuote": {
+					"description": "Quotation style for `brigadier:string` command arguments that accept a quoted phrase.",
+					"$ref": "#/definitions/QuoteLint"
+				},
+				"nbtKeyQuote": {
+					"description": "Quotation style for NBT compound tag keys.",
+					"$ref": "#/definitions/QuoteLint"
+				},
+				"nbtPathQuote": {
+					"description": "Quotation style for NBT path keys.",
+					"$ref": "#/definitions/QuoteLint"
+				},
+				"nbtStringQuote": {
+					"description": "Quotation style for NBT string tag values.",
+					"$ref": "#/definitions/QuoteLint"
+				},
+				"selectorKeyQuote": {
+					"description": "Quotation style for entity selector argument keys.",
+					"$ref": "#/definitions/QuoteLint"
+				},
+				"selectorSortKeys": {
+					"description": "The order that entity selector argument keys should appear in. Keys absent from the list are ignored.",
+					"$ref": "#/definitions/SelectorSortKeysLint"
+				},
+				"nbtBoolean": {
+					"description": "When `true`, boolean-typed NBT values must be written as `true` / `false`. When `false`, they must be written as byte tags (`1b` / `0b`).",
+					"$ref": "#/definitions/BooleanLint"
+				},
+				"impDocPrivate": {
+					"description": "Report references that violate IMP-Doc `@private` / `@within` visibility. Fork-only rule.",
+					"$ref": "#/definitions/BooleanLint"
+				},
+				"impDocPrivateBestEffort": {
+					"description": "Warning-level counterpart of `impDocPrivate` for references whose caller cannot be resolved exactly. Fork-only rule.",
+					"$ref": "#/definitions/BooleanLint"
+				},
+				"impDocVisibilityConflict": {
+					"description": "Report symbols declared with conflicting IMP-Doc visibility in more than one place. Fork-only rule.",
+					"$ref": "#/definitions/BooleanLint"
+				},
+				"impDocContractCheck": {
+					"description": "Semantic checks for typed IMP-Doc function contracts. Fork-only rule. Defaults to `off`.",
+					"enum": [ "off", "information", "warning", "error" ]
 				},
 				"undeclaredSymbol": {
 					"type": "array",
