@@ -35,7 +35,7 @@ export const selectorSortKeys: Linter<ArgumentsNode> = (node, ctx) => {
 						{
 							type: 'edit',
 							range: Range.get(node.innerRange),
-							text: sort(pairs, ranks, ctx),
+							text: sort(node, ranks, ctx),
 						},
 					],
 				}
@@ -48,17 +48,25 @@ export const selectorSortKeys: Linter<ArgumentsNode> = (node, ctx) => {
 }
 
 function sort(
-	pairs: StateProxy<ArgumentsNode>['children'],
+	node: StateProxy<ArgumentsNode>,
 	ranks: number[],
 	ctx: LinterContext,
 ): string {
-	return ranks
+	const pairs = node.children
+	const sortedIndices = ranks
 		.map((rank, index) => ({ index, rank: rank === -1 ? Number.MAX_SAFE_INTEGER : rank }))
 		.sort((a, b) => a.rank - b.rank || a.index - b.index)
-		.map(({ index }) => {
-			const pair = pairs[index]
-			// A pair's range covers its trailing separator, which is re-added by the join below.
-			return ctx.src.slice(pair.range.start, pair.end?.start ?? pair.range.end)
-		})
-		.join(',')
+		.map(({ index }) => index)
+	const bodyEnds = pairs.map((pair) => pair.value?.range.end ?? pair.end?.start ?? pair.range.end)
+	const bodies = pairs.map((pair, index) => ctx.src.slice(pair.range.start, bodyEnds[index]))
+	const separators = pairs.map((_, index) =>
+		ctx.src.slice(
+			bodyEnds[index],
+			index + 1 < pairs.length ? pairs[index + 1].range.start : node.innerRange!.end,
+		)
+	)
+	const prefix = ctx.src.slice(node.innerRange!.start, pairs[0].range.start)
+
+	return prefix
+		+ sortedIndices.map((pairIndex, slot) => bodies[pairIndex] + separators[slot]).join('')
 }

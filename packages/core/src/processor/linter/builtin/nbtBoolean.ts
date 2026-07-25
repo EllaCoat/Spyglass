@@ -26,6 +26,10 @@ const BooleanLiteralPattern = /^(?:true|false)$/i
  * type definition are left alone, as `1b` cannot be replaced with `true` in a numeric position.
  */
 export const nbtBoolean: Linter<ByteNode> = (node, ctx) => {
+	if (node.typeDef?.kind !== 'boolean') {
+		return
+	}
+
 	const raw = ctx.src.slice(node.range.start, node.range.end)
 	const isLiteral = BooleanLiteralPattern.test(raw)
 
@@ -53,7 +57,7 @@ export const nbtBoolean: Linter<ByteNode> = (node, ctx) => {
 		return
 	}
 
-	if (isLiteral || node.typeDef?.kind !== 'boolean') {
+	if (isLiteral) {
 		return
 	}
 	const literal = node.value === 0 ? 'false' : 'true'

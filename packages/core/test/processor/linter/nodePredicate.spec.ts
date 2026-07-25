@@ -39,6 +39,7 @@ const compound = recordNode({
 		value: { type: 'nbt:string', value: 'foo', quote: '"' },
 	}],
 })
+;(compound.values[0] as unknown as { typeDef?: { kind: string } }).typeDef = { kind: 'string' }
 const selector = recordNode({
 	type: 'mcfunction:entity_selector/arguments',
 	entries: [{ key: { value: 'tag' }, value: { value: 'foo' } }],
@@ -65,8 +66,40 @@ describe('quote linter node predicates', () => {
 
 	it('Should route a loose NBT string to nbtStringQuote', () => {
 		const { node } = stringNode({ type: 'nbt:string', value: 'foo', quote: '"' })
+		;(node as unknown as { typeDef?: { kind: string } }).typeDef = { kind: 'string' }
 		wrap('nbt:list', node)
 		assertRules(node, ['nbtStringQuote'], 'NBT list element')
+	})
+
+	it('Should not route an untyped NBT string value anywhere', () => {
+		const { node } = stringNode({ type: 'nbt:string', value: 'foo', quote: '"' })
+		wrap('nbt:list', node)
+		assertRules(node, [], 'untyped NBT list element')
+	})
+
+	it('Should route an NBT string value typed by a string union', () => {
+		const { node } = stringNode({ type: 'nbt:string', value: 'foo', quote: '"' })
+		;(node as unknown as { typeDef?: unknown }).typeDef = {
+			kind: 'union',
+			members: [{ kind: 'int' }, { kind: 'string' }],
+		}
+		wrap('nbt:list', node)
+		assertRules(node, ['nbtStringQuote'], 'union-typed NBT list element')
+	})
+
+	it('Should not route enum, literal, or non-string union NBT values', () => {
+		for (
+			const typeDef of [
+				{ kind: 'enum' },
+				{ kind: 'literal' },
+				{ kind: 'union', members: [{ kind: 'int' }, { kind: 'boolean' }] },
+			]
+		) {
+			const { node } = stringNode({ type: 'nbt:string', value: 'foo', quote: '"' })
+			;(node as unknown as { typeDef?: unknown }).typeDef = typeDef
+			wrap('nbt:list', node)
+			assertRules(node, [], `${typeDef.kind}-typed NBT list element`)
+		}
 	})
 
 	it('Should route a command argument to commandStringQuote', () => {

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { StringBaseNode } from '../../../lib/index.js'
-import { Logger, MetaRegistry, Range } from '../../../lib/index.js'
+import { AstNode, Logger, MetaRegistry, Range } from '../../../lib/index.js'
 import { editOf, lint, stringNode, titleOf } from './utils.ts'
 
 const meta = new MetaRegistry()
@@ -29,6 +29,24 @@ describe('quote linter', () => {
 		assert.match(errors[0].message, /Expected an unquoted string/)
 		assert.equal(titleOf(errors[0]), 'Unquote this string')
 		assert.deepEqual(editOf(errors[0]), { range: Range.create(0, 5), text: 'foo' })
+	})
+
+	it('Should unquote an empty string when the parser allows an empty unquoted value', () => {
+		const { node, src } = stringNode({ value: '', quote: '"' })
+		const errors = lint(meta, Rule, { always: false }, node, src)
+		assert.equal(errors.length, 1)
+		assert.deepEqual(editOf(errors[0]), { range: Range.create(0, 2), text: '' })
+	})
+
+	it('Should keep an empty string quoted when the parser prohibits an empty unquoted value', () => {
+		const node = {
+			...stringNode({ value: '', quote: '"' }).node,
+			options: {
+				quotes: ['"'],
+				unquotable: { blockList: new Set<string>() },
+			},
+		} as StringBaseNode
+		assert.deepEqual(lint(meta, 'nbtPathQuote', { always: false }, node, '""'), [])
 	})
 
 	it('Should keep quiet about a value that cannot be unquoted', () => {
@@ -87,6 +105,60 @@ describe('quote linter', () => {
 		const errors = lint(meta, Rule, { always: true, type: 'single' }, node, src)
 		assert.equal(errors.length, 1)
 		assert.equal(editOf(errors[0]).text, String.raw`'a"b\\c'`)
+	})
+
+	it('Should omit the quick fix when the decoded value contains a control character', () => {
+		const { node, src } = stringNode({ value: 'line\nbreak', quote: "'" })
+		const errors = lint(meta, Rule, { always: true, type: 'double' }, node, src)
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0].info?.codeAction, undefined)
+	})
+
+	it('Should omit the quick fix for a string embedded in another string', () => {
+		const { node: outer, src } = stringNode({ value: "'foo'", quote: '"' })
+		const { node: inner } = stringNode({ value: 'foo', quote: "'" })
+		inner.range = Range.create(1, 6)
+		outer.valueMap.push({ inner: Range.create(0), outer: Range.create(1) })
+		outer.children = [inner]
+		AstNode.setParents(outer)
+
+		const errors = lint(meta, Rule, { always: true, type: 'double' }, inner, src)
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0].info?.codeAction, undefined)
+	})
+
+	it('Should keep primitive-looking NBT strings quoted', () => {
+		for (
+			const value of [
+				'0',
+				'-1',
+				'1b',
+				'2S',
+				'3l',
+				'1.5',
+				'4.5f',
+				'6.7D',
+				'true',
+				'FALSE',
+			]
+		) {
+			const { node, src } = stringNode({ type: 'nbt:string', value, quote: '"' })
+			assert.deepEqual(lint(meta, 'nbtStringQuote', { always: false }, node, src), [], value)
+		}
+	})
+
+	it('Should allow primitive-looking strings to be unquoted outside NBT values', () => {
+		for (
+			const rule of [
+				'commandStringQuote',
+				'nbtKeyQuote',
+				'nbtPathQuote',
+				'selectorKeyQuote',
+			]
+		) {
+			const { node, src } = stringNode({ value: '1b', quote: '"' })
+			assert.equal(lint(meta, rule, { always: false }, node, src).length, 1, rule)
+		}
 	})
 
 	it('Should be shared by all five quote rules', () => {

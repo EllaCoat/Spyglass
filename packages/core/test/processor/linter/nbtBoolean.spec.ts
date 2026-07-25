@@ -45,9 +45,9 @@ describe('nbtBoolean linter asking for bytes', () => {
 		assert.equal(lint(meta, Rule, false, node, src).length, 1)
 	})
 
-	it('Should report a literal even without a type definition', () => {
+	it('Should keep quiet about a literal outside a boolean position', () => {
 		const { node, src } = byteNode('true', 1)
-		assert.equal(lint(meta, Rule, false, node, src).length, 1)
+		assert.deepEqual(lint(meta, Rule, false, node, src), [])
 	})
 
 	it('Should keep quiet about a byte', () => {
