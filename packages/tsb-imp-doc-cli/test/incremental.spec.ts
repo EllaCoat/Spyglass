@@ -380,6 +380,12 @@ describe('incremental legacy export discovery', () => {
 			manifest: PerFileManifest
 			graph: ReturnType<typeof createDependencyGraph>
 		}
+		// manifest.references に載るのは collectReferences (runner.ts) が拾う
+		// ResourceLocationNode と SymbolNode(usageType: reference) だけで、実質
+		// function と random_sequence の 2 category に限られる。score_holder / entity /
+		// tag は CLI parser が該当 node を作らないため載らない (entity は
+		// binder/entity.ts が reference usage を登録するが、対象が StringNode なので
+		// collectReferences の判定を通らない)。よって seed graph 注入で固定する。
 		cache.manifest.files[declarationDependent]!.references = keys
 		cache.graph = createDependencyGraph(cache.manifest)
 		await writeFile(cachePath, JSON.stringify(cache))
@@ -415,8 +421,11 @@ describe('incremental legacy export discovery', () => {
 			manifest: PerFileManifest
 			graph: ReturnType<typeof createDependencyGraph>
 		}
-		// Phase 4-3: consumer 実装時に、この seed graph への手動 references 注入を
-		// 実 reference 生成経路の end-to-end test へ置換、または追加する。
+		// alias 補完は expansion 値そのものを挿入する (completer/alias.ts) ため、
+		// 完成した mcfunction に alias 名が残らず実 reference 経路が原理的に存在しない。
+		// consumer matrix 側でも alias × {hover, definition, reference, diagnostics}
+		// の 12 cell を N/A として freeze 済み (tsb-imp-doc/test/consumer-matrix.spec.ts)。
+		// よって dependents の seed graph 注入を恒久的な手法として採用する。
 		cache.manifest.files[knownAliasDependent]!.references = [knownKey]
 		cache.manifest.files[extensionAliasDependent]!.references = [extensionKey]
 		cache.graph = createDependencyGraph(cache.manifest)
