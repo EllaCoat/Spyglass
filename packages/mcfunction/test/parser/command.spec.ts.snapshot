@@ -546,3 +546,159 @@ exports[`mcfunction parser command() > Should not exceed max call stack 1`] = `
   ]
 }
 `;
+
+exports[`mcfunction parser command() with a trailing space > Parse 'function ' 1`] = `
+{
+  "node": {
+    "type": "mcfunction:command",
+    "range": {
+      "start": 0,
+      "end": 9
+    },
+    "children": [
+      {
+        "type": "mcfunction:command_child",
+        "range": {
+          "start": 0,
+          "end": 8
+        },
+        "children": [
+          {
+            "type": "mcfunction:command_child/literal",
+            "range": {
+              "start": 0,
+              "end": 8
+            },
+            "value": "function"
+          }
+        ],
+        "path": [
+          "function"
+        ]
+      }
+    ]
+  },
+  "errors": [
+    {
+      "range": {
+        "start": 9,
+        "end": 9
+      },
+      "message": "Expected id",
+      "severity": 3
+    }
+  ]
+}
+`;
+
+exports[`mcfunction parser command() with a trailing space > Parse 'function id  ' 1`] = `
+{
+  "node": {
+    "type": "mcfunction:command",
+    "range": {
+      "start": 0,
+      "end": 13
+    },
+    "children": [
+      {
+        "type": "mcfunction:command_child",
+        "range": {
+          "start": 0,
+          "end": 8
+        },
+        "children": [
+          {
+            "type": "mcfunction:command_child/literal",
+            "range": {
+              "start": 0,
+              "end": 8
+            },
+            "value": "function"
+          }
+        ],
+        "path": [
+          "function"
+        ]
+      },
+      {
+        "type": "mcfunction:command_child",
+        "range": {
+          "start": 9,
+          "end": 11
+        },
+        "children": [
+          {
+            "type": "mcfunction:command_child/literal",
+            "range": {
+              "start": 9,
+              "end": 11
+            },
+            "value": "id"
+          }
+        ],
+        "path": [
+          "function",
+          "id"
+        ]
+      }
+    ]
+  },
+  "errors": []
+}
+`;
+
+exports[`mcfunction parser command() with a trailing space > Parse 'function id ' 1`] = `
+{
+  "node": {
+    "type": "mcfunction:command",
+    "range": {
+      "start": 0,
+      "end": 12
+    },
+    "children": [
+      {
+        "type": "mcfunction:command_child",
+        "range": {
+          "start": 0,
+          "end": 8
+        },
+        "children": [
+          {
+            "type": "mcfunction:command_child/literal",
+            "range": {
+              "start": 0,
+              "end": 8
+            },
+            "value": "function"
+          }
+        ],
+        "path": [
+          "function"
+        ]
+      },
+      {
+        "type": "mcfunction:command_child",
+        "range": {
+          "start": 9,
+          "end": 11
+        },
+        "children": [
+          {
+            "type": "mcfunction:command_child/literal",
+            "range": {
+              "start": 9,
+              "end": 11
+            },
+            "value": "id"
+          }
+        ],
+        "path": [
+          "function",
+          "id"
+        ]
+      }
+    ]
+  },
+  "errors": []
+}
+`;

@@ -193,6 +193,13 @@ function dispatch(
 			}
 
 			if (src.canReadInLine()) {
+				if (childTreeNode.executable && !src.hasNonSpaceAheadInLine()) {
+					// End-of-command. Minecraft trims every line of a function file before parsing it,
+					// so trailing whitespace is a line ending rather than an argument separation, and
+					// `sep` must not require it to be a single space.
+					src.skipSpace()
+					return false
+				}
 				// Skip command argument separation (a space).
 				sep(src, ctx)
 				return { childPath, childTreeNode }
