@@ -2,6 +2,7 @@ import * as core from '@spyglassmc/core'
 import * as json from '@spyglassmc/json'
 import * as mcdoc from '@spyglassmc/mcdoc'
 import * as nbt from '@spyglassmc/nbt'
+import { registerAdvancementCriteriaBinder } from './binder/advancementCriteria.js'
 import { jeFileUriPredicate, registerUriBuilders, uriBinder } from './binder/index.js'
 import type { McmetaSummary } from './dependency/index.js'
 import {
@@ -105,6 +106,8 @@ export const initialize: core.ProjectInitializer = async (ctx) => {
 
 	json.getInitializer(jeFileUriPredicate)(ctx)
 	jeJson.initialize(ctx)
+	// Chains onto the `json:file` binder registered by `jeJson.initialize`, so it has to come after.
+	registerAdvancementCriteriaBinder(meta)
 	jeMcf.initialize(ctx, summary.commands, release)
 	nbt.initialize(ctx)
 
