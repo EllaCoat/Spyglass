@@ -1,4 +1,4 @@
-import { ErrorReporter, StateProxy } from '@spyglassmc/core'
+import { ErrorReporter, ErrorSeverity, StateProxy } from '@spyglassmc/core'
 import type { Symbol as CoreSymbol } from '@spyglassmc/core'
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
@@ -278,6 +278,73 @@ describe('parseVisibility', () => {
 				name,
 			)
 		}
+	})
+
+	it('ignores unknown @within modifiers with a warning instead of denying', () => {
+		for (
+			const [name, tokens, targetType, modifiers] of [
+				[
+					'explicit target type',
+					['@within', 'function', 'a:b', '@readonly'],
+					'function',
+					['@readonly'],
+				],
+				[
+					'target type shorthand',
+					['@within', 'a:b', '@readonly'],
+					'*',
+					['@readonly'],
+				],
+				[
+					'multiple modifiers',
+					['@within', 'function', 'a:b', '@readonly', '@deprecated'],
+					'function',
+					['@readonly', '@deprecated'],
+				],
+			] as const
+		) {
+			const err = new ErrorReporter()
+			assert.deepEqual(
+				parseVisibility([annotation(...tokens)], owner, err),
+				{
+					type: 'within',
+					owner,
+					includeOwner: false,
+					patterns: [{
+						raw: 'a:b',
+						targetType,
+						regex: '^a:b$',
+					}],
+				},
+				name,
+			)
+			assert.deepEqual(
+				err.errors.map(error => [error.message, error.severity]),
+				modifiers.map(modifier => [
+					`Unknown @within modifier "${modifier}" is ignored`,
+					ErrorSeverity.Warning,
+				]),
+				name,
+			)
+		}
+	})
+
+	it('still denies extra @within arguments that are not modifiers', () => {
+		const err = new ErrorReporter()
+		assert.deepEqual(
+			parseVisibility(
+				[annotation('@within', 'function', 'a:b', 'c:d')],
+				owner,
+				err,
+			),
+			{ type: 'denied', owner },
+		)
+		assert.ok(
+			err.errors.some(error =>
+				error.message.includes('@within accepts one path pattern per line')
+			),
+		)
+		assert.ok(err.errors.some(error => error.message.includes('falling back to deny state')))
 	})
 
 	it('makes malformed @within override public and other valid annotations', () => {

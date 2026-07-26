@@ -1,6 +1,6 @@
 // core の Symbol 型は global Symbol constructor (unique symbol 宣言で使用) と
 // 衝突するため alias で import する。
-import { StateProxy, SymbolUtil } from '@spyglassmc/core'
+import { ErrorSeverity, StateProxy, SymbolUtil } from '@spyglassmc/core'
 import type { ErrorReporter, Symbol as CoreSymbol } from '@spyglassmc/core'
 import { isLegacyWithinTarget } from '../legacy/categories.js'
 import type {
@@ -201,7 +201,32 @@ function parseWithin(
 	values: readonly ImpDocValue[],
 	err?: ErrorReporter,
 ): WithinPattern | undefined {
-	const [, first, second, ...extra] = values
+	// 引数位置 (= annotation 名 `values[0]` を除く) の `@` 始まりトークンは IMP-Doc 仕様に
+	// 無い修飾子 (実 corpus の `@within function foo:** @readonly` 等)。 resource location
+	// の文字集合と glob wildcard はいずれも `@` を含まないため、 既知 annotation 名の
+	// リストと突き合わせずに構文だけで修飾子と判定できる。 未知修飾子 1 個で宣言ブロック
+	// 全体が deny state に落ちて大量の false positive を生むのを避けるため、 warning に
+	// 降格して剥がし、 残りのトークンで解析を続ける。 剥がしを destructuring より前に
+	// 置くのは、 target type 省略形 (`@within foo:** @readonly`) では修飾子が `second` に
+	// 入って path pattern が target type 扱いされてしまうため。
+	const modifiers: ImpDocValue[] = []
+	const effective: ImpDocValue[] = []
+	for (const [index, value] of values.entries()) {
+		if (index > 0 && value.raw.startsWith('@')) {
+			modifiers.push(value)
+		} else {
+			effective.push(value)
+		}
+	}
+	for (const modifier of modifiers) {
+		err?.report(
+			`Unknown @within modifier "${modifier.raw}" is ignored`,
+			modifier,
+			ErrorSeverity.Warning,
+		)
+	}
+
+	const [, first, second, ...extra] = effective
 	if (!first) {
 		err?.report('@within requires a path pattern', values[0])
 		return undefined
