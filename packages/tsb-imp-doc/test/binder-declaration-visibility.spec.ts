@@ -410,4 +410,27 @@ describe('IMP-Doc declaration binder visibility fallback', () => {
 			))
 		}
 	})
+
+	it('keeps the pattern and warns when @within carries an unknown modifier', () => {
+		const { err, symbol } = bindStorage([
+			'@within',
+			'function',
+			'owner:**',
+			'@readonly',
+		])
+		assert.deepEqual(declaredVisibility(symbol), {
+			type: 'within',
+			owner: Owner,
+			includeOwner: false,
+			patterns: [{
+				raw: 'owner:**',
+				targetType: 'function',
+				regex: '^owner:.{0,}$',
+			}],
+		})
+		assert.deepEqual(
+			err.errors.map(error => [error.message, error.severity]),
+			[['Unknown @within modifier "@readonly" is ignored', core.ErrorSeverity.Warning]],
+		)
+	})
 })

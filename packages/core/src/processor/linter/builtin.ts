@@ -207,6 +207,20 @@ function hasStringTypeDefinition(node: AstNode): boolean {
 			&& typeDef.members?.some((member) => member.kind === 'string') === true)
 }
 
+/**
+ * @returns Whether the `node` carries a symbol of the given `category` and holds its name in the
+ * `value` property.
+ *
+ * A `symbol` can be attached to any {@link AstNode}, so the category alone does not imply the node
+ * shape that {@link nameConvention} requires: a node of another syntax may keep its name under a
+ * different property. Such nodes are skipped here instead of tripping the assertion in
+ * {@link nameConvention}.
+ */
+function isNamedSymbolOf(node: AstNode, category: string): boolean {
+	return node.symbol?.category === category
+		&& typeof (node as AstNode & { value?: unknown }).value === 'string'
+}
+
 export namespace configValidator {
 	function getDocLink(name: string): string {
 		return `https://spyglassmc.com/user/lint/${name}`
@@ -325,22 +339,22 @@ export function registerLinters(meta: MetaRegistry) {
 	meta.registerLinter('nameOfObjective', {
 		configValidator: configValidator.nameConvention,
 		linter: nameConvention('value'),
-		nodePredicate: (n) => n.symbol && n.symbol.category === 'objective',
+		nodePredicate: (n) => isNamedSymbolOf(n, 'objective'),
 	})
 	meta.registerLinter('nameOfScoreHolder', {
 		configValidator: configValidator.nameConvention,
 		linter: nameConvention('value'),
-		nodePredicate: (n) => n.symbol && n.symbol.category === 'score_holder',
+		nodePredicate: (n) => isNamedSymbolOf(n, 'score_holder'),
 	})
 	meta.registerLinter('nameOfTag', {
 		configValidator: configValidator.nameConvention,
 		linter: nameConvention('value'),
-		nodePredicate: (n) => n.symbol && n.symbol.category === 'tag',
+		nodePredicate: (n) => isNamedSymbolOf(n, 'tag'),
 	})
 	meta.registerLinter('nameOfTeam', {
 		configValidator: configValidator.nameConvention,
 		linter: nameConvention('value'),
-		nodePredicate: (n) => n.symbol && n.symbol.category === 'team',
+		nodePredicate: (n) => isNamedSymbolOf(n, 'team'),
 	})
 	meta.registerLinter('nbtBoolean', {
 		configValidator: configValidator.boolean,

@@ -253,18 +253,16 @@ describe('IMP-Doc declaration union runtime (P4-2b v3 parity)', () => {
 		assert.match(errors[0]!.message, /other:denied/)
 	})
 
-	it('warns on private-owner and public-restricted conflicts only in the canonical declaring file', () => {
+	it('warns on public-restricted conflicts only in the canonical declaring file', () => {
+		// conflict:data is declared @private by two different owners, which the
+		// union simply admits both of (v3 parity, no warning). Only mixed:data,
+		// where the @public side cancels the restricted side, is contradictory.
 		const errors = getState('secondOwner').node.linterErrors ?? []
-		assert.equal(errors.length, 2)
-		for (const error of errors) {
-			assert.equal(error.severity, core.ErrorSeverity.Warning)
-			assert.match(error.message, /impDocVisibilityConflict/)
-		}
-		assert.match(
-			errors[0]!.message,
-			/private to “external:second_owner” here and private to “owner:_index\.d”/,
-		)
-		assert.match(errors[1]!.message, /restricted here but public/)
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0]?.severity, core.ErrorSeverity.Warning)
+		assert.match(errors[0]!.message, /impDocVisibilityConflict/)
+		assert.match(errors[0]!.message, /“mixed:data”/)
+		assert.match(errors[0]!.message, /restricted here but public/)
 	})
 
 	it('does not duplicate conflict diagnostics in the counterpart declaring file', () => {
@@ -272,12 +270,13 @@ describe('IMP-Doc declaration union runtime (P4-2b v3 parity)', () => {
 		assert.deepEqual(errors, [])
 	})
 
-	it('does not warn on same-owner private duplicates, within unions, or internal unions', () => {
-		// dup:data is declared @private twice by the same owner and aj:remove has
-		// two different @within declarations. internal:shared adds two @internal
-		// declarations in the same namespace; none may produce a conflict.
-		// The exact-2 assertions above already exclude them, and the headerless
-		// aj target plus the caller-local declare must stay conflict-free too.
+	it('does not warn on private duplicates, within unions, or internal unions', () => {
+		// dup:data is declared @private twice by the same owner, conflict:data
+		// twice by different owners, and aj:remove has two different @within
+		// declarations. internal:shared adds two @internal declarations in the
+		// same namespace; none may produce a conflict. The exact-1 assertion
+		// above already excludes them, and the headerless aj target plus the
+		// caller-local declare must stay conflict-free too.
 		assert.deepEqual(getState('ajRemove').node.linterErrors ?? [], [])
 		assert.deepEqual(getState('caller').node.linterErrors ?? [], [])
 		assert.deepEqual(getState('internalFirst').node.linterErrors ?? [], [])
@@ -452,13 +451,19 @@ describe('IMP-Doc function header purge on file deletion', () => {
 				'pack.mcmeta',
 				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Header purge fixture"\n\t}\n}\n',
 			)
+			// The header owns both the a:target definition and the canonical
+			// (lowest-URI) shared:data declaration, so no conflict is published in
+			// the declaring documents while it exists.
 			const header = await writeRuntimeFixtureFile(
 				projectRoot,
 				'data/a/functions/target.mcfunction',
-				'#> a:target\n# @public\n\nbadcommand target\n',
+				'#> a:target\n# @public\n\n'
+					+ '#> Shared storage (public side)\n# @public\n#declare storage shared:data\n\n'
+					+ 'badcommand target\n',
 			)
 			const declaringContent = '#> b:decl\n# @public\n\n'
-				+ '#> Restricted declaration\n# @private\n#declare function a:target\n'
+				+ '#> Restricted declaration\n# @private\n#declare function a:target\n\n'
+				+ '#> Shared storage (public side)\n# @public\n#declare storage shared:data\n'
 			const declaring = await writeRuntimeFixtureFile(
 				projectRoot,
 				'data/b/functions/decl.mcfunction',
@@ -468,7 +473,8 @@ describe('IMP-Doc function header purge on file deletion', () => {
 				projectRoot,
 				'data/c/functions/decl.mcfunction',
 				'#> c:decl\n# @public\n\n'
-					+ '#> Other restricted declaration\n# @private\n#declare function a:target\n',
+					+ '#> Other restricted declaration\n# @private\n#declare function a:target\n\n'
+					+ '#> Shared storage (restricted side)\n# @private\n#declare storage shared:data\n',
 			)
 			const projectRootUri = core.fileUtil.ensureEndingSlash(
 				core.normalizeUri(pathToFileURL(projectRoot).toString()),
@@ -541,9 +547,12 @@ describe('IMP-Doc function header purge on file deletion', () => {
 			assert.equal(headerRemovalCount, 1)
 			assert.equal(readyHeaderUri, undefined)
 			assert.deepEqual(readyHeaderErrors, [])
+			// The purged header hands shared:data ownership to b:decl, whose
+			// public declaration still contradicts the restricted c:decl side.
 			assert.ok(
 				readyOwnerErrors?.some(error =>
-					/private to “b:decl” here and private to “c:decl”/.test(error.message)
+					error.message.includes('impDocVisibilityConflict')
+					&& /“shared:data”.*public here but restricted/.test(error.message)
 				),
 				'the surviving declaration owner must be linted before READY',
 			)
@@ -729,7 +738,7 @@ describe('IMP-Doc conflict ownership handoff on header file deletion', () => {
 				projectRoot,
 				'data/b/functions/first.mcfunction',
 				'#> b:first\n# @public\n\n'
-					+ '#> First private declaration\n# @private\n#declare function a:target\n',
+					+ '#> First public declaration\n# @public\n#declare function a:target\n',
 			)
 			const second = await writeRuntimeFixtureFile(
 				projectRoot,
@@ -761,12 +770,12 @@ describe('IMP-Doc conflict ownership handoff on header file deletion', () => {
 
 			// With the header (= previous canonical owner) gone, the surviving
 			// first declaration document must be queued and publish the
-			// private-owner conflict of the remaining declarations.
+			// public/restricted conflict of the remaining declarations.
 			const republished = project.cacheService.errors[first.uri] ?? []
 			assert.ok(
 				republished.some(error =>
 					error.message.includes('impDocVisibilityConflict')
-					&& /private to “b:first” here and private to “c:second”/.test(error.message)
+					&& /“a:target”.*public here but restricted/.test(error.message)
 				),
 				'the surviving declaration owner must publish the conflict',
 			)

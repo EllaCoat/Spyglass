@@ -1351,8 +1351,10 @@ export class Project extends EventDispatcher<{
 		}
 
 		node.linterErrors = []
-		try {
-			for (const [ruleName, rawValue] of Object.entries(this.config.lint)) {
+		for (const [ruleName, rawValue] of Object.entries(this.config.lint)) {
+			// Each rule is isolated: a rule that throws loses only its own results, and the remaining
+			// rules still contribute their diagnostics.
+			try {
 				const result = LinterConfigValue.destruct(rawValue)
 				if (!result) {
 					// Rule is disabled (i.e. set to `null`) in the config.
@@ -1381,9 +1383,12 @@ export class Project extends EventDispatcher<{
 					}
 				})
 				;(node.linterErrors as LanguageError[]).push(...ctx.err.dump())
+			} catch (e) {
+				this.logger.error(
+					`[Project] [lint] Rule “${ruleName}” failed for ${doc.uri} # ${doc.version}`,
+					e,
+				)
 			}
-		} catch (e) {
-			this.logger.error(`[Project] [lint] Failed for ${doc.uri} # ${doc.version}`, e)
 		}
 	}
 
