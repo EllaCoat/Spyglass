@@ -1,16 +1,56 @@
 import type { AstNode, Linter, LinterContext, Logger, StateProxy, Symbol } from '@spyglassmc/core'
-import { ResourceLocationNode } from '@spyglassmc/core'
+import { LinterSeverity, ResourceLocationNode } from '@spyglassmc/core'
 import type { ImpDocSymbolData, ImpDocVisibility } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, getRefProvenance } from '../node/ImpDocNode.js'
 import type { DocumentResource } from '../util/documentFunction.js'
 import { getDocumentResource } from '../util/documentFunction.js'
 import { getVisibilityEntries, matchesVisibility } from '../util/withinPattern.js'
 
-export function configValidator(_ruleName: string, value: unknown, logger: Logger): boolean {
+/** Map from symbol category to the severity used for that category. */
+export type ImpDocPrivateSeverityByCategory = Readonly<Record<string, LinterSeverity>>
+
+/**
+ * Object form of the `impDocPrivate` rule value.
+ *
+ * v3 had no dedicated visibility rule: restricted symbols were trimmed from the
+ * cache, so violations surfaced through the `strict<Category>Check` rules whose
+ * severities differed per category (`score_holder` / `enchantment` were
+ * `information`, every other category was `error`; the fork has no declarable
+ * `enchantment` category, so only `score_holder` is reachable today). This map
+ * reproduces that split; categories absent from it keep the severity of the
+ * rule itself.
+ */
+export interface ImpDocPrivateConfig {
+	severityByCategory: ImpDocPrivateSeverityByCategory
+}
+
+/**
+ * Reads the object rule value, doubling as its validation: a value that is not
+ * the object form (e.g. the boolean form) returns `undefined`.
+ */
+function getSeverityByCategory(
+	value: unknown,
+): ImpDocPrivateSeverityByCategory | undefined {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) {
+		return undefined
+	}
+	const map = (value as Partial<ImpDocPrivateConfig>).severityByCategory
+	if (!map || typeof map !== 'object' || Array.isArray(map)) {
+		return undefined
+	}
+	return Object.values(map).every(severity => LinterSeverity.is(severity)) ? map : undefined
+}
+
+export function configValidator(ruleName: string, value: unknown, logger: Logger): boolean {
 	if (typeof value === 'boolean') {
 		return value
 	}
-	logger.error('[Invalid Linter Config] [impDocPrivate] Expected a boolean value')
+	if (getSeverityByCategory(value)) {
+		return true
+	}
+	logger.error(
+		`[Invalid Linter Config] [${ruleName}] Expected a boolean value, or an object with a “severityByCategory” map from symbol category to “hint”, “information”, “warning”, or “error”`,
+	)
 	return false
 }
 
@@ -99,6 +139,8 @@ export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => 
 	if (!caller) {
 		return
 	}
+	// Rule value は lint pass 中不変なので visit の外で 1 度だけ解決する。
+	const severityByCategory = getSeverityByCategory(ctx.ruleValue)
 
 	visit(node as StateProxy<AstNode>, (candidate) => {
 		// symbol 無しの node が大半なので存在 check を先頭に置き定数コストで抜ける。
@@ -129,11 +171,14 @@ export const privateVisibility: Linter<AstNode> = (node, ctx: LinterContext) => 
 
 		const target = describeTarget(candidate, symbol)
 		const scope = describeVisibilityScope(visibility)
+		const severity = severityByCategory?.[symbol.category]
 		ctx.err.lint(
 			symbol.category === 'function'
 				? `Function “${target}” is ${scope} and cannot be called from “${caller.resourceID}”`
 				: `Symbol “${target}” in category “${symbol.category}” is ${scope} and cannot be referenced from “${caller.resourceID}”`,
 			candidate,
+			undefined,
+			severity === undefined ? undefined : LinterSeverity.toErrorSeverity(severity),
 		)
 	})
 }

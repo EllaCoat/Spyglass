@@ -96,6 +96,50 @@
 				}
 			]
 		},
+		"ImpDocSeverityByCategoryConfig": {
+			"title": "ImpDocSeverityByCategoryConfig",
+			"type": "object",
+			"properties": {
+				"severityByCategory": {
+					"type": "object",
+					"description": "Per-category severity overrides, keyed by symbol category (e.g. `score_holder`, `objective`, `function`). Categories absent from this map use the severity of the rule itself.",
+					"additionalProperties": { "$ref": "#/definitions/Severity" }
+				}
+			},
+			"required": [ "severityByCategory" ],
+			"additionalProperties": false
+		},
+		"ImpDocPrivateLint": {
+			"anyOf": [
+				{
+					"type": "null"
+				},
+				{
+					"enum": [ true ]
+				},
+				{
+					"$ref": "#/definitions/Severity"
+				},
+				{
+					"$ref": "#/definitions/ImpDocSeverityByCategoryConfig"
+				},
+				{
+					"type": "array",
+					"minItems": 2,
+					"maxItems": 2,
+					"items": [
+						{ "$ref": "#/definitions/Severity" },
+						{
+							"anyOf": [
+								{ "enum": [ true ] },
+								{ "$ref": "#/definitions/ImpDocSeverityByCategoryConfig" }
+							]
+						}
+					],
+					"default": [ "warning", true ]
+				}
+			]
+		},
 		"QuoteConfig": {
 			"title": "QuoteConfig",
 			"type": "object",
@@ -380,8 +424,8 @@
 					"$ref": "#/definitions/BooleanLint"
 				},
 				"impDocPrivate": {
-					"description": "Report references that violate IMP-Doc `@private` / `@within` visibility. Fork-only rule.",
-					"$ref": "#/definitions/ImpDocBooleanLint"
+					"description": "Report references that violate IMP-Doc `@private` / `@within` visibility. Fork-only rule. The object form takes a `severityByCategory` map so that each symbol category can be reported at its own severity, mirroring the per-category severities of the legacy `strict<Category>Check` rules.",
+					"$ref": "#/definitions/ImpDocPrivateLint"
 				},
 				"impDocPrivateBestEffort": {
 					"description": "Warning-level counterpart of `impDocPrivate` for references whose caller cannot be resolved exactly. Fork-only rule.",

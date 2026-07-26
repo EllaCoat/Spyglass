@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import type { ImpDocVisibility, WithinTargetType } from '../lib/index.js'
 import { legacyGlobToRegex, stampVisibility } from '../lib/index.js'
-import { privateVisibility } from '../lib/linter/private.js'
+import { configValidator, privateVisibility } from '../lib/linter/private.js'
 
 const FunctionCallerUri = 'file:///data/example/functions/caller.mcfunction'
 const BiomeCallerUri = 'file:///data/example/worldgen/biome/caller.json'
@@ -73,7 +73,17 @@ interface Harness {
 		node: core.AstNode,
 		uri: string,
 	) => void
-	lint: (node: core.AstNode, uri: string) => readonly core.LanguageError[]
+	lint: (
+		node: core.AstNode,
+		uri: string,
+		options?: LintOptions,
+	) => readonly core.LanguageError[]
+}
+
+interface LintOptions {
+	/** Destructured rule value, i.e. `true` for the boolean config form. */
+	ruleValue?: unknown
+	ruleSeverity?: core.ErrorSeverity
 }
 
 /**
@@ -107,15 +117,16 @@ function createHarness(): Harness {
 				})
 			})
 		},
-		lint: (node, uri) => {
+		lint: (node, uri, options) => {
 			const err = new core.LinterErrorReporter(
 				'test-rule',
-				core.ErrorSeverity.Error,
+				options?.ruleSeverity ?? core.ErrorSeverity.Error,
 			)
 			const ctx = {
 				symbols,
 				doc: { uri },
 				err,
+				ruleValue: options?.ruleValue ?? true,
 			} as unknown as core.LinterContext
 			privateVisibility(core.StateProxy.create(node), ctx)
 			return err.dump()
@@ -330,5 +341,115 @@ describe('impDocPrivate generic caller and category coverage', () => {
 		// No caller resolves, so the strict rule reports nothing instead of
 		// guessing between the two candidate resources.
 		assert.deepEqual(harness.lint(fileNode(ref), BiomeCallerUri), [])
+	})
+})
+
+/**
+ * Enters a `@private` target in `category` plus a denied reference to it from
+ * `FunctionCallerUri`, and returns the reference node.
+ */
+function enterDeniedReference(
+	harness: Harness,
+	category: string,
+	identifier: string,
+	start: number,
+): core.AstNode {
+	const target = harness.enterTarget(category, identifier)
+	stampVisibility(target, { type: 'private', owner: 'example:owner' })
+	const denied = symbolNode(category, identifier)
+	denied.range = { start, end: start + identifier.length }
+	harness.enterReference(category, identifier, denied, FunctionCallerUri)
+	return denied
+}
+
+function createRecordingLogger(): core.Logger & { errors: string[] } {
+	const errors: string[] = []
+	return {
+		errors,
+		error: (data: unknown) => {
+			errors.push(String(data))
+		},
+		info: () => {},
+		log: () => {},
+		warn: () => {},
+	}
+}
+
+/**
+ * v3 reported visibility violations through the `strict<Category>Check` rules,
+ * so the severity depended on the category of the referenced symbol
+ * (`score_holder` / `enchantment` were `information`, the rest `error`). The
+ * object rule value reproduces that split on top of the single fork rule.
+ */
+describe('impDocPrivate per-category severity', () => {
+	it('reports the boolean rule value at the rule-wide severity', () => {
+		const harness = createHarness()
+		harness.enterCaller('function', 'example:caller', FunctionCallerUri)
+		const denied = enterDeniedReference(harness, 'score_holder', '$Temp', 0)
+
+		const errors = harness.lint(fileNode(denied), FunctionCallerUri, {
+			ruleValue: true,
+			ruleSeverity: core.ErrorSeverity.Information,
+		})
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0]!.severity, core.ErrorSeverity.Information)
+	})
+
+	it('reports a category listed in severityByCategory at its own severity', () => {
+		const harness = createHarness()
+		harness.enterCaller('function', 'example:caller', FunctionCallerUri)
+		const denied = enterDeniedReference(harness, 'objective', 'Obj.One', 0)
+
+		const errors = harness.lint(fileNode(denied), FunctionCallerUri, {
+			ruleValue: { severityByCategory: { objective: 'error' } },
+			ruleSeverity: core.ErrorSeverity.Information,
+		})
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0]!.severity, core.ErrorSeverity.Error)
+	})
+
+	it('falls back to the rule-wide severity for unlisted categories', () => {
+		const harness = createHarness()
+		harness.enterCaller('function', 'example:caller', FunctionCallerUri)
+		const denied = enterDeniedReference(harness, 'score_holder', '$Temp', 0)
+
+		const errors = harness.lint(fileNode(denied), FunctionCallerUri, {
+			ruleValue: { severityByCategory: { objective: 'error' } },
+			ruleSeverity: core.ErrorSeverity.Information,
+		})
+		assert.equal(errors.length, 1)
+		assert.equal(errors[0]!.severity, core.ErrorSeverity.Information)
+	})
+})
+
+describe('impDocPrivate config validation', () => {
+	it('accepts the boolean form and the severityByCategory form', () => {
+		const logger = createRecordingLogger()
+		assert.equal(configValidator('impDocPrivate', true, logger), true)
+		assert.equal(configValidator('impDocPrivate', false, logger), false)
+		assert.equal(
+			configValidator(
+				'impDocPrivate',
+				{ severityByCategory: { objective: 'error', score_holder: 'information' } },
+				logger,
+			),
+			true,
+		)
+		// Disabling the rule through `false` is not a config error.
+		assert.deepEqual(logger.errors, [])
+	})
+
+	it('rejects an invalid severity in severityByCategory', () => {
+		const logger = createRecordingLogger()
+		assert.equal(
+			configValidator(
+				'impDocPrivate',
+				{ severityByCategory: { objective: 'fatal' } },
+				logger,
+			),
+			false,
+		)
+		assert.equal(logger.errors.length, 1)
+		assert.match(logger.errors[0]!, /\[impDocPrivate\]/)
 	})
 })
