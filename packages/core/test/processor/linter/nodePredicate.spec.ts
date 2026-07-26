@@ -127,6 +127,47 @@ describe('quote linter node predicates', () => {
 	})
 })
 
+const NameOfRules: readonly (readonly [ruleName: string, category: string])[] = [
+	['nameOfObjective', 'objective'],
+	['nameOfScoreHolder', 'score_holder'],
+	['nameOfTag', 'tag'],
+	['nameOfTeam', 'team'],
+]
+
+/**
+ * @returns A node that carries a symbol of the given `category`, with `props` supplying whatever
+ * properties hold the symbol's name. A binder may attach a symbol to a node of any shape, so the
+ * name is not necessarily kept in a `value` string.
+ */
+function symbolNode(category: string, props: Record<string, unknown>): AstNode {
+	return {
+		type: 'test:symbol_carrier',
+		range: Range.create(0, 3),
+		symbol: { category, identifier: 'Foo', path: ['Foo'], parentMap: {} },
+		...props,
+	} as unknown as AstNode
+}
+
+describe('nameOf linter node predicates', () => {
+	for (const [ruleName, category] of NameOfRules) {
+		it(`Should accept a ${category} symbol whose name is a string value`, () => {
+			assert.equal(matches(meta, ruleName, symbolNode(category, { value: 'Foo' })), true)
+		})
+
+		it(`Should not accept a ${category} symbol without a value`, () => {
+			// e.g. an `impDoc:declaration` node, which keeps its name in a `name` object instead.
+			const node = symbolNode(category, { name: { raw: 'Foo', range: Range.create(0, 3) } })
+			assert.equal(matches(meta, ruleName, node), false)
+		})
+
+		it(`Should not accept a ${category} symbol whose value is an object`, () => {
+			// e.g. an `impDoc:alias` node, whose `value` is a `{ raw, range }` pair.
+			const node = symbolNode(category, { value: { raw: 'Foo', range: Range.create(0, 3) } })
+			assert.equal(matches(meta, ruleName, node), false)
+		})
+	}
+})
+
 describe('selectorSortKeys and nbtBoolean node predicates', () => {
 	it('Should only accept selector arguments', () => {
 		assert.equal(matches(meta, 'selectorSortKeys', selector.node), true)
