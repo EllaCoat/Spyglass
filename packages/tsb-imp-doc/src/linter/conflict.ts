@@ -48,8 +48,15 @@ function getSortedDeclarations(
 
 /**
  * union (OR) 意味論の下で「宣言者の意図が両立しない」 組み合わせのみ矛盾扱いする :
- * - public + restricted の混在 = restricted 側の意図が union で無効化される
- * - 厳格 `@private` 同士で owner が異なる = 排他所有の主張が両立しない
+ * public と restricted の混在は片方 (= restricted 側) の意図が union で無効化される
+ * ため引き続き報告する。
+ *
+ * 一方、 厳格 `@private` 同士で owner が異なる組み合わせは矛盾にしない。 同名 symbol
+ * を複数の function が各々 `@private` として宣言するのは datapack の一般的な作法
+ * (`$Temp` のような汎用の一時 score holder) で、 実 corpus (Core 100 file) では
+ * 45 symbol / 204 件に達し、 pair の全組み合わせ (N(N-1)/2) で膨張する。 union が
+ * 両 owner を許可するのは v3 と同じ union 意味論の正しい帰結であり、 v3 にこの
+ * 警告は存在しなかった。
  *
  * `@within` / `@internal` の union (= 許可 caller の追加宣言) は v3 で正当な
  * idiom (caller-local `#declare`) のため矛盾にしない。 同 owner の `@private`
@@ -71,9 +78,6 @@ function getConflictMessage(
 				? 'public here but restricted'
 				: 'restricted here but public'
 		} in ${counterpart.where}, so the union makes it public everywhere`
-	}
-	if (own.type === 'private' && other.type === 'private' && own.owner !== other.owner) {
-		return `Visibility of “${identifier}” is contradictory: it is private to “${own.owner}” here and private to “${other.owner}” in ${counterpart.where}, so the union allows both owners`
 	}
 	return undefined
 }
