@@ -1349,3 +1349,176 @@ describe('IMP-Doc conflict linter reverse URI cache re-verification', () => {
 		assert.deepEqual(queued, [])
 	})
 })
+
+describe('IMP-Doc implicit lint propagation depth', () => {
+	it('re-lints the direct dependents of an edit but not their own dependents', async () => {
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-propagation-depth-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-propagation-depth-cache-'),
+		)
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Propagation depth fixture"\n\t}\n}\n',
+			)
+			// head declares chain:first, middle references it and declares
+			// chain:second, tail references chain:second. Editing head therefore
+			// reaches middle in one hop and tail only in a second one.
+			const headContent = '#> a:head\n# @public\n\n'
+				+ '#> Restricted to the middle namespace\n# @within function b:**\n'
+				+ '#declare function chain:first\n'
+			const head = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/head.mcfunction',
+				headContent,
+			)
+			const middle = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/middle.mcfunction',
+				'#> b:middle\n# @public\n\n'
+					+ '#> Restricted to the tail namespace\n# @within function c:**\n'
+					+ '#declare function chain:second\n\n'
+					+ 'function chain:first\n',
+			)
+			const tail = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/c/functions/tail.mcfunction',
+				'#> c:tail\n# @public\n\nfunction chain:second\n',
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher([pack.uri, head.uri, middle.uri, tail.uri]),
+			})
+
+			// Guard the fixture itself: without the second reverse edge this test
+			// would pass for the wrong reason.
+			const second = project.symbols.lookup('function', ['chain:second']).symbol
+			assert.ok(second)
+			assert.deepEqual(second.reference?.map(location => location.uri), [tail.uri])
+
+			const published = new Set<string>()
+			project.on('documentUpdated', ({ doc }) => {
+				published.add(doc.uri)
+			}).on('documentErrored', ({ uri }) => {
+				published.add(uri)
+			})
+
+			await project.onDidOpen(head.uri, 'mcfunction', 1, headContent)
+
+			assert.ok(published.has(head.uri), 'the edited document must be republished')
+			assert.ok(
+				published.has(middle.uri),
+				'the direct dependent of the edited document must be re-linted',
+			)
+			assert.equal(
+				published.has(tail.uri),
+				false,
+				'the implicit lint must not propagate past the direct dependents',
+			)
+		} finally {
+			await project?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
+
+describe('IMP-Doc canonical owner redirect inside the implicit lint drain', () => {
+	it('publishes and clears an unopened owner reached from a redrained document', async () => {
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-drain-redirect-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-drain-redirect-cache-'),
+		)
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Drain redirect fixture"\n\t}\n}\n',
+			)
+			// owner holds the canonical (lowest-URI) shared:data declaration and is
+			// never opened. relay holds the conflicting side and is only reached
+			// through the drain, because head is the document that gets edited and
+			// relay merely references head's chain:head declaration. The owner is
+			// therefore reachable only through the redirect performed by relay's
+			// lint inside the drain.
+			const owner = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/a/functions/owner.mcfunction',
+				'#> a:owner\n# @public\n\n'
+					+ '#> Canonical declaration\n# @public\n#declare storage shared:data\n',
+			)
+			const relayContent = '#> b:relay\n# @public\n\n'
+				+ '#> Conflicting declaration\n# @private\n#declare storage shared:data\n\n'
+				+ 'function chain:head\n'
+			const resolvedRelayContent = '#> b:relay\n# @public\n\n'
+				+ '#> Resolved declaration\n# @public\n#declare storage shared:data\n\n'
+				+ 'function chain:head\n'
+			const relay = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/b/functions/relay.mcfunction',
+				relayContent,
+			)
+			const headContent = '#> c:head\n# @public\n\n'
+				+ '#> Restricted to the relay namespace\n# @within function b:**\n'
+				+ '#declare function chain:head\n'
+			const head = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/c/functions/head.mcfunction',
+				headContent,
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher([pack.uri, owner.uri, relay.uri, head.uri]),
+			})
+			// The initial scan is bind-only, so no document owns the conflict yet.
+			assert.deepEqual(
+				(project.cacheService.errors[owner.uri] ?? []).filter(error =>
+					error.message.includes('impDocVisibilityConflict')
+				),
+				[],
+			)
+
+			await project.onDidOpen(head.uri, 'mcfunction', 1, headContent)
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+			assert.equal(project.getClientManaged(relay.uri), undefined)
+			assert.ok(
+				(project.cacheService.errors[owner.uri] ?? []).some(error =>
+					error.message.includes('impDocVisibilityConflict')
+				),
+				'the drained document must redirect the conflict to its unopened canonical owner',
+			)
+
+			// Resolving the conflict must clear the owner diagnostic again.
+			await project.onDidOpen(relay.uri, 'mcfunction', 1, relayContent)
+			await project.onDidChange(relay.uri, [{ text: resolvedRelayContent }], 2)
+			assert.equal(project.getClientManaged(owner.uri), undefined)
+			assert.deepEqual(
+				(project.cacheService.errors[owner.uri] ?? []).filter(error =>
+					error.message.includes('impDocVisibilityConflict')
+				),
+				[],
+			)
+		} finally {
+			await project?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})
