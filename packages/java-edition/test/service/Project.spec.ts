@@ -1198,6 +1198,73 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 		}
 	})
 
+	it('rebuilds for a reset requested during the final cache save before settling it', async () => {
+		const hooks: RaceHooks = {}
+		const releaseSaveWrite = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+
+			const saveWriteStarted = Promise.withResolvers<void>()
+			let shouldBlockWrite = true
+			hooks.beforeCacheWrite = async () => {
+				if (shouldBlockWrite) {
+					shouldBlockWrite = false
+					saveWriteStarted.resolve()
+					await releaseSaveWrite.promise
+				}
+			}
+			let rebuildCount = 0
+			project.on('ready', () => {
+				rebuildCount += 1
+			})
+
+			const firstReset = project.reset()
+			await saveWriteStarted.promise
+			const secondReset = project.reset()
+			releaseSaveWrite.resolve()
+			await secondReset
+
+			assert.equal(
+				rebuildCount,
+				2,
+				'a reset requested during the final save must rebuild before it settles',
+			)
+			await firstReset
+		} finally {
+			releaseSaveWrite.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('completes reset with a warning when the final cache save is skipped', async () => {
+		const hooks: RaceHooks = {}
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		let endCacheMutation: (() => void) | undefined
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+			let warningCount = 0
+			project.logger.warn = () => {
+				warningCount += 1
+			}
+			endCacheMutation = project.cacheService.beginStateMutation()
+
+			await assert.doesNotReject(project.reset())
+			assert.equal(warningCount, 1, 'a skipped final cache save must emit a warning')
+		} finally {
+			endCacheMutation?.()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
 	it('serializes a manual reset behind an in-flight config update, both completing without coalescing', async () => {
 		const hooks: RaceHooks = {}
 		// Declared before `try` so the `finally` release below can reach it (see the finally

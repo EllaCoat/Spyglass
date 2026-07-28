@@ -1031,28 +1031,40 @@ export class Project extends EventDispatcher<{
 	 */
 	private async drainResets(): Promise<void> {
 		let lastError: unknown
-		while (this.#processedResetGeneration < this.#resetGeneration) {
-			const generation = this.#resetGeneration
-			try {
-				await this.resetOnce()
-				lastError = undefined
-			} catch (e) {
-				lastError = e
+		for (;;) {
+			while (this.#processedResetGeneration < this.#resetGeneration) {
+				const generation = this.#resetGeneration
+				try {
+					await this.resetOnce()
+					lastError = undefined
+				} catch (e) {
+					lastError = e
+				}
+				this.#processedResetGeneration = generation
 			}
-			this.#processedResetGeneration = generation
-		}
-		if (lastError !== undefined) {
-			throw lastError
-		}
-		// Persist the cache before `reset()` returns. Otherwise the diagnostics the full pass
-		// produced for the whole corpus live only in memory until the 10-minute autosave or
-		// `close()`, and a crash in that window loses them. Running here keeps the save inside
-		// the lifecycle queue (no concurrent checksum mutation invalidating the save snapshot)
-		// and after the coalescing loop (one save per drain, not one per reset request).
-		try {
-			await this.cacheService.save()
-		} catch (e) {
-			this.logger.error('[Project#drainResets] Failed saving cache', e)
+			if (lastError !== undefined) {
+				throw lastError
+			}
+			// Persist the cache before `reset()` returns. Otherwise the diagnostics the full pass
+			// produced for the whole corpus live only in memory until the 10-minute autosave or
+			// `close()`, and a crash in that window loses them. Keeping this best-effort save in
+			// the lifecycle queue serializes it with resets and config updates, and placing it after
+			// the coalescing loop runs it once per settled rebuild batch. Editor-driven bind/check
+			// mutations do not use that queue: if one changes the cache generation during this save,
+			// `CacheService#save` returns false and the next autosave or `close()` can persist it.
+			try {
+				const saved = await this.cacheService.save()
+				if (!saved) {
+					this.logger.warn('[Project#drainResets] Finished reset without saving cache')
+				}
+			} catch (e) {
+				this.logger.error('[Project#drainResets] Failed saving cache', e)
+			}
+			// A reset requested during the potentially long save still has to pass through a
+			// rebuild before its promise settles, so recheck the generation after every save.
+			if (this.#processedResetGeneration >= this.#resetGeneration) {
+				break
+			}
 		}
 	}
 
