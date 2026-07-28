@@ -1522,3 +1522,88 @@ describe('IMP-Doc canonical owner redirect inside the implicit lint drain', () =
 		}
 	})
 })
+
+describe('IMP-Doc reset full-pass diagnostic preservation', () => {
+	it('checks an unopened caller on reset and keeps its diagnostics through an implicit lint', async () => {
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-reset-full-pass-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-reset-full-pass-cache-'),
+		)
+		let first: core.Project | undefined
+		let second: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Reset full-pass fixture"\n\t}\n}\n',
+			)
+			const declarationContent = '#> ns:declaration\n# @public\n\n'
+				+ '#> Restricted declaration\n# @within function other:**\n'
+				+ '#declare function ns:name\n'
+			const declaration = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/ns/functions/declaration.mcfunction',
+				declarationContent,
+			)
+			const caller = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/blocked/functions/caller.mcfunction',
+				'#> blocked:mismatch\n# @public\n\nfunction ns:name\n',
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watchedUris = [pack.uri, declaration.uri, caller.uri]
+
+			first = createRuntimeProject(cacheDir, projectRootUri)
+			await first.init()
+			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			assert.equal(first.getClientManaged(caller.uri), undefined)
+			assert.equal(
+				(first.cacheService.errors[caller.uri] ?? []).some(error =>
+					error.message.includes('impDocPrivate')
+				),
+				false,
+				'the initial bind-only scan must not publish linter diagnostics',
+			)
+
+			await first.reset()
+			const resetErrors = first.cacheService.errors[caller.uri] ?? []
+			assert.ok(
+				resetErrors.some(error => error.message.includes('impDocPrivate')),
+				'the reset full pass must publish the unopened caller linter diagnostic',
+			)
+			assert.ok(
+				resetErrors.some(error => /Expected function ID/.test(error.message)),
+				'the reset full pass must publish the unopened caller checker diagnostic',
+			)
+			await first.close()
+			first = undefined
+
+			// A warm start restores the reset diagnostics without stage provenance.
+			// Opening the declaring file then queues its unopened caller through the
+			// symbol clearer, forcing the implicit lint drain to reproduce the full set.
+			second = createRuntimeProject(cacheDir, projectRootUri)
+			await second.init()
+			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			await second.onDidOpen(declaration.uri, 'mcfunction', 1, declarationContent)
+			assert.equal(second.getClientManaged(caller.uri), undefined)
+			const republished = second.cacheService.errors[caller.uri] ?? []
+			assert.ok(
+				republished.some(error => error.message.includes('impDocPrivate')),
+				'the implicit lint must keep the reset linter diagnostic',
+			)
+			assert.ok(
+				republished.some(error => /Expected function ID/.test(error.message)),
+				'the implicit lint must keep the reset checker diagnostic',
+			)
+		} finally {
+			await first?.close()
+			await second?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+})

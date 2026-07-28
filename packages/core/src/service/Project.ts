@@ -216,15 +216,6 @@ export class Project extends EventDispatcher<{
 	readonly #symbolUpToDateUris = new Set<string>()
 	readonly #queuedLintUris = new Set<string>()
 	#queuedLintFlushPromise: Promise<void> | undefined
-	/**
-	 * Non-client-managed cache URIs whose published diagnostics include checker
-	 * results (produced by the `onDidClose` restore path). Implicit lint passes
-	 * must re-run the checker for them, or republishing would drop the checker
-	 * errors from the published superset. Persisted diagnostics do not retain
-	 * stage provenance, so warm cache/archive documents are restored here
-	 * conservatively as checker candidates.
-	 */
-	readonly #checkedCacheDocUris = new Set<string>()
 	/** File-deletion events whose core cleanup is run inline by `#ready`. */
 	readonly #inlineFileDeletedUris = new Set<string>()
 	/** File-deletion URIs processed inline by the active `#ready` generation. */
@@ -413,6 +404,10 @@ export class Project extends EventDispatcher<{
 				this.removeCachedTextDocument(uri)
 				if (this.isOnlyWatched(uri)) {
 					await this.ensureBindingStarted(uri)
+					// `ensureBindingStarted` publishes a bind-only node, which replaces
+					// whatever the reset pass published for this document. Requeue it so
+					// the drain below restores the checker and linter diagnostics.
+					this.queueLint(uri)
 				}
 				await this.flushQueuedLints()
 			}
@@ -448,7 +443,6 @@ export class Project extends EventDispatcher<{
 			this.updateRoots()
 		}
 		this.#symbolUpToDateUris.delete(uri)
-		this.#checkedCacheDocUris.delete(uri)
 		this.clearUriSymbolLocations(uri)
 		if (forceDocumentRemoval) {
 			this.removeCachedTextDocument(uri)
@@ -486,15 +480,6 @@ export class Project extends EventDispatcher<{
 		})
 		this.symbols = new SymbolUtil(symbols)
 		this.symbols.buildCache()
-		// Cache JSON stores the combined diagnostics but not their processing
-		// stage. Only physical cache-root documents and logical archive documents
-		// can have entered the checked onDidClose path, so conservatively re-check
-		// that bounded set if a later implicit lint republishes one of them.
-		for (const uri of Object.keys(this.cacheService.errors)) {
-			if (this.isCacheUri(uri) || uri.startsWith(ArchiveUriSupporter.Protocol)) {
-				this.#checkedCacheDocUris.add(uri)
-			}
-		}
 		__profiler.task('Activate Cache').finalize()
 
 		this.#isInitialized = true
@@ -549,7 +534,6 @@ export class Project extends EventDispatcher<{
 	private beginProjectRebuildTransaction(): ProjectRebuildTransaction {
 		const snapshot = {
 			bindingInProgressUris: new Set(this.#bindingInProgressUris),
-			checkedCacheDocUris: new Set(this.#checkedCacheDocUris),
 			clientManagedDocAndNodes: new Map(this.#clientManagedDocAndNodes),
 			ctx: this.#ctx,
 			dependencyFiles: this.#dependencyFiles,
@@ -581,8 +565,6 @@ export class Project extends EventDispatcher<{
 				cacheTransaction.rollback()
 				this.#bindingInProgressUris.clear()
 				snapshot.bindingInProgressUris.forEach(uri => this.#bindingInProgressUris.add(uri))
-				this.#checkedCacheDocUris.clear()
-				snapshot.checkedCacheDocUris.forEach(uri => this.#checkedCacheDocUris.add(uri))
 				this.#clientManagedDocAndNodes.clear()
 				snapshot.clientManagedDocAndNodes.forEach((value, uri) =>
 					this.#clientManagedDocAndNodes.set(uri, value)
@@ -1083,11 +1065,6 @@ export class Project extends EventDispatcher<{
 		this.logger.info('[Project#resetCache] Initiated...')
 		this.#isReady = false
 		this.reparseClientManaged()
-		// The rebuild's full checker/linter pass republishes every non-client-managed
-		// document with checker diagnostics and re-adds it here, so start from an
-		// empty set: documents that are gone after the rebuild must not keep
-		// claiming checker provenance.
-		this.#checkedCacheDocUris.clear()
 		// Lints queued against the discarded symbol table would otherwise drain
 		// after the full pass and republish diagnostics derived from it.
 		this.#queuedLintUris.clear()
@@ -1480,25 +1457,19 @@ export class Project extends EventDispatcher<{
 
 					const doc = await this.read(uri)
 					if (!doc) {
-						this.#checkedCacheDocUris.delete(uri)
 						await this.emitAsync('documentErrored', { errors: [], uri })
 						continue
 					}
 					const node = this.parse(doc)
 					// Republishing replaces this URI's diagnostics wholesale, so bind
-					// before linting: a lint-only pass on a fresh AST would drop the
-					// binder diagnostics published for this document earlier. Checkers
-					// normally run only for client-managed documents, but a cache URI
-					// document closed in the editor keeps its checker diagnostics
-					// published (see `onDidCloseOnce`), so reproduce that superset
-					// with the flush-free check path (flushing here would await this
-					// drain from inside itself).
+					// before checking: the reset pass publishes checker diagnostics for
+					// every project file, so implicit lint must always reproduce that
+					// superset. Since publishDiagnostics replaces all diagnostics for a
+					// URI, a lint-only pass would drop its checker diagnostics. Use the
+					// flush-free check path because flushing here would await this drain
+					// from inside itself.
 					await this.bind(doc, node, false, 'owner-only')
-					if (this.#checkedCacheDocUris.has(uri)) {
-						await this.checkWithoutLintFlush(doc, node, false, 'owner-only')
-					} else {
-						this.lint(doc, node, 'owner-only')
-					}
+					await this.checkWithoutLintFlush(doc, node, false, 'owner-only')
 					await this.emitAsync('documentUpdated', { doc, node })
 				}
 			}
@@ -1649,9 +1620,6 @@ export class Project extends EventDispatcher<{
 			const node = this.parse(doc)
 			await this.bind(doc, node, propagateProcessorErrors, 'none')
 			await this.checkWithoutLintFlush(doc, node, propagateProcessorErrors, 'none')
-			// Every document now publishes checker diagnostics, so implicit lint
-			// passes must reproduce that superset for all of them.
-			this.#checkedCacheDocUris.add(normalized)
 			stagedDiagnostics.push({
 				data: this.createDocumentErrorEvent(doc, node),
 				name: 'documentErrored',
@@ -1732,10 +1700,6 @@ export class Project extends EventDispatcher<{
 		const doc = TextDocument.create(uri, languageID, version, content)
 		const node = this.parse(doc)
 		this.#clientManagedUris.add(uri)
-		// While the document is client-managed its diagnostics are maintained
-		// through the client path; the closed-document marker is re-added by
-		// `onDidCloseOnce` when applicable.
-		this.#checkedCacheDocUris.delete(uri)
 		this.#clientManagedDocAndNodes.set(uri, { doc, node })
 		this.#clientManagedUriMap.delete(uri)
 		this.#clientManagedUriMap.set(uri, clientUri)
@@ -1815,9 +1779,6 @@ export class Project extends EventDispatcher<{
 				const node = this.parse(doc)
 				await this.bind(doc, node)
 				await this.check(doc, node)
-				// The published diagnostics for this closed document now include
-				// checker results; implicit lint passes must keep that superset.
-				this.#checkedCacheDocUris.add(uri)
 				restored = { doc, node }
 			} else {
 				// Reading the archive source failed; stale client contributions must not survive.
