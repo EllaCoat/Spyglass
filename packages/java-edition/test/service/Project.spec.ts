@@ -1000,18 +1000,47 @@ describe('Project cache reset (#1975)', () => {
 			const watcher = new ResetFixtureWatcher([fixtureFiles.pack])
 			await project.ready({ projectRootsWatcher: watcher })
 			assert.equal(project.cacheService.errors[fixtureFiles.caller], undefined)
+			assert.equal(hooks.checkedUris.has(fixtureFiles.caller), false)
 
 			// A real watcher registers the file before announcing it (see `LspFileWatcher`).
+			const linterDiagnostics = new Promise<readonly core.PosRangeLanguageError[]>(
+				(resolve) => {
+					project.on('documentErrored', ({ errors, uri }) => {
+						if (
+							uri === fixtureFiles.caller
+							&& errors.some(error => /Cannot find function/.test(error.message))
+						) {
+							resolve(errors)
+						}
+					})
+				},
+			)
+			let timeoutId: number | undefined
 			watcher.watchedFiles.add(fixtureFiles.caller)
 			watcher.emit('add', fixtureFiles.caller)
-			// Fence on the fileCreated lifecycle task queued by the watcher event.
-			await project.onDidClose(fixtureFiles.caller)
+			const errors = await Promise.race([
+				linterDiagnostics,
+				new Promise<undefined>((resolve) => {
+					timeoutId = setTimeout(resolve, 5000)
+				}),
+			])
+			if (timeoutId !== undefined) {
+				clearTimeout(timeoutId)
+			}
 
-			const errors = project.cacheService.errors[fixtureFiles.caller] ?? []
+			assert.ok(
+				errors,
+				'timed out waiting for the created file to publish a documentErrored event '
+					+ 'with linter diagnostics',
+			)
+			assert.ok(
+				hooks.checkedUris.has(fixtureFiles.caller),
+				'a created file must run the checker before publishing final diagnostics',
+			)
 			assert.ok(
 				errors.some(error => /Cannot find function/.test(error.message)),
-				'a created file must get its checker and linter diagnostics, not just the '
-					+ 'bind-only ones `ensureBindingStarted` publishes',
+				'a created file must get linter diagnostics, not just the bind-only ones '
+					+ '`ensureBindingStarted` publishes',
 			)
 		} finally {
 			await project.close()
