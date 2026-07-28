@@ -393,6 +393,13 @@ export class Project extends EventDispatcher<{
 				}
 				this.bindUri(uri)
 				await this.ensureBindingStarted(uri)
+				if (this.isOnlyWatched(uri)) {
+					// `ensureBindingStarted` publishes a bind-only node, so the new file would
+					// keep parser and binder errors only. Requeue it so the drain below adds the
+					// checker and linter diagnostics.
+					this.queueLint(uri)
+				}
+				await this.flushQueuedLints()
 			}
 			if (this.shouldReinitializeFor(uri)) {
 				this.requestReinitialization(uri, process)
@@ -1045,28 +1052,38 @@ export class Project extends EventDispatcher<{
 			if (lastError !== undefined) {
 				throw lastError
 			}
-			// Persist the cache before `reset()` returns. Otherwise the diagnostics the full pass
-			// produced for the whole corpus live only in memory until the 10-minute autosave or
-			// `close()`, and a crash in that window loses them. Keeping this best-effort save in
-			// the lifecycle queue serializes it with resets and config updates, and placing it after
-			// the coalescing loop runs it once per settled rebuild batch. Editor-driven bind/check
-			// mutations do not use that queue: if one changes the cache generation during this save,
-			// `CacheService#save` reports the skip by returning false — outside the narrow window
-			// it leaves unguarded between its last snapshot check and the rename — and the next
-			// autosave or `close()` can persist the state instead.
-			try {
-				const saved = await this.cacheService.save()
-				if (!saved) {
-					this.logger.warn('[Project#drainResets] Finished reset without saving cache')
-				}
-			} catch (e) {
-				this.logger.error('[Project#drainResets] Failed saving cache', e)
-			}
+			await this.saveCacheAfterRebuild('Project#drainResets')
 			// A reset requested during the potentially long save still has to pass through a
 			// rebuild before its promise settles, so recheck the generation after every save.
 			if (this.#processedResetGeneration >= this.#resetGeneration) {
 				break
 			}
+		}
+	}
+
+	/**
+	 * Persist the cache before a settled rebuild returns to its caller. Otherwise the diagnostics
+	 * the full pass produced for the whole corpus live only in memory until the 10-minute autosave
+	 * or `close()`, and a crash in that window loses them. Keeping this best-effort save in the
+	 * lifecycle queue serializes it with resets and config updates, and every caller runs it once
+	 * per settled rebuild batch rather than once per {@link resetOnce} pass — `CacheService#save`
+	 * costs seconds on a large corpus, so a coalescing loop must not repeat it per iteration.
+	 * Editor-driven bind/check mutations do not use that queue: if one changes the cache generation
+	 * during this save, `CacheService#save` reports the skip by returning false — outside the narrow
+	 * window it leaves unguarded between its last snapshot check and the rename — and the next
+	 * autosave or `close()` can persist the state instead. Both the skip and a failed save are
+	 * logged and swallowed; callers continue as if the rebuild succeeded.
+	 *
+	 * @param origin Identifies the calling path in the logs, e.g. `Project#drainResets`.
+	 */
+	private async saveCacheAfterRebuild(origin: string): Promise<void> {
+		try {
+			const saved = await this.cacheService.save()
+			if (!saved) {
+				this.logger.warn(`[${origin}] Finished rebuild without saving cache`)
+			}
+		} catch (e) {
+			this.logger.error(`[${origin}] Failed saving cache`, e)
 		}
 	}
 
@@ -1135,6 +1152,7 @@ export class Project extends EventDispatcher<{
 			})
 			if (preparedContext.changed) {
 				await this.resetOnce(preparedContext)
+				await this.saveCacheAfterRebuild('Project#applyConfigUpdate')
 			}
 		}
 	}
