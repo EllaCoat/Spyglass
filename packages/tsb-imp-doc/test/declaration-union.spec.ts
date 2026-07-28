@@ -1588,6 +1588,15 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 			second = createRuntimeProject(cacheDir, projectRootUri)
 			await second.init()
 			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			const restored = second.cacheService.errors[caller.uri] ?? []
+			assert.ok(
+				restored.some(error => error.message.includes('impDocPrivate')),
+				'the warm start must restore the reset linter diagnostic before any implicit lint',
+			)
+			assert.ok(
+				restored.some(error => /Expected function ID/.test(error.message)),
+				'the warm start must restore the reset checker diagnostic before any implicit lint',
+			)
 			await second.onDidOpen(declaration.uri, 'mcfunction', 1, declarationContent)
 			assert.equal(second.getClientManaged(caller.uri), undefined)
 			const republished = second.cacheService.errors[caller.uri] ?? []
@@ -1602,6 +1611,87 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 		} finally {
 			await first?.close()
 			await second?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
+	it('restores full diagnostics after a watched project file changes', async () => {
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-modified-full-pass-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-modified-full-pass-cache-'),
+		)
+		let project: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Modified full-pass fixture"\n\t}\n}\n',
+			)
+			const declaration = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/ns/functions/declaration.mcfunction',
+				'#> ns:declaration\n# @public\n\n'
+					+ '#> Restricted declaration\n# @within function other:**\n'
+					+ '#declare function ns:name\n',
+			)
+			const caller = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/blocked/functions/caller.mcfunction',
+				'#> blocked:mismatch\n# @public\n\nfunction ns:name\n',
+			)
+			const changed = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/changed/functions/target.mcfunction',
+				'#> changed:mismatch\n# @public\n\nfunction ns:name\n',
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watcher = new FixtureWatcher([
+				pack.uri,
+				declaration.uri,
+				caller.uri,
+				changed.uri,
+			])
+
+			project = createRuntimeProject(cacheDir, projectRootUri)
+			await project.init()
+			await project.ready({ projectRootsWatcher: watcher })
+			await project.reset()
+			assert.equal(project.getClientManaged(caller.uri), undefined)
+			assert.equal(project.getClientManaged(changed.uri), undefined)
+			const callerErrors = project.cacheService.errors[caller.uri] ?? []
+			assert.ok(
+				callerErrors.some(error => error.message.includes('impDocPrivate')),
+				'the reset must publish the unopened caller linter diagnostic',
+			)
+			assert.ok(
+				callerErrors.some(error => /Expected function ID/.test(error.message)),
+				'the reset must publish the unopened caller checker diagnostic',
+			)
+			const beforeChange = project.cacheService.errors[changed.uri] ?? []
+			assert.ok(beforeChange.some(error => error.message.includes('impDocPrivate')))
+			assert.ok(beforeChange.some(error => /Expected function ID/.test(error.message)))
+
+			watcher.emit('change', changed.uri)
+			// Fence on the fileModified lifecycle task queued by the watcher event.
+			await project.onDidClose(changed.uri)
+
+			assert.equal(project.getClientManaged(changed.uri), undefined)
+			const afterChange = project.cacheService.errors[changed.uri] ?? []
+			assert.ok(
+				afterChange.some(error => error.message.includes('impDocPrivate')),
+				'the modified watched file must regain its linter diagnostic',
+			)
+			assert.ok(
+				afterChange.some(error => /Expected function ID/.test(error.message)),
+				'the modified watched file must regain its checker diagnostic',
+			)
+		} finally {
+			await project?.close()
 			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
 		}

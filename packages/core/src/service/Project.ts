@@ -122,8 +122,9 @@ interface SymbolRegistrarEvent {
  *
  * - `full`: URI clearers queue every dependent document and cross-document
  *   linters redirect to their canonical owner. Editor-driven binds use this.
- * - `owner-only`: clearers stay silent while linters still redirect, so one
- *   editor edit propagates exactly one hop. The implicit lint drain uses this.
+ * - `owner-only`: URI clearers stay silent while cross-document linters may
+ *   still redirect to their canonical owner. The implicit lint drain uses this
+ *   to stop reverse-reference traversal without suppressing owner redirects.
  * - `none`: nothing is queued. The reset full pass uses this because it already
  *   schedules every document.
  */
@@ -1419,13 +1420,13 @@ export class Project extends EventDispatcher<{
 	 * client-managed editor documents. A single drain deduplicates cycles among
 	 * cross-document lint rules and republishes the target's diagnostics.
 	 *
-	 * Every pass inside the drain runs with `owner-only` propagation, so the
-	 * editor edit that opened the drain propagates exactly one hop: the URI
-	 * clearers of the redrained documents stay silent instead of walking the
-	 * reverse dependency graph into the next generation. Cross-document linters
-	 * still redirect to their canonical owner, which is how an unopened owner
-	 * gets its conflict diagnostics. Whole-corpus diagnostics are the reset
-	 * pass's job, not the editor path's.
+	 * Every pass inside the drain runs with `owner-only` propagation. URI
+	 * clearers of the redrained documents stay silent, so clearer-driven reverse
+	 * reference propagation stops after the first queued generation instead of
+	 * walking the dependency graph. Cross-document linters are different: they
+	 * may still queue canonical owners from inside the drain, and those
+	 * intentional redirects are drained as well. Whole-corpus diagnostics are
+	 * the reset pass's job, not the editor path's.
 	 */
 	private async flushQueuedLints(): Promise<void> {
 		if (!this.#isReady || this.#queuedLintUris.size === 0) {
