@@ -78,9 +78,13 @@ describe('CacheService binary file hashing (#1706)', () => {
 	function createProject(
 		externals: core.Externals = NodeJsExternals,
 		extraProjectRoot?: core.RootUriString,
+		beforeCheck?: (uri: string) => Promise<void>,
 	): core.Project {
 		const initializer: core.ProjectInitializer = ({ meta }) => {
 			meta.registerLanguage('png', { extensions: ['.png'] })
+			if (beforeCheck) {
+				meta.registerChecker('file', async (_node, ctx) => beforeCheck(ctx.doc.uri))
+			}
 			return { binaryFixture: 'v1' }
 		}
 		return new core.Project({
@@ -123,6 +127,20 @@ describe('CacheService binary file hashing (#1706)', () => {
 	async function readyProject(project: core.Project): Promise<void> {
 		await project.init()
 		await project.ready({ projectRootsWatcher: new FixtureWatcher(binaryUri) })
+	}
+
+	async function waitForRecordedHashes(project: core.Project, uri: string): Promise<void> {
+		const deadline = Date.now() + 5000
+		while (Date.now() < deadline) {
+			if (
+				project.cacheService.checksums.fileContents[uri] !== undefined
+				&& project.cacheService.checksums.files[uri] !== undefined
+			) {
+				return
+			}
+			await new Promise<void>(resolve => setTimeout(resolve, 20))
+		}
+		assert.fail(`Timed out waiting for recorded hashes of ${uri}`)
 	}
 
 	it('does not report an unchanged binary file as changed after cache reload', async () => {
@@ -520,6 +538,57 @@ describe('CacheService binary file hashing (#1706)', () => {
 		}
 	})
 
+	it('does not trust hashes after a file notification queued behind a rebuild', async () => {
+		const checkStarted = Promise.withResolvers<void>()
+		const releaseCheck = Promise.withResolvers<void>()
+		let shouldBlockCheck = false
+		const project = createProject(NodeJsExternals, undefined, async (uri) => {
+			if (shouldBlockCheck && uri === binaryUri) {
+				shouldBlockCheck = false
+				checkStarted.resolve()
+				await releaseCheck.promise
+			}
+		})
+		const watcher = new FixtureWatcher(binaryUri)
+		try {
+			await project.init()
+			await project.ready({ projectRootsWatcher: watcher })
+			assert.deepEqual(
+				(await readdir(cacheDir, { recursive: true }))
+					.filter(entry => entry.endsWith('.json.gz')),
+				[],
+				'the fixture must not have a cache that could hide a stale rebuild save',
+			)
+
+			shouldBlockCheck = true
+			const reset = project.reset()
+			await checkStarted.promise
+			await waitForRecordedHashes(project, binaryUri)
+			const recordedBeforeNotification = {
+				fileContent: project.cacheService.checksums.fileContents[binaryUri],
+				file: project.cacheService.checksums.files[binaryUri],
+			}
+
+			await writeFile(new URL(binaryUri), new Uint8Array([0x41, 0x42, 0x43]))
+			watcher.emit('change', binaryUri)
+			releaseCheck.resolve()
+			await reset
+
+			assert.deepEqual(
+				(await readdir(cacheDir, { recursive: true }))
+					.filter(entry => entry.endsWith('.json.gz')),
+				[],
+				'a trusting rebuild save must re-read a notified URI and reject the hashes recorded '
+					+ 'from its old contents',
+			)
+			assert.ok(recordedBeforeNotification.fileContent)
+			assert.ok(recordedBeforeNotification.file)
+		} finally {
+			releaseCheck.resolve()
+			await project.close()
+		}
+	})
+
 	it('reads a tracked file whose raw-byte hash an unsaved edit dropped, even when trusted', async () => {
 		const { project, readUris, restoreReadFile } = createReadRecordingProject()
 		try {
@@ -550,6 +619,90 @@ describe('CacheService binary file hashing (#1706)', () => {
 			)
 		} finally {
 			restoreReadFile()
+			await project.close()
+		}
+	})
+
+	it('reads a tracked file whose text hash is missing, even when trusted', async () => {
+		const { project, readUris, restoreReadFile } = createReadRecordingProject()
+		try {
+			await readyProject(project)
+			assert.equal(await project.cacheService.save(), true)
+			assert.ok(project.cacheService.checksums.files[binaryUri])
+			// No production transition leaves `files` behind while dropping only `fileContents`,
+			// so manipulate the checksum fixture directly to cover the other half of the skip guard.
+			delete project.cacheService.checksums.fileContents[binaryUri]
+
+			readUris.length = 0
+			assert.equal(
+				await project.cacheService.save({ trustRecordedHashes: true }),
+				false,
+				'a file with cached diagnostics but no text hash must abort publication',
+			)
+			assert.deepEqual(
+				readUris.filter(uri => uri === binaryUri),
+				[binaryUri],
+				'a tracked file missing its text hash must be read back even when the caller trusts '
+					+ 'recorded hashes',
+			)
+		} finally {
+			restoreReadFile()
+			await project.close()
+		}
+	})
+
+	it('waits for a pending hash recording before trusting recorded hashes', async () => {
+		const fs = { ...NodeJsExternals.fs }
+		const externals: core.Externals = { ...NodeJsExternals, fs }
+		const read = fs.readFile.bind(fs)
+		const hashReadStarted = Promise.withResolvers<void>()
+		const releaseHashRead = Promise.withResolvers<void>()
+		const unexpectedVerificationRead = Promise.withResolvers<void>()
+		let binaryReadCount = 0
+		fs.readFile = async (location) => {
+			if (location.toString() === binaryUri) {
+				binaryReadCount += 1
+				if (binaryReadCount === 2) {
+					hashReadStarted.resolve()
+					await releaseHashRead.promise
+				} else if (binaryReadCount === 3) {
+					unexpectedVerificationRead.resolve()
+				}
+			}
+			return read(location)
+		}
+		const project = createProject(externals)
+		try {
+			await readyProject(project)
+			await hashReadStarted.promise
+			assert.equal(project.cacheService.checksums.fileContents[binaryUri], undefined)
+			assert.equal(project.cacheService.checksums.files[binaryUri], undefined)
+
+			const save = project.cacheService.save({ trustRecordedHashes: true })
+			const readBeforeRelease = await Promise.race([
+				unexpectedVerificationRead.promise.then(() => true),
+				new Promise<false>(resolve => setTimeout(() => resolve(false), 100)),
+			])
+			assert.equal(
+				readBeforeRelease,
+				false,
+				'the save must wait for the pending recording instead of verifying an incomplete '
+					+ 'checksum snapshot',
+			)
+
+			releaseHashRead.resolve()
+			assert.equal(await save, true)
+			const cache = await readCacheFile()
+			assert.equal(
+				cache.checksums.fileContents[binaryUri],
+				project.cacheService.checksums.fileContents[binaryUri],
+			)
+			assert.equal(
+				cache.checksums.files[binaryUri],
+				project.cacheService.checksums.files[binaryUri],
+			)
+		} finally {
+			releaseHashRead.resolve()
 			await project.close()
 		}
 	})

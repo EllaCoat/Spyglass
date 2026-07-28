@@ -653,6 +653,7 @@ describe('Project cache reset (#1975)', () => {
 		beforeCheck?: (uri: string) => Promise<void>
 		checkedUris: Set<string>
 		failBindUri?: string
+		readUris?: string[]
 	}
 
 	class ResetFixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
@@ -721,6 +722,15 @@ describe('Project cache reset (#1975)', () => {
 			})
 			return { loadedVersion: '1.20.4', errorSource: '1.20.4' }
 		}
+		const fs = { ...NodeJsExternals.fs }
+		if (hooks.readUris) {
+			const read = fs.readFile.bind(fs)
+			fs.readFile = async (location) => {
+				hooks.readUris?.push(location.toString())
+				return read(location)
+			}
+		}
+		const externals: core.Externals = { ...NodeJsExternals, fs }
 		const project = new core.Project({
 			cacheRoot: core.fileUtil.ensureEndingSlash(
 				core.normalizeUri(pathToFileURL(cacheDir).toString()),
@@ -728,7 +738,7 @@ describe('Project cache reset (#1975)', () => {
 			defaultConfig: core.ConfigService.merge(core.VanillaConfig, {
 				env: { dependencies: [], exclude: [], gameVersion: '1.20.4' },
 			}),
-			externals: NodeJsExternals,
+			externals,
 			initializers: [initializer],
 			logger: core.Logger.noop(),
 			projectRoots: [fixtureRoot],
@@ -948,6 +958,34 @@ describe('Project cache reset (#1975)', () => {
 				[cacheFileName],
 				'reset must persist the cache before it settles, instead of leaving the full-pass '
 					+ 'diagnostics in memory until the autosave interval or close()',
+			)
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('does not re-read files during the cache save after reset', async () => {
+		const readUris: string[] = []
+		const hooks: ResetHooks = { checkedUris: new Set(), readUris }
+		const { cacheDir, project } = await createResetProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new ResetFixtureWatcher(Object.values(fixtureFiles)),
+			})
+			// Drain the initial scan's hash recordings so only reset work is measured below.
+			assert.equal(await project.cacheService.save(), true)
+
+			readUris.length = 0
+			await project.reset()
+
+			assert.ok(project.cacheService.checksums.fileContents[fixtureFiles.caller])
+			assert.ok(project.cacheService.checksums.files[fixtureFiles.caller])
+			assert.deepEqual(
+				readUris.filter(uri => uri === fixtureFiles.caller),
+				[fixtureFiles.caller],
+				'the rebuild records the file once; its final trusting save must not read it again',
 			)
 		} finally {
 			await project.close()

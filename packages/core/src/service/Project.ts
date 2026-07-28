@@ -387,6 +387,7 @@ export class Project extends EventDispatcher<{
 		}).on('documentRemoved', ({ uri }) => {
 			this.emit('documentErrored', { errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
+			this.cacheService.markFileChange(uri)
 			const process = async () => {
 				if (uri.endsWith(Project.RootSuffix)) {
 					this.updateRoots()
@@ -407,6 +408,7 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileCreated] ${uri}`)
 		}).on('fileModified', ({ uri }) => {
+			this.cacheService.markFileChange(uri)
 			const process = async () => {
 				this.#symbolUpToDateUris.delete(uri)
 				this.removeCachedTextDocument(uri)
@@ -425,6 +427,7 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
+			this.cacheService.markFileChange(uri)
 			const readyFileDeletedUris = this.#readyFileDeletedUris
 			const process = () =>
 				readyFileDeletedUris?.has(uri)

@@ -181,6 +181,8 @@ export class CacheService {
 	#activeInitializerHash: string | undefined
 	#activeLintHash: string | undefined
 	readonly #fileContentUpdateTokens = new Map<string, number>()
+	/** File notifications received since the URI's latest completed hash recording. */
+	readonly #fileChangePendingUris = new Set<string>()
 	// Monotonic counter bumped on every mutation of cached state (root updates, file tracking,
 	// context commits, partial invalidation, transactions, reset). `saveOnce` snapshots its
 	// value on start and skips publishing when it moved (see `isSaveSnapshotCurrent`), so a
@@ -240,11 +242,17 @@ export class CacheService {
 			this.#hashUpdateGeneration += 1
 			this.errors[uri] = errors
 		})
-		for (const event of ['fileCreated', 'fileModified', 'fileDeleted'] as const) {
-			this.project.on(event, () => {
-				this.#hashUpdateGeneration += 1
-			})
-		}
+	}
+
+	/**
+	 * Synchronously stop a watcher-notified URI from reusing hashes recorded before the event.
+	 * Invalidating its update token also prevents an older in-flight hash operation from
+	 * recording stale values or clearing the marker after this notification.
+	 */
+	markFileChange(uri: string): void {
+		this.#hashUpdateGeneration += 1
+		this.#fileChangePendingUris.add(uri)
+		this.#fileContentUpdateTokens.delete(uri)
 	}
 
 	/** Track a processed document without requiring its AST to remain live until publication. */
@@ -291,6 +299,9 @@ export class CacheService {
 					} else {
 						delete checksums.files[doc.uri]
 					}
+					// A missing `files` entry already forces verification. Either way, the
+					// current document state has now replaced every hash from before the event.
+					this.#fileChangePendingUris.delete(doc.uri)
 				}
 			} catch (e) {
 				if (!this.project.externals.error.isKind(e, 'EISDIR')) {
@@ -339,9 +350,10 @@ export class CacheService {
 	 * moments ago, {@link trackDocumentUpdate} recorded both hashes from the same read, and
 	 * `saveOnce` awaits {@link waitForPendingHashUpdates} before getting here, so re-reading the
 	 * whole corpus repeats a verification that has just run. What is deliberately not trusted:
-	 * a file with no `fileContents` entry was never bound, and one with no `files` entry is one
+	 * a file with no `fileContents` entry was never bound, one with no `files` entry is one
 	 * `trackDocumentUpdate` found disagreeing with its backing file (an unsaved client-managed
-	 * edit, for instance) and therefore refused to record. Both keep the full read path.
+	 * edit, for instance), and one in `#fileChangePendingUris` received a watcher notification
+	 * after its hashes were recorded. All three keep the full read path.
 	 *
 	 * The cost is that an external change the file watcher missed is no longer caught here, so
 	 * the reuse stays scoped to rebuild-driven saves; the autosave interval and `close()` keep
@@ -357,6 +369,7 @@ export class CacheService {
 		for (const uri of this.project.getTrackedFiles()) {
 			if (
 				trustRecordedHashes
+				&& !this.#fileChangePendingUris.has(uri)
 				&& checksums.fileContents[uri] !== undefined
 				&& checksums.files[uri] !== undefined
 			) {
