@@ -1616,6 +1616,75 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 		}
 	})
 
+	it('restores the reset diagnostics on a warm start that never saw a close()', async () => {
+		const projectRoot = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-reset-persist-project-'),
+		)
+		const cacheDir = await createCanonicalTempDir(
+			join(tmpdir(), 'spyglass-imp-doc-reset-persist-cache-'),
+		)
+		let first: core.Project | undefined
+		let second: core.Project | undefined
+		try {
+			const pack = await writeRuntimeFixtureFile(
+				projectRoot,
+				'pack.mcmeta',
+				'{\n\t"pack": {\n\t\t"pack_format": 26,\n\t\t"description": "Reset persist fixture"\n\t}\n}\n',
+			)
+			const declaration = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/ns/functions/declaration.mcfunction',
+				'#> ns:declaration\n# @public\n\n'
+					+ '#> Restricted declaration\n# @within function other:**\n'
+					+ '#declare function ns:name\n',
+			)
+			const caller = await writeRuntimeFixtureFile(
+				projectRoot,
+				'data/blocked/functions/caller.mcfunction',
+				'#> blocked:mismatch\n# @public\n\nfunction ns:name\n',
+			)
+			const projectRootUri = core.fileUtil.ensureEndingSlash(
+				core.normalizeUri(pathToFileURL(projectRoot).toString()),
+			)
+			const watchedUris = [pack.uri, declaration.uri, caller.uri]
+
+			first = createRuntimeProject(cacheDir, projectRootUri)
+			await first.init()
+			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			await first.reset()
+			const resetErrors = first.cacheService.errors[caller.uri] ?? []
+			assert.ok(
+				resetErrors.some(error => error.message.includes('impDocPrivate')),
+				'the reset full pass must publish the unopened caller linter diagnostic',
+			)
+			assert.ok(
+				resetErrors.some(error => /Expected function ID/.test(error.message)),
+				'the reset full pass must publish the unopened caller checker diagnostic',
+			)
+
+			// The first project is deliberately left open: an editor crashing right after a
+			// Regenerate Cache never reaches `close()`, so the reset itself has to be what
+			// persisted the full-pass diagnostics.
+			second = createRuntimeProject(cacheDir, projectRootUri)
+			await second.init()
+			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
+			const restored = second.cacheService.errors[caller.uri] ?? []
+			assert.ok(
+				restored.some(error => error.message.includes('impDocPrivate')),
+				'the warm start must restore the reset linter diagnostic without a preceding close()',
+			)
+			assert.ok(
+				restored.some(error => /Expected function ID/.test(error.message)),
+				'the warm start must restore the reset checker diagnostic without a preceding close()',
+			)
+		} finally {
+			await first?.close()
+			await second?.close()
+			await rm(projectRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+			await rm(cacheDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 })
+		}
+	})
+
 	it('restores full diagnostics after a watched project file changes', async () => {
 		const projectRoot = await createCanonicalTempDir(
 			join(tmpdir(), 'spyglass-imp-doc-modified-full-pass-project-'),

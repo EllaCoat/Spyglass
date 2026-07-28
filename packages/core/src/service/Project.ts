@@ -1044,6 +1044,16 @@ export class Project extends EventDispatcher<{
 		if (lastError !== undefined) {
 			throw lastError
 		}
+		// Persist the cache before `reset()` returns. Otherwise the diagnostics the full pass
+		// produced for the whole corpus live only in memory until the 10-minute autosave or
+		// `close()`, and a crash in that window loses them. Running here keeps the save inside
+		// the lifecycle queue (no concurrent checksum mutation invalidating the save snapshot)
+		// and after the coalescing loop (one save per drain, not one per reset request).
+		try {
+			await this.cacheService.save()
+		} catch (e) {
+			this.logger.error('[Project#drainResets] Failed saving cache', e)
+		}
 	}
 
 	private async resetOnce(preparedContext?: PreparedCacheContext): Promise<void> {
