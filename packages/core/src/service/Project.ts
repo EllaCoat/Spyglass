@@ -387,6 +387,7 @@ export class Project extends EventDispatcher<{
 		}).on('documentRemoved', ({ uri }) => {
 			this.emit('documentErrored', { errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
+			this.cacheService.markFileChange(uri)
 			const process = async () => {
 				if (uri.endsWith(Project.RootSuffix)) {
 					this.updateRoots()
@@ -407,6 +408,7 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileCreated] ${uri}`)
 		}).on('fileModified', ({ uri }) => {
+			this.cacheService.markFileChange(uri)
 			const process = async () => {
 				this.#symbolUpToDateUris.delete(uri)
 				this.removeCachedTextDocument(uri)
@@ -425,6 +427,7 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
+			this.cacheService.markFileChange(uri)
 			const readyFileDeletedUris = this.#readyFileDeletedUris
 			const process = () =>
 				readyFileDeletedUris?.has(uri)
@@ -451,6 +454,7 @@ export class Project extends EventDispatcher<{
 			this.updateRoots()
 		}
 		this.#symbolUpToDateUris.delete(uri)
+		this.cacheService.clearFileChange(uri)
 		this.clearUriSymbolLocations(uri)
 		if (forceDocumentRemoval) {
 			this.removeCachedTextDocument(uri)
@@ -1074,11 +1078,16 @@ export class Project extends EventDispatcher<{
 	 * autosave or `close()` can persist the state instead. Both the skip and a failed save are
 	 * logged and swallowed; callers continue as if the rebuild succeeded.
 	 *
+	 * Because the rebuild just bound every tracked file, this path saves with
+	 * `trustRecordedHashes` so that `CacheService` reuses the checksums binding recorded rather
+	 * than reading the whole corpus a second time. The autosave interval and `close()` run
+	 * arbitrarily long after a rebuild and keep the full verification.
+	 *
 	 * @param origin Identifies the calling path in the logs, e.g. `Project#drainResets`.
 	 */
 	private async saveCacheAfterRebuild(origin: string): Promise<void> {
 		try {
-			const saved = await this.cacheService.save()
+			const saved = await this.cacheService.save({ trustRecordedHashes: true })
 			if (!saved) {
 				this.logger.warn(`[${origin}] Finished rebuild without saving cache`)
 			}
