@@ -454,6 +454,7 @@ export class Project extends EventDispatcher<{
 			this.updateRoots()
 		}
 		this.#symbolUpToDateUris.delete(uri)
+		this.cacheService.clearFileChange(uri)
 		this.clearUriSymbolLocations(uri)
 		if (forceDocumentRemoval) {
 			this.removeCachedTextDocument(uri)

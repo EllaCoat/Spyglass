@@ -255,6 +255,15 @@ export class CacheService {
 		this.#fileContentUpdateTokens.delete(uri)
 	}
 
+	/**
+	 * Drop a removed URI's change marker. {@link trackDocumentUpdate} is what normally clears it,
+	 * but a deleted file is never bound again, so its marker would otherwise be retained for the
+	 * lifetime of the project and accumulate across bulk deletions.
+	 */
+	clearFileChange(uri: string): void {
+		this.#fileChangePendingUris.delete(uri)
+	}
+
 	/** Track a processed document without requiring its AST to remain live until publication. */
 	trackDocumentUpdate(doc: TextDocument): void {
 		if (
