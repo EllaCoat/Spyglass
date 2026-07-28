@@ -677,6 +677,17 @@ describe('Project cache reset (#1975)', () => {
 		return caller.node.linterErrors ?? []
 	}
 
+	// The cache file lands at `<cacheRoot>/symbols/<hash>.json.gz`. Listing the cache root
+	// recursively keeps the pre-rebuild assertions valid while `symbols/` does not exist yet,
+	// and the separator normalization keeps the comparison against the `/`-joined name
+	// returned by `computeSymbolCacheName` working on Windows.
+	async function listCacheFiles(cacheDir: string): Promise<string[]> {
+		const entries = await readdir(cacheDir, { recursive: true })
+		return entries
+			.map(entry => entry.split(sep).join('/'))
+			.filter(entry => entry.endsWith('.json.gz'))
+	}
+
 	async function createResetProject(hooks: ResetHooks): Promise<{
 		cacheDir: string
 		project: core.Project
@@ -913,16 +924,6 @@ describe('Project cache reset (#1975)', () => {
 	it('has written the cache file by the time reset settles, without close()', async () => {
 		const hooks: ResetHooks = { checkedUris: new Set() }
 		const { cacheDir, project } = await createResetProject(hooks)
-		// The cache file lands at `<cacheRoot>/symbols/<hash>.json.gz`. Listing the cache root
-		// recursively keeps the pre-reset assertion valid while `symbols/` does not exist yet,
-		// and the separator normalization keeps the comparison against the `/`-joined name
-		// returned by `computeSymbolCacheName` working on Windows.
-		const listCacheFiles = async (): Promise<string[]> => {
-			const entries = await readdir(cacheDir, { recursive: true })
-			return entries
-				.map(entry => entry.split(sep).join('/'))
-				.filter(entry => entry.endsWith('.json.gz'))
-		}
 		try {
 			await project.init()
 			await project.ready({
@@ -930,7 +931,7 @@ describe('Project cache reset (#1975)', () => {
 			})
 			const cacheFileName = await core.computeSymbolCacheName(project.projectRoots)
 			assert.deepEqual(
-				await listCacheFiles(),
+				await listCacheFiles(cacheDir),
 				[],
 				'the fixture must start without a cache file so the assertion below has meaning',
 			)
@@ -938,10 +939,108 @@ describe('Project cache reset (#1975)', () => {
 			await project.reset()
 
 			assert.deepEqual(
-				await listCacheFiles(),
+				await listCacheFiles(cacheDir),
 				[cacheFileName],
 				'reset must persist the cache before it settles, instead of leaving the full-pass '
 					+ 'diagnostics in memory until the autosave interval or close()',
+			)
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('has written the cache file by the time a config-driven rebuild settles', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new ResetFixtureWatcher(Object.values(fixtureFiles)),
+			})
+			const cacheFileName = await core.computeSymbolCacheName(project.projectRoots)
+			assert.deepEqual(
+				await listCacheFiles(cacheDir),
+				[],
+				'the fixture must start without a cache file so the assertion below has meaning',
+			)
+			let readyCount = 0
+			project.on('ready', () => {
+				readyCount += 1
+			})
+
+			// A bare severity is tolerated at runtime for `undeclaredSymbol` but is not part
+			// of LinterConfigValue<SymbolLinterConfig>; cast to keep the original runtime value.
+			await project.onEditorConfigurationUpdate(
+				{ lint: { undeclaredSymbol: 'error' } } as unknown as core.PartialConfig,
+			)
+
+			assert.equal(readyCount, 1, 'the changed lint config must rebuild the whole project')
+			assert.deepEqual(
+				await listCacheFiles(cacheDir),
+				[cacheFileName],
+				'a config-driven rebuild bypasses the drainResets loop, so it must persist the '
+					+ 'cache itself instead of leaving the rebuilt diagnostics in memory',
+			)
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('publishes checker and linter diagnostics for a newly created watched file', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		try {
+			await project.init()
+			// The caller is left out of the initial watch set so that the `add` event below is
+			// the project's first sighting of it, like a file created after the project is ready.
+			// The callee is left out as well, which makes the caller's `function example:b`
+			// reference undeclared and therefore linter-reportable.
+			const watcher = new ResetFixtureWatcher([fixtureFiles.pack])
+			await project.ready({ projectRootsWatcher: watcher })
+			assert.equal(project.cacheService.errors[fixtureFiles.caller], undefined)
+			assert.equal(hooks.checkedUris.has(fixtureFiles.caller), false)
+
+			// A real watcher registers the file before announcing it (see `LspFileWatcher`).
+			const linterDiagnostics = new Promise<readonly core.PosRangeLanguageError[]>(
+				(resolve) => {
+					project.on('documentErrored', ({ errors, uri }) => {
+						if (
+							uri === fixtureFiles.caller
+							&& errors.some(error => /Cannot find function/.test(error.message))
+						) {
+							resolve(errors)
+						}
+					})
+				},
+			)
+			let timeoutId: number | undefined
+			watcher.watchedFiles.add(fixtureFiles.caller)
+			watcher.emit('add', fixtureFiles.caller)
+			const errors = await Promise.race([
+				linterDiagnostics,
+				new Promise<undefined>((resolve) => {
+					timeoutId = setTimeout(resolve, 5000)
+				}),
+			])
+			if (timeoutId !== undefined) {
+				clearTimeout(timeoutId)
+			}
+
+			assert.ok(
+				errors,
+				'timed out waiting for the created file to publish a documentErrored event '
+					+ 'with linter diagnostics',
+			)
+			assert.ok(
+				hooks.checkedUris.has(fixtureFiles.caller),
+				'a created file must run the checker before publishing final diagnostics',
+			)
+			assert.ok(
+				errors.some(error => /Cannot find function/.test(error.message)),
+				'a created file must get linter diagnostics, not just the bind-only ones '
+					+ '`ensureBindingStarted` publishes',
 			)
 		} finally {
 			await project.close()
@@ -1305,8 +1404,11 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			await project.ready({
 				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
 			})
-			// The checker gate only fires for client-managed documents, so open the caller
-			// before racing the rebuilds (see `rebindAndCheckClientManaged`).
+			// The reset's whole-corpus checker pass runs the registered `file` checker for
+			// unopened project files as well, so the gate below fires with or without an open
+			// document. The caller is opened anyway so the gated check is the one issued by
+			// `rebindAndCheckClientManaged`, keeping this a race against a rebuild of an
+			// editor-managed document.
 			await project.onDidOpen(
 				fixtureFiles.caller,
 				'mcfunction',
