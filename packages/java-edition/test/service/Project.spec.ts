@@ -1571,6 +1571,192 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			await rm(cacheDir, { recursive: true, force: true })
 		}
 	})
+
+	it('cancels an in-flight analysis for a reset, which rebuilds after the analyzed file', async () => {
+		const hooks: RaceHooks = {}
+		// Declared before `try` so the `finally` release below can reach it (see the finally
+		// note); the closure in `hooks.beforeCheck` captures it either way.
+		const releaseAnalysisCheck = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+
+			const diagnostics = new Map<string, readonly core.PosRangeLanguageError[]>()
+			const eventOrder: string[] = []
+			project.on('documentErrored', ({ errors, uri }) => {
+				diagnostics.set(uri, errors)
+			}).on('documentUpdated', ({ doc }) => {
+				// Only the analysis publishes this event here: the rebuild stages its diagnostics
+				// as 'documentErrored' and emits 'documentUpdated' for open documents only.
+				eventOrder.push(`analyzed:${doc.uri}`)
+			})
+			// `Project` has no event for the start of a rebuild, so the log line that
+			// `rebuildProjectFromEmptyCache` writes before emptying the symbol table stands in
+			// for it. Everything else this noop logger receives is dropped as before.
+			project.logger.info = (data: unknown) => {
+				if (typeof data === 'string' && data.includes('[Project#resetCache] Initiated')) {
+					eventOrder.push('rebuild-started')
+				}
+			}
+
+			const analysisCheckStarted = Promise.withResolvers<void>()
+			let isAnalyzing = false
+			let shouldBlockCheck = true
+			hooks.beforeCheck = async () => {
+				if (isAnalyzing && shouldBlockCheck) {
+					shouldBlockCheck = false
+					analysisCheckStarted.resolve()
+					await releaseAnalysisCheck.promise
+				}
+			}
+			isAnalyzing = true
+			const analysis = project.analyzeProject()
+			// The analysis is now inside the checker of the first file of its 'analyze' pass.
+			await analysisCheckStarted.promise
+			const reset = project.reset()
+			await new Promise<void>(resolve => setImmediate(resolve))
+			// Emptying the symbol table now would leave that file's check reading a table that no
+			// longer exists, and its result would be published all the same.
+			assert.deepEqual(eventOrder, [])
+			releaseAnalysisCheck.resolve()
+			const result = await analysis
+			await reset
+
+			// The blocked file still counts: the analysis only stops at the following boundary.
+			assert.deepEqual(result, { analyzedFiles: 1, cancelled: true, totalFiles: 2 })
+			assert.equal(eventOrder.length, 2, `unexpected order: ${eventOrder.join(', ')}`)
+			assert.match(eventOrder[0], /^analyzed:/)
+			assert.equal(eventOrder[1], 'rebuild-started')
+			// `a.mcfunction` calls `example:b`, which a check against a symbol table that was
+			// emptied mid-analysis reports as undeclared (#1975).
+			assert.deepEqual(diagnostics.get(fixtureFiles.caller), [])
+			assert.deepEqual(diagnostics.get(fixtureFiles.callee), [])
+		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked analysis.
+			releaseAnalysisCheck.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('starts an analysis requested during a reset only after the rebuild finished', async () => {
+		const hooks: RaceHooks = {}
+		const releaseRebuild = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+
+			const eventOrder: string[] = []
+			project.on('ready', () => {
+				eventOrder.push('ready')
+			})
+
+			const rebuildStarted = Promise.withResolvers<void>()
+			let shouldBlockCheck = true
+			hooks.beforeCheck = async (uri) => {
+				if (shouldBlockCheck && uri === fixtureFiles.caller) {
+					shouldBlockCheck = false
+					rebuildStarted.resolve()
+					await releaseRebuild.promise
+				}
+			}
+			const reset = project.reset()
+			await rebuildStarted.promise
+			const analysis = project.analyzeProject({
+				onProgress: (done, _total, phase) => {
+					if (done === 1) {
+						eventOrder.push(`analysis:${phase}`)
+					}
+				},
+			})
+			await new Promise<void>(resolve => setImmediate(resolve))
+			// The analysis registers itself through the lifecycle queue, so it stays behind the
+			// gated rebuild rather than reading the symbol table that rebuild is repopulating.
+			assert.deepEqual(eventOrder, [])
+			releaseRebuild.resolve()
+			const result = await analysis
+			await reset
+
+			assert.deepEqual(result, { analyzedFiles: 2, cancelled: false, totalFiles: 2 })
+			assert.deepEqual(eventOrder, ['ready', 'analysis:prepare', 'analysis:analyze'])
+		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked rebuild.
+			releaseRebuild.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('starts an analysis requested during a config rebuild only after it finished', async () => {
+		const hooks: RaceHooks = {}
+		const releaseRebuild = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+
+			const eventOrder: string[] = []
+			project.on('configChanged', () => {
+				eventOrder.push('configChanged')
+			}).on('ready', () => {
+				eventOrder.push('ready')
+			})
+
+			const rebuildStarted = Promise.withResolvers<void>()
+			let shouldBlockCheck = true
+			hooks.beforeCheck = async (uri) => {
+				if (shouldBlockCheck && uri === fixtureFiles.caller) {
+					shouldBlockCheck = false
+					rebuildStarted.resolve()
+					await releaseRebuild.promise
+				}
+			}
+			// A bare severity is tolerated at runtime for `undeclaredSymbol` but is not part
+			// of LinterConfigValue<SymbolLinterConfig>; cast to keep the original runtime value.
+			const configUpdate = project.onEditorConfigurationUpdate(
+				{ lint: { undeclaredSymbol: 'error' } } as unknown as core.PartialConfig,
+			)
+			await rebuildStarted.promise
+			const analysis = project.analyzeProject({
+				onProgress: (done, _total, phase) => {
+					if (done === 1) {
+						eventOrder.push(`analysis:${phase}`)
+					}
+				},
+			})
+			await new Promise<void>(resolve => setImmediate(resolve))
+			// Same barrier as for a reset: the config rebuild replaces the symbol table, and the
+			// analysis would otherwise report against both the old and the new lint config.
+			assert.deepEqual(eventOrder, ['configChanged'])
+			releaseRebuild.resolve()
+			const result = await analysis
+			await configUpdate
+
+			assert.deepEqual(result, { analyzedFiles: 2, cancelled: false, totalFiles: 2 })
+			assert.deepEqual(eventOrder, [
+				'configChanged',
+				'ready',
+				'analysis:prepare',
+				'analysis:analyze',
+			])
+		} finally {
+			// Release the gate before closing so a mid-`try` assertion failure cannot leave
+			// `project.close()` waiting on the blocked config rebuild.
+			releaseRebuild.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
 })
 
 describe('Project cache-backed documents (#1483)', () => {

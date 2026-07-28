@@ -143,6 +143,16 @@ interface ProjectRebuildTransaction {
 	commit(): void
 	rollback(): void
 }
+/**
+ * A run of {@link Project.analyzeProject} that is in flight. The run registers itself through the
+ * lifecycle queue and then works outside of it, so lifecycle operations that replace the symbol
+ * table have to stop it through this handle before they start rebuilding.
+ */
+interface RunningAnalysis {
+	controller: AbortController
+	/** Settled once the run stopped reading and writing document state. */
+	stopped: PromiseWithResolvers<void>
+}
 type ProjectDiagnosticsEvent = { data: DocumentErrorEvent; name: 'documentErrored' }
 interface SymbolRegistrarEvent {
 	id: string
@@ -265,6 +275,8 @@ export class Project extends EventDispatcher<{
 	#registeredWatcher: FileWatcher | undefined
 	#lifecyclePromise: Promise<void> = Promise.resolve()
 	#configUpdatePromise: Promise<void> = Promise.resolve()
+	/** The {@link analyzeProject} run that is currently working outside the lifecycle queue. */
+	#activeAnalysis: RunningAnalysis | undefined
 	get watchedFiles() {
 		return this.#watcher?.watchedFiles ?? new UriStore()
 	}
@@ -392,6 +404,10 @@ export class Project extends EventDispatcher<{
 		// still run serially in `enqueueLifecycle` (FIFO) order, so a config update and a
 		// manual reset cannot interleave.
 		this.#configService.on('changed', ({ config }) => {
+			// Even an update that keeps the cache context fingerprint intact swaps the lint config
+			// the analysis reports against, so its remaining files would be judged by other rules
+			// than the ones already published.
+			this.cancelActiveAnalysis('Project#applyConfigUpdate')
 			this.#configUpdatePromise = this.enqueueLifecycle(() => this.applyConfigUpdate(config))
 				.catch(e => this.logger.error('[Project] [Config] Failed applying update', e))
 		}).on(
@@ -419,6 +435,7 @@ export class Project extends EventDispatcher<{
 		}).on('documentRemoved', ({ uri }) => {
 			this.emit('documentErrored', { errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
+			this.cancelActiveAnalysis(`[Project#fileCreated] ${uri}`)
 			this.cacheService.markFileChange(uri)
 			const process = async () => {
 				if (uri.endsWith(Project.RootSuffix)) {
@@ -440,6 +457,7 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileCreated] ${uri}`)
 		}).on('fileModified', ({ uri }) => {
+			this.cancelActiveAnalysis(`[Project#fileModified] ${uri}`)
 			this.cacheService.markFileChange(uri)
 			const process = async () => {
 				this.#symbolUpToDateUris.delete(uri)
@@ -459,6 +477,10 @@ export class Project extends EventDispatcher<{
 			}
 			this.requestLifecycle(process, `[Project#fileModified] ${uri}`)
 		}).on('fileDeleted', ({ uri }) => {
+			// The three watcher events change the very file set the analysis walks, so its result
+			// would describe a mixture of the corpus before and after the change while claiming to
+			// have covered all of it.
+			this.cancelActiveAnalysis(`[Project#fileDeleted] ${uri}`)
 			this.cacheService.markFileChange(uri)
 			const readyFileDeletedUris = this.#readyFileDeletedUris
 			const process = () =>
@@ -640,6 +662,10 @@ export class Project extends EventDispatcher<{
 	}
 
 	private scheduleReinitialization(): Promise<boolean> {
+		// A reinitialization commits a new `MetaRegistry` and initializer context even when it does
+		// not rebuild, so the parsers, binders, and checkers an analysis is running would change
+		// under it either way.
+		this.cancelActiveAnalysis('Project#reinitialize')
 		this.#reinitializationGeneration += 1
 		if (!this.#reinitializationPromise) {
 			const operation = this.enqueueLifecycle(() => this.drainReinitializations())
@@ -661,6 +687,8 @@ export class Project extends EventDispatcher<{
 	 * changed the cache context, which is why the two drains stay separate implementations.
 	 */
 	private async drainReinitializations(): Promise<boolean> {
+		// See `drainResets`: no analysis can slip in between two iterations of the loop below.
+		await this.settleActiveAnalysis('Project#reinitialize')
 		let lastError: unknown
 		let contextChanged = false
 		while (
@@ -735,6 +763,38 @@ export class Project extends EventDispatcher<{
 
 	private requestLifecycle(operation: () => Promise<void> | void, label: string): void {
 		this.enqueueLifecycle(operation).catch(e => this.logger.error(label, e))
+	}
+
+	/**
+	 * Ask the analysis working outside the lifecycle queue, if any, to stop at its next file
+	 * boundary. Raising the flag is synchronous, so paths that only invalidate what a single file
+	 * contributed — watcher events and editor notifications — signal without waiting for it.
+	 *
+	 * @param reason The lifecycle path that invalidated the analysis, e.g. `Project#reset`.
+	 */
+	private cancelActiveAnalysis(reason: string): void {
+		const analysis = this.#activeAnalysis
+		if (!analysis || analysis.controller.signal.aborted) {
+			return
+		}
+		this.logger.info(`[Project#analyzeProject] Cancelling for ${reason}`)
+		analysis.controller.abort()
+	}
+
+	/**
+	 * Cancel the running analysis and wait until it finished the file it is on. Operations that
+	 * replace the symbol table go through this first: emptying the table while a file is halfway
+	 * through its check publishes diagnostics derived from a table that no longer exists, which is
+	 * the very race the two-pass split in {@link analyzeProject} exists to avoid.
+	 *
+	 * Only operations running inside the lifecycle queue may await this. An analysis enters that
+	 * queue exactly once, to register itself, and never re-enters it afterwards, so a queued
+	 * operation waiting for the analysis cannot deadlock against it.
+	 */
+	private async settleActiveAnalysis(reason: string): Promise<void> {
+		const analysis = this.#activeAnalysis
+		this.cancelActiveAnalysis(reason)
+		await analysis?.stopped.promise
 	}
 
 	private requestReinitialization(
@@ -1003,6 +1063,9 @@ export class Project extends EventDispatcher<{
 	 */
 	async close(): Promise<void> {
 		clearInterval(this.#cacheSaverIntervalId)
+		// An analysis runs outside the lifecycle queue, so the drain below never waits for it. Left
+		// alone it would keep reading and publishing into a project that is being torn down.
+		this.cancelActiveAnalysis('Project#close')
 		await this.#watcher?.close()
 		for (;;) {
 			const lifecycle = this.#lifecyclePromise
@@ -1047,6 +1110,9 @@ export class Project extends EventDispatcher<{
 	 * absorbed by the next loop iteration, which jumps straight to the latest generation.
 	 */
 	async reset(): Promise<void> {
+		// Signalled before the drain is queued so that a running analysis winds down while the
+		// operations ahead of the reset are still executing, instead of only once the drain runs.
+		this.cancelActiveAnalysis('Project#reset')
 		this.#resetGeneration += 1
 		if (!this.#resetPromise) {
 			const operation = this.enqueueLifecycle(() => this.drainResets())
@@ -1073,6 +1139,10 @@ export class Project extends EventDispatcher<{
 	 * save atomicity.
 	 */
 	private async drainResets(): Promise<void> {
+		// Once here, no analysis can register behind us: `analyzeProject` registers through this
+		// same queue, so a request that arrives mid-drain waits for the whole drain. One wait
+		// therefore covers every iteration of the loop below.
+		await this.settleActiveAnalysis('Project#reset')
 		let lastError: unknown
 		for (;;) {
 			while (this.#processedResetGeneration < this.#resetGeneration) {
@@ -1181,6 +1251,9 @@ export class Project extends EventDispatcher<{
 	 * {@link reset} calls; the two are serialized only by `enqueueLifecycle` (FIFO) order.
 	 */
 	private async applyConfigUpdate(config: Config): Promise<void> {
+		// Waited for before the config is swapped, not only before the rebuild below: the analysis
+		// reads `this.config` per file.
+		await this.settleActiveAnalysis('Project#applyConfigUpdate')
 		const oldConfig = this.config
 		this.config = config
 		this.logger.info('[Project] [Config] Changed')
@@ -1788,7 +1861,15 @@ export class Project extends EventDispatcher<{
 	 * further documents.
 	 *
 	 * The analysis only starts after the READY process is complete, which guarantees that the
-	 * global symbol table is fully populated before any file is checked.
+	 * global symbol table is fully populated before any file is checked. It also starts behind
+	 * everything the lifecycle queue already holds, so a reset or a config rebuild that was
+	 * requested first finishes before the first file is read.
+	 *
+	 * The analysis itself runs outside that queue: it takes minutes on a large project, and the
+	 * same queue carries every editor-driven update. What keeps it consistent instead is that
+	 * lifecycle operations invalidating the state it reads stop it at its next file boundary — see
+	 * {@link cancelActiveAnalysis} and {@link settleActiveAnalysis}. Such a run reports
+	 * `cancelled`, exactly like one the caller aborted through {@link AnalyzeProjectOptions.signal}.
 	 *
 	 * Dependency files are not analyzed.
 	 *
@@ -1799,6 +1880,23 @@ export class Project extends EventDispatcher<{
 	async analyzeProject(options: AnalyzeProjectOptions = {}): Promise<AnalyzeProjectResult> {
 		await this.ready()
 
+		const analysis: RunningAnalysis = {
+			controller: new AbortController(),
+			stopped: Promise.withResolvers<void>(),
+		}
+		// Registering through the lifecycle queue is the entire interaction with it: operations
+		// queued before this point run to completion first, and from here on lifecycle operations
+		// find the analysis through `#activeAnalysis` instead of by holding the queue.
+		await this.enqueueLifecycle(() => {
+			this.#activeAnalysis = analysis
+		})
+
+		/** Whether the caller or a lifecycle operation asked this run to stop. */
+		const isCancelled = () =>
+			analysis.controller.signal.aborted || options.signal?.aborted === true
+
+		// Listed after the barrier: an operation that ran ahead of it may have changed the roots or
+		// the set of tracked files.
 		const files = [...new Set(this.getTrackedFiles().map((uri) => this.normalizeUri(uri)))]
 			.filter((uri) =>
 				this.projectRoots.some((root) => fileUtil.isSubUriOf(uri, root))
@@ -1813,110 +1911,120 @@ export class Project extends EventDispatcher<{
 		/** URIs the `prepare` pass bound, in the order the `analyze` pass has to process them. */
 		const boundUris: string[] = []
 		let prepared = 0
-		for (const uri of files) {
-			if (options.signal?.aborted) {
-				cancelled = true
-				this.logger.info(
-					`[Project#analyzeProject] Cancelled while preparing ${prepared}/${files.length} files`,
-				)
-				break
-			}
+		let analyzed = 0
+		try {
+			for (const uri of files) {
+				if (isCancelled()) {
+					cancelled = true
+					this.logger.info(
+						`[Project#analyzeProject] Cancelled while preparing ${prepared}/${files.length} files`,
+					)
+					break
+				}
 
-			try {
-				const clientManaged = this.#clientManagedDocAndNodes.get(uri)
-				if (clientManaged) {
-					// The editor holds the authoritative content of this document, so its
-					// node is reused instead of a disk read. That node still carries the
-					// results of the last editor pass, and every stage returns early once
-					// its own results are present. This command means “redo everything
-					// with the current config”, so those results must not survive it.
-					delete clientManaged.node.binderErrors
-					delete clientManaged.node.checkerErrors
-					delete clientManaged.node.linterErrors
-					await this.bind(clientManaged.doc, clientManaged.node, false, 'none')
-					boundUris.push(uri)
-				} else {
-					// This command is also how a user recovers from a stale cache, so the
-					// text cache is dropped to force a read from disk.
-					this.removeCachedTextDocument(uri)
-					const doc = await this.read(uri)
-					if (doc) {
-						await this.bind(doc, this.parse(doc), false, 'none')
+				try {
+					const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+					if (clientManaged) {
+						// The editor holds the authoritative content of this document, so its
+						// node is reused instead of a disk read. That node still carries the
+						// results of the last editor pass, and every stage returns early once
+						// its own results are present. This command means “redo everything
+						// with the current config”, so those results must not survive it.
+						delete clientManaged.node.binderErrors
+						delete clientManaged.node.checkerErrors
+						delete clientManaged.node.linterErrors
+						await this.bind(clientManaged.doc, clientManaged.node, false, 'none')
 						boundUris.push(uri)
 					} else {
-						await this.#publishEmptyDiagnosticsIfBound(uri)
+						// This command is also how a user recovers from a stale cache, so the
+						// text cache is dropped to force a read from disk.
+						this.removeCachedTextDocument(uri)
+						const doc = await this.read(uri)
+						if (doc) {
+							await this.bind(doc, this.parse(doc), false, 'none')
+							boundUris.push(uri)
+						} else {
+							await this.#publishEmptyDiagnosticsIfBound(uri)
+						}
 					}
+				} catch (e) {
+					this.logger.error(`[Project#analyzeProject] Failed to prepare ${uri}`, e)
 				}
-			} catch (e) {
-				this.logger.error(`[Project#analyzeProject] Failed to prepare ${uri}`, e)
-			}
 
-			prepared += 1
-			options.onProgress?.(prepared, files.length, 'prepare')
-			if (prepared % Project.AnalysisYieldInterval === 0) {
-				await new Promise((resolve) => setTimeout(resolve, 0))
+				prepared += 1
+				options.onProgress?.(prepared, files.length, 'prepare')
+				if (prepared % Project.AnalysisYieldInterval === 0) {
+					await new Promise((resolve) => setTimeout(resolve, 0))
+				}
 			}
-		}
-		__profiler.task('Prepare Files')
+			__profiler.task('Prepare Files')
 
-		let analyzed = 0
-		// A cancellation during the pass above aborted the signal for good, so this pass stops on
-		// its first file without a separate guard.
-		for (const uri of boundUris) {
-			if (options.signal?.aborted) {
-				cancelled = true
-				this.logger.info(
-					`[Project#analyzeProject] Cancelled after ${analyzed}/${boundUris.length} files`,
-				)
-				break
-			}
-
-			try {
-				const clientManaged = this.#clientManagedDocAndNodes.get(uri)
-				if (clientManaged) {
-					delete clientManaged.node.checkerErrors
-					delete clientManaged.node.linterErrors
-					await this.checkWithoutLintFlush(
-						clientManaged.doc,
-						clientManaged.node,
-						false,
-						'none',
+			// A cancellation during the pass above stays raised, so this pass stops on its first
+			// file without a separate guard.
+			for (const uri of boundUris) {
+				if (isCancelled()) {
+					cancelled = true
+					this.logger.info(
+						`[Project#analyzeProject] Cancelled after ${analyzed}/${boundUris.length} files`,
 					)
-					// Other code paths hold this very object; publishing a copy of it
-					// would leave them looking at a node nobody updates.
-					await this.emitAsync('documentUpdated', clientManaged)
-				} else {
-					const doc = await this.read(uri)
-					if (doc) {
-						// The `prepare` pass released its AST to keep memory flat, and a
-						// freshly parsed node carries no symbol, which linter rules such as
-						// `undeclaredSymbol` read from the node. Hence the second bind. It
-						// is not deduplicated against the first one: `bind` is keyed on the
-						// document and drops the key once its Promise settles, which the
-						// `prepare` pass awaited.
-						const node = this.parse(doc)
-						await this.bind(doc, node, false, 'none')
-						// `check` would flush the queued lints, which is the very
-						// self-feeding pass this two-pass split exists to avoid.
-						await this.checkWithoutLintFlush(doc, node, false, 'none')
-						// Awaiting the publish keeps one URI's diagnostics from overtaking
-						// each other when a listener is slow.
-						await this.emitAsync('documentUpdated', { doc, node })
-					} else {
-						await this.#publishEmptyDiagnosticsIfBound(uri)
-					}
+					break
 				}
-			} catch (e) {
-				this.logger.error(`[Project#analyzeProject] Failed for ${uri}`, e)
-			}
 
-			analyzed += 1
-			options.onProgress?.(analyzed, files.length, 'analyze')
-			if (analyzed % Project.AnalysisYieldInterval === 0) {
-				await new Promise((resolve) => setTimeout(resolve, 0))
+				try {
+					const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+					if (clientManaged) {
+						delete clientManaged.node.checkerErrors
+						delete clientManaged.node.linterErrors
+						await this.checkWithoutLintFlush(
+							clientManaged.doc,
+							clientManaged.node,
+							false,
+							'none',
+						)
+						// Other code paths hold this very object; publishing a copy of it
+						// would leave them looking at a node nobody updates.
+						await this.emitAsync('documentUpdated', clientManaged)
+					} else {
+						const doc = await this.read(uri)
+						if (doc) {
+							// The `prepare` pass released its AST to keep memory flat, and a
+							// freshly parsed node carries no symbol, which linter rules such as
+							// `undeclaredSymbol` read from the node. Hence the second bind. It
+							// is not deduplicated against the first one: `bind` is keyed on the
+							// document and drops the key once its Promise settles, which the
+							// `prepare` pass awaited.
+							const node = this.parse(doc)
+							await this.bind(doc, node, false, 'none')
+							// `check` would flush the queued lints, which is the very
+							// self-feeding pass this two-pass split exists to avoid.
+							await this.checkWithoutLintFlush(doc, node, false, 'none')
+							// Awaiting the publish keeps one URI's diagnostics from overtaking
+							// each other when a listener is slow.
+							await this.emitAsync('documentUpdated', { doc, node })
+						} else {
+							await this.#publishEmptyDiagnosticsIfBound(uri)
+						}
+					}
+				} catch (e) {
+					this.logger.error(`[Project#analyzeProject] Failed for ${uri}`, e)
+				}
+
+				analyzed += 1
+				options.onProgress?.(analyzed, files.length, 'analyze')
+				if (analyzed % Project.AnalysisYieldInterval === 0) {
+					await new Promise((resolve) => setTimeout(resolve, 0))
+				}
 			}
+			__profiler.task('Analyze Files')
+		} finally {
+			// Waiters are released here rather than after the save below: the save only reads
+			// project state, and `CacheService` already drops one whose snapshot a concurrent
+			// rebuild invalidated, so making a reset wait for it would only delay the rebuild.
+			if (this.#activeAnalysis === analysis) {
+				this.#activeAnalysis = undefined
+			}
+			analysis.stopped.resolve()
 		}
-		__profiler.task('Analyze Files')
 
 		await this.cacheService.save()
 		__profiler.task('Save Cache').finalize()
@@ -1933,6 +2041,11 @@ export class Project extends EventDispatcher<{
 		version: number,
 		content: string,
 	): Promise<void> {
+		// Opening a document deliberately does not cancel a running analysis. It does move which
+		// content of the URI `#clientManagedDocAndNodes` reports as authoritative, but the buffer of
+		// a freshly opened file still holds what is on disk, so a `prepare` pass that read the file
+		// and an `analyze` pass that sees it as client-managed agree on its content. Editing or
+		// closing it is what makes the two disagree, and those do cancel.
 		await this.enqueueLifecycle(() => this.onDidOpenOnce(uri, languageID, version, content))
 	}
 
@@ -1973,6 +2086,7 @@ export class Project extends EventDispatcher<{
 		changes: TextDocumentContentChangeEvent[],
 		version: number,
 	): Promise<void> {
+		this.cancelActiveAnalysis(`[Project#onDidChange] ${uri}`)
 		await this.enqueueLifecycle(() => this.onDidChangeOnce(uri, changes, version))
 	}
 
@@ -2010,6 +2124,7 @@ export class Project extends EventDispatcher<{
 	 * Notify that an existing document was closed in the editor.
 	 */
 	async onDidClose(uri: string): Promise<void> {
+		this.cancelActiveAnalysis(`[Project#onDidClose] ${uri}`)
 		await this.enqueueLifecycle(() => this.onDidCloseOnce(uri))
 	}
 
