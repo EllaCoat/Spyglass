@@ -437,4 +437,120 @@ describe('CacheService binary file hashing (#1706)', () => {
 			await project.close()
 		}
 	})
+
+	/**
+	 * Record which files a save reads back from disk. `FileService`'s `file:` supporter forwards
+	 * straight to the externals, so every read `createVerifiedChecksums` performs shows up here.
+	 */
+	function createReadRecordingProject(): {
+		project: core.Project
+		readUris: string[]
+		restoreReadFile: () => void
+	} {
+		const fs = { ...NodeJsExternals.fs }
+		const externals: core.Externals = { ...NodeJsExternals, fs }
+		const read = fs.readFile.bind(fs)
+		const readUris: string[] = []
+		fs.readFile = async (location) => {
+			readUris.push(location.toString())
+			return read(location)
+		}
+		return {
+			project: createProject(externals),
+			readUris,
+			restoreReadFile: () => {
+				fs.readFile = read
+			},
+		}
+	}
+
+	it('reuses the recorded hashes of tracked files when the caller trusts them', async () => {
+		const { project, readUris, restoreReadFile } = createReadRecordingProject()
+		try {
+			await readyProject(project)
+			// The checksum updates `documentUpdated` queued during `ready` are still in flight
+			// here. A first save doubles as their barrier: `saveOnce` awaits every pending hash
+			// update before it verifies anything, so the reads recorded below belong to the
+			// measured save alone.
+			assert.equal(await project.cacheService.save(), true)
+			const recorded = {
+				fileContent: project.cacheService.checksums.fileContents[binaryUri],
+				file: project.cacheService.checksums.files[binaryUri],
+			}
+			assert.ok(recorded.fileContent)
+			assert.ok(recorded.file)
+
+			readUris.length = 0
+			assert.equal(await project.cacheService.save({ trustRecordedHashes: true }), true)
+
+			assert.deepEqual(
+				readUris.filter(uri => uri === binaryUri),
+				[],
+				'a tracked file that already has both recorded hashes must not be read again by a '
+					+ 'save that follows the rebuild which recorded them',
+			)
+			const cache = await readCacheFile()
+			assert.equal(cache.checksums.files[binaryUri], recorded.file)
+			assert.equal(cache.checksums.fileContents[binaryUri], recorded.fileContent)
+		} finally {
+			restoreReadFile()
+			await project.close()
+		}
+	})
+
+	it('re-reads every tracked file when the caller does not trust recorded hashes', async () => {
+		const { project, readUris, restoreReadFile } = createReadRecordingProject()
+		try {
+			await readyProject(project)
+			// Drain the checksum updates queued by `ready` first; see the test above.
+			assert.equal(await project.cacheService.save(), true)
+
+			readUris.length = 0
+			assert.equal(await project.cacheService.save(), true)
+
+			assert.deepEqual(
+				readUris.filter(uri => uri === binaryUri),
+				[binaryUri],
+				'the default save path must keep verifying tracked files against disk so that a '
+					+ 'change the watcher missed cannot reach the cache file',
+			)
+		} finally {
+			restoreReadFile()
+			await project.close()
+		}
+	})
+
+	it('reads a tracked file whose raw-byte hash an unsaved edit dropped, even when trusted', async () => {
+		const { project, readUris, restoreReadFile } = createReadRecordingProject()
+		try {
+			await readyProject(project)
+			// An unsaved client-managed edit makes `trackDocumentUpdate` drop `checksums.files`
+			// while keeping `checksums.fileContents`, which is the state a trusting save must not
+			// take at face value.
+			await project.onDidOpen(binaryUri, 'png', 1, 'unsaved editor contents')
+			await project.ensureClientManagedChecked(binaryUri)
+			// Drain the checksum updates queued by `ready` and by the edit above; see the first
+			// test of this trio.
+			assert.equal(await project.cacheService.save(), false)
+
+			readUris.length = 0
+			assert.equal(
+				await project.cacheService.save({ trustRecordedHashes: true }),
+				false,
+				'a document that disagrees with its file on disk must still abort the save',
+			)
+
+			assert.ok(project.cacheService.checksums.fileContents[binaryUri])
+			assert.equal(project.cacheService.checksums.files[binaryUri], undefined)
+			assert.deepEqual(
+				readUris.filter(uri => uri === binaryUri),
+				[binaryUri],
+				'a tracked file missing its raw-byte hash must be read back even when the caller '
+					+ 'trusts recorded hashes',
+			)
+		} finally {
+			restoreReadFile()
+			await project.close()
+		}
+	})
 })

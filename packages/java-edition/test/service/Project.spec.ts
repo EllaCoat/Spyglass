@@ -688,11 +688,16 @@ describe('Project cache reset (#1975)', () => {
 			.filter(entry => entry.endsWith('.json.gz'))
 	}
 
-	async function createResetProject(hooks: ResetHooks): Promise<{
+	/**
+	 * @param existingCacheDir Reuse the cache root of an earlier project instead of creating an
+	 * empty one, so that the returned project warm starts from what that instance persisted.
+	 */
+	async function createResetProject(hooks: ResetHooks, existingCacheDir?: string): Promise<{
 		cacheDir: string
 		project: core.Project
 	}> {
-		const cacheDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-reset-cache-')))
+		const cacheDir = existingCacheDir
+			?? await realpath(await mkdtemp(join(tmpdir(), 'spyglass-reset-cache-')))
 		const initializer: core.ProjectInitializer = (ctx) => {
 			ctx.meta.registerUriBinder(je.binder.uriBinder)
 			je.mcf.initialize(ctx, commands, '1.20.4')
@@ -984,6 +989,75 @@ describe('Project cache reset (#1975)', () => {
 			)
 		} finally {
 			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('warm starts from the cache a rebuild-driven save wrote with reused hashes', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		// The callee stays out of the watch set so that the caller's `function example:b` is
+		// undeclared and the full pass produces diagnostics worth persisting.
+		const watchedUris = [fixtureFiles.pack, fixtureFiles.caller]
+		const cacheFilePath = join(
+			cacheDir,
+			...(await core.computeSymbolCacheName(project.projectRoots)).split('/'),
+		)
+		let cacheFileBytes: Uint8Array | undefined
+		let messages: string[] | undefined
+		try {
+			await project.init()
+			await project.ready({ projectRootsWatcher: new ResetFixtureWatcher(watchedUris) })
+
+			await project.reset()
+
+			messages = (project.cacheService.errors[fixtureFiles.caller] ?? [])
+				.map(error => error.message)
+			assert.ok(
+				messages.some(message => /Cannot find function/.test(message)),
+				'the rebuild must produce diagnostics for the caller, otherwise the warm start '
+					+ 'below would assert nothing',
+			)
+			// Snapshot what `saveCacheAfterRebuild` wrote: the `close()` below saves again through
+			// the full verification path and would otherwise replace the file under test.
+			cacheFileBytes = await readFile(cacheFilePath)
+		} finally {
+			await project.close()
+		}
+		assert.ok(cacheFileBytes)
+		assert.ok(messages)
+
+		const warmHooks: ResetHooks = { checkedUris: new Set() }
+		const { project: warmProject } = await createResetProject(warmHooks, cacheDir)
+		try {
+			await writeFile(cacheFilePath, cacheFileBytes)
+			const published = new Map<string, readonly core.PosRangeLanguageError[]>()
+			warmProject.on('documentErrored', ({ errors, uri }) => {
+				published.set(uri, errors)
+			})
+
+			await warmProject.init()
+			await warmProject.ready({ projectRootsWatcher: new ResetFixtureWatcher(watchedUris) })
+
+			assert.deepEqual(
+				(warmProject.cacheService.errors[fixtureFiles.caller] ?? [])
+					.map(error => error.message),
+				messages,
+				'a cache written from the recorded hashes must still restore its diagnostics',
+			)
+			assert.deepEqual(
+				(published.get(fixtureFiles.caller) ?? []).map(error => error.message),
+				messages,
+				'the restored diagnostics must reach the client',
+			)
+			assert.equal(
+				warmHooks.checkedUris.has(fixtureFiles.caller),
+				false,
+				'the warm start must serve those diagnostics from the cache instead of checking '
+					+ 'the file again, which is what makes the assertions above meaningful',
+			)
+		} finally {
+			await warmProject.close()
 			await rm(cacheDir, { recursive: true, force: true })
 		}
 	})

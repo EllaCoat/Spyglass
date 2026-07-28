@@ -70,6 +70,15 @@ export interface CacheTransaction {
 	rollback(): void
 }
 
+export interface SaveOptions {
+	/**
+	 * Reuse the checksums recorded while binding instead of re-reading every tracked file.
+	 * Reserved for saves that directly follow a full rebuild; see
+	 * `CacheService#createVerifiedChecksums`.
+	 */
+	trustRecordedHashes?: boolean
+}
+
 /**
  * Checksums of cached files or roots.
  */
@@ -320,12 +329,44 @@ export class CacheService {
 		}
 	}
 
+	/**
+	 * Build the checksum snapshot a save publishes, confirming that every tracked file on disk
+	 * still holds the text the in-memory state was built from.
+	 *
+	 * @param trustRecordedHashes Reuse the recorded hashes of tracked files that have both a
+	 * `fileContents` and a `files` entry instead of reading those files back from disk. Only
+	 * callers running right after a full rebuild may pass `true`: every tracked file was bound
+	 * moments ago, {@link trackDocumentUpdate} recorded both hashes from the same read, and
+	 * `saveOnce` awaits {@link waitForPendingHashUpdates} before getting here, so re-reading the
+	 * whole corpus repeats a verification that has just run. What is deliberately not trusted:
+	 * a file with no `fileContents` entry was never bound, and one with no `files` entry is one
+	 * `trackDocumentUpdate` found disagreeing with its backing file (an unsaved client-managed
+	 * edit, for instance) and therefore refused to record. Both keep the full read path.
+	 *
+	 * The cost is that an external change the file watcher missed is no longer caught here, so
+	 * the reuse stays scoped to rebuild-driven saves; the autosave interval and `close()` keep
+	 * verifying every tracked file.
+	 */
 	private async createVerifiedChecksums(
 		checksums: Checksums,
 		generation: number,
+		trustRecordedHashes = false,
 	): Promise<Checksums | undefined> {
+		const reusedUris: string[] = []
+		const readUris: string[] = []
+		for (const uri of this.project.getTrackedFiles()) {
+			if (
+				trustRecordedHashes
+				&& checksums.fileContents[uri] !== undefined
+				&& checksums.files[uri] !== undefined
+			) {
+				reusedUris.push(uri)
+			} else {
+				readUris.push(uri)
+			}
+		}
 		const updates = await mapLimit(
-			this.project.getTrackedFiles(),
+			readUris,
 			ChecksumReadConcurrency,
 			async (uri) => {
 				try {
@@ -352,6 +393,12 @@ export class CacheService {
 		const verified = Checksums.create()
 		verified.roots = { ...checksums.roots }
 		verified.symbolRegistrars = { ...checksums.symbolRegistrars }
+		// Reused URIs always carry a `fileContents` entry, so they can never reach the
+		// `stateHash === undefined` abort below; skipping them drops no error-entry check.
+		for (const uri of reusedUris) {
+			verified.files[uri] = checksums.files[uri]
+			verified.fileContents[uri] = checksums.fileContents[uri]
+		}
 		for (const update of updates) {
 			const stateHash = checksums.fileContents[update.uri]
 			if (stateHash === undefined) {
@@ -703,15 +750,17 @@ export class CacheService {
 	}
 
 	/**
+	 * @param options `trustRecordedHashes` skips re-reading tracked files whose hashes were just
+	 * recorded; see {@link createVerifiedChecksums} for who may pass it.
 	 * @returns If the cache file was saved successfully.
 	 */
-	save(): Promise<boolean> {
-		const result = this.#saveQueue.then(() => this.saveOnce())
+	save(options?: SaveOptions): Promise<boolean> {
+		const result = this.#saveQueue.then(() => this.saveOnce(options))
 		this.#saveQueue = result.then(() => undefined, () => undefined)
 		return result
 	}
 
-	private async saveOnce(): Promise<boolean> {
+	private async saveOnce(options?: SaveOptions): Promise<boolean> {
 		if (!this.canSave()) {
 			return false
 		}
@@ -721,7 +770,11 @@ export class CacheService {
 			await this.waitForPendingHashUpdates()
 			const sourceChecksums = this.checksums
 			const generation = this.#hashUpdateGeneration
-			const checksums = await this.createVerifiedChecksums(sourceChecksums, generation)
+			const checksums = await this.createVerifiedChecksums(
+				sourceChecksums,
+				generation,
+				options?.trustRecordedHashes,
+			)
 			if (!checksums) {
 				return false
 			}
