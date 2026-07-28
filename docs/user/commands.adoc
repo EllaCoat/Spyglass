@@ -8,7 +8,7 @@
 
 Check and lint every file in the current project and publish the results to the editor's diagnostics panel (e.g. the Problems view in VS Code).
 
-Spyglass normally only checks files that are open in the editor. Use this command to see the problems of the whole project, e.g. after migrating a pack to a new game version. The analysis may take a while on large projects and can be cancelled from the progress notification.
+Spyglass normally only checks files that are open in the editor. Use this command to see the problems of the whole project, e.g. after migrating a pack to a new game version, or after `spyglassmc.resetProjectCache` discarded the results of an earlier analysis. The analysis may take a while on large projects and can be cancelled from the progress notification.
 
 === `spyglassmc.dataHackPubify`
 
@@ -16,7 +16,9 @@ Data Hack Pubify a string.
 
 === `spyglassmc.resetProjectCache`
 
-Reset the symbols cache for the current project.
+Rebuild the cache of the current project: the cache file, the symbol table, and the recorded file checksums. Every tracked file is bound again, and the files that are open in the editor are checked again. The files that are not open are not checked.
+
+The problems of the files that are not open therefore disappear from the diagnostics panel until the project is analyzed again. That is intentional: it is what keeps a reset from walking the whole project. Run `spyglassmc.analyzeProject` to bring those problems back -- the notification shown when the reset finishes offers it as an action, and the reset never starts it on its own.
 
 === `spyglassmc.showCacheRoot`
 
@@ -25,3 +27,18 @@ Show the cache folder of Spyglass in the platform-specific explorer program.
 === `spyglassmc.showOutput`
 
 Show the output panel with the logs of the Spyglass Language Server.
+
+== Diagnostics coverage
+
+Three routes publish diagnostics, and each of them covers a different set of files.
+
+.What each route checks
+|===
+|Route |Responsibility
+
+|`spyglassmc.analyzeProject` |Checks and lints every file of the project. Shows its progress and can be cancelled while it runs.
+|`spyglassmc.resetProjectCache` |Regenerates the cache, the symbol table, and the file checksums, and rechecks the files that are open in the editor. It never checks the other files.
+|Editing in the editor |Checks and lints the file that changed, and propagates one step from it to the documents that directly depend on it.
+|===
+
+Only `spyglassmc.analyzeProject` covers the whole project. Whenever the diagnostics of a file that is not open in the editor go missing -- after a reset, or simply because the file has never been analyzed -- run that command to restore them.

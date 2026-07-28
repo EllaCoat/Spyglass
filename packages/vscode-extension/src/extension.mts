@@ -143,6 +143,19 @@ export async function activate(context: vsc.ExtensionContext) {
 						}, async () => {
 							await client.sendRequest('spyglassmc/resetProjectCache')
 						})
+
+						// A reset only rechecks the documents that are open in the editor, so the
+						// diagnostics of the other files stay absent until the project is analyzed.
+						// The analysis is offered instead of started: running it from here would
+						// turn the reset back into an operation that walks the whole project.
+						const analyzeAction = localize('reset-project-cache.analyze-project')
+						const selectedAction = await vsc.window.showInformationMessage(
+							localize('reset-project-cache.done'),
+							analyzeAction,
+						)
+						if (selectedAction === analyzeAction) {
+							await vsc.commands.executeCommand('spyglassmc.analyzeProject')
+						}
 					} catch (e) {
 						console.error('[client#resetProjectCache]', e)
 					}
