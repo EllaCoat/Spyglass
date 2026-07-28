@@ -77,6 +77,14 @@ export interface SaveOptions {
 	 * `CacheService#createVerifiedChecksums`.
 	 */
 	trustRecordedHashes?: boolean
+	/**
+	 * The same reuse restricted to the listed URIs, for callers that covered part of the corpus
+	 * rather than all of it. Trust is the union of the two options: a tracked file qualifies when
+	 * `trustRecordedHashes` is set or when it is a member here, so passing both only widens the
+	 * set to every tracked file. Whatever neither option covers keeps the full read path, as do
+	 * the members a recorded reason disqualifies; see `CacheService#createVerifiedChecksums`.
+	 */
+	trustRecordedHashesFor?: ReadonlySet<string>
 }
 
 /**
@@ -367,17 +375,29 @@ export class CacheService {
 	 * The cost is that an external change the file watcher missed is no longer caught here, so
 	 * the reuse stays scoped to rebuild-driven saves; the autosave interval and `close()` keep
 	 * verifying every tracked file.
+	 *
+	 * @param trustRecordedHashesFor The same reuse, granted one URI at a time. A pass that covers
+	 * part of the corpus cannot pass `trustRecordedHashes` — `Project#analyzeProject` walks the
+	 * project's own files and leaves the dependency files, which outnumber them, untouched, and
+	 * the flag would extend its confidence to every file it never looked at, publishing whatever
+	 * external change the watcher missed on those. Membership is therefore earned per URI: the
+	 * pass read, bound, checked and published the document, and it is that publish which recorded
+	 * the hashes reused here. A URI the pass skipped, failed on, or stopped short of is absent
+	 * from the set and keeps the full read path. The three exclusions above still apply to
+	 * members, because each names a concrete reason the recorded hashes cannot be believed —
+	 * a reason about the file itself, which no caller is in a position to overrule.
 	 */
 	private async createVerifiedChecksums(
 		checksums: Checksums,
 		generation: number,
 		trustRecordedHashes = false,
+		trustRecordedHashesFor?: ReadonlySet<string>,
 	): Promise<Checksums | undefined> {
 		const reusedUris: string[] = []
 		const readUris: string[] = []
 		for (const uri of this.project.getTrackedFiles()) {
 			if (
-				trustRecordedHashes
+				(trustRecordedHashes || trustRecordedHashesFor?.has(uri) === true)
 				&& !this.#fileChangePendingUris.has(uri)
 				&& checksums.fileContents[uri] !== undefined
 				&& checksums.files[uri] !== undefined
@@ -773,7 +793,8 @@ export class CacheService {
 
 	/**
 	 * @param options `trustRecordedHashes` skips re-reading tracked files whose hashes were just
-	 * recorded; see {@link createVerifiedChecksums} for who may pass it.
+	 * recorded, and `trustRecordedHashesFor` skips the same reads for the listed URIs alone; see
+	 * {@link createVerifiedChecksums} for who may pass either.
 	 * @returns If the cache file was saved successfully.
 	 */
 	save(options?: SaveOptions): Promise<boolean> {
@@ -796,6 +817,7 @@ export class CacheService {
 				sourceChecksums,
 				generation,
 				options?.trustRecordedHashes,
+				options?.trustRecordedHashesFor,
 			)
 			if (!checksums) {
 				return false

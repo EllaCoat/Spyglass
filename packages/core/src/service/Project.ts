@@ -1829,6 +1829,11 @@ export class Project extends EventDispatcher<{
 	 *
 	 * Dependency files are not analyzed.
 	 *
+	 * A run that completes persists the cache on its way out. The diagnostics it published for the
+	 * whole corpus live only in memory until the 10-minute autosave or `close()` otherwise, and a
+	 * crash in that window throws away the minutes the run cost. That save is best-effort: a
+	 * failure or a skip is logged and the analysis still reports success. A cancelled run skips it.
+	 *
 	 * If an analysis is already in progress, the Promise of that analysis is returned instead and
 	 * the passed-in `options` are ignored.
 	 */
@@ -1866,6 +1871,12 @@ export class Project extends EventDispatcher<{
 
 		/** URIs the `prepare` pass bound, in the order the `analyze` pass has to process them. */
 		const boundUris: string[] = []
+		/**
+		 * URIs the `analyze` pass carried all the way through its publish, which is what recorded
+		 * the checksums the final save reuses. Anything this run skipped, failed on, or never
+		 * reached stays out and is verified against disk instead.
+		 */
+		const analyzedUris = new Set<string>()
 		let prepared = 0
 		let analyzed = 0
 		try {
@@ -1940,6 +1951,7 @@ export class Project extends EventDispatcher<{
 						// Other code paths hold this very object; publishing a copy of it
 						// would leave them looking at a node nobody updates.
 						await this.emitAsync('documentUpdated', clientManaged)
+						analyzedUris.add(uri)
 					} else {
 						const doc = await this.read(uri)
 						if (doc) {
@@ -1957,6 +1969,7 @@ export class Project extends EventDispatcher<{
 							// Awaiting the publish keeps one URI's diagnostics from overtaking
 							// each other when a listener is slow.
 							await this.emitAsync('documentUpdated', { doc, node })
+							analyzedUris.add(uri)
 						} else {
 							await this.#publishEmptyDiagnosticsIfBound(uri)
 						}
@@ -1982,7 +1995,34 @@ export class Project extends EventDispatcher<{
 			analysis.stopped.resolve()
 		}
 
-		await this.cacheService.save()
+		// A cancelled run persists nothing. It published a subset of the corpus, and an internal
+		// abort means a reset, a config rebuild or a reinitialization is already waiting to
+		// discard the state a save would write out; its partial diagnostics reach the caller
+		// right away instead, and the autosave interval or `close()` covers whatever survives.
+		// The signal is read again rather than the loops' `cancelled` flag: a cancellation that
+		// arrived after the last file left that flag unset, and the rebuild behind it is no less
+		// imminent. What lands after the block above cleared `#activeAnalysis` can no longer
+		// reach this signal, and for that remainder `CacheService#save` reports the skip itself.
+		if (!isCancelled()) {
+			try {
+				// Only the URIs this run published are trusted, so the dependency files it never
+				// analyzed — and the project files it failed on — stay on the read path. See
+				// `CacheService#createVerifiedChecksums`.
+				const saved = await this.cacheService.save({
+					trustRecordedHashesFor: analyzedUris,
+				})
+				if (!saved) {
+					this.logger.warn(
+						'[Project#analyzeProject] Finished analysis without saving cache',
+					)
+				}
+			} catch (e) {
+				// The analysis itself succeeded and its diagnostics are already published, so a
+				// failed save is reported to the log alone, exactly as `saveCacheAfterRebuild`
+				// treats one.
+				this.logger.error('[Project#analyzeProject] Failed saving cache', e)
+			}
+		}
 		__profiler.task('Save Cache').finalize()
 
 		return { analyzedFiles: analyzed, cancelled, totalFiles: files.length }

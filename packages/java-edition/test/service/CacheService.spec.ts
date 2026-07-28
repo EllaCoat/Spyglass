@@ -35,14 +35,22 @@ interface SerializedCacheFixture {
 	version: number
 }
 
+/** One `CacheService#save` a test observed. */
+interface SaveRecord {
+	options: core.SaveOptions | undefined
+	result: boolean
+}
+
 class FixtureWatcher extends core.EventDispatcher<core.FileWatcherEventMap>
 	implements core.FileWatcher
 {
 	readonly watchedFiles = new core.UriStore()
 
-	constructor(uri: string) {
+	constructor(...uris: string[]) {
 		super()
-		this.watchedFiles.add(uri)
+		for (const uri of uris) {
+			this.watchedFiles.add(uri)
+		}
 	}
 
 	async ready(): Promise<void> {}
@@ -124,9 +132,21 @@ describe('CacheService binary file hashing (#1706)', () => {
 		await writeFile(await getCacheFilePath(), gzipSync(JSON.stringify(cache)))
 	}
 
-	async function readyProject(project: core.Project): Promise<void> {
+	async function readyProject(
+		project: core.Project,
+		...extraWatchedUris: string[]
+	): Promise<void> {
 		await project.init()
-		await project.ready({ projectRootsWatcher: new FixtureWatcher(binaryUri) })
+		await project.ready({
+			projectRootsWatcher: new FixtureWatcher(binaryUri, ...extraWatchedUris),
+		})
+	}
+
+	/** Add another fixture file to the project directory and return its canonical URI. */
+	async function writeProjectFile(name: string): Promise<string> {
+		const uri = core.normalizeUri(pathToFileURL(join(projectDir, name)).toString())
+		await writeFile(new URL(uri), BinaryPngBytes)
+		return uri
 	}
 
 	async function waitForRecordedHashes(project: core.Project, uri: string): Promise<void> {
@@ -482,6 +502,24 @@ describe('CacheService binary file hashing (#1706)', () => {
 		}
 	}
 
+	/**
+	 * Record every save the project performs from here on, with the options it was given and the
+	 * result it reported. Which files a save reads is not measurable this way: `saveOnce` drains
+	 * the pending hash recordings first, and their reads are indistinguishable from the ones the
+	 * verification itself performs. The tests calling `save` directly cover that instead.
+	 */
+	function recordSaves(project: core.Project): SaveRecord[] {
+		const records: SaveRecord[] = []
+		const save = project.cacheService.save.bind(project.cacheService)
+		project.cacheService.save = async (options) => {
+			const record: SaveRecord = { options, result: false }
+			records.push(record)
+			record.result = await save(options)
+			return record.result
+		}
+		return records
+	}
+
 	it('reuses the recorded hashes of tracked files when the caller trusts them', async () => {
 		const { project, readUris, restoreReadFile } = createReadRecordingProject()
 		try {
@@ -531,6 +569,84 @@ describe('CacheService binary file hashing (#1706)', () => {
 				[binaryUri],
 				'the default save path must keep verifying tracked files against disk so that a '
 					+ 'change the watcher missed cannot reach the cache file',
+			)
+		} finally {
+			restoreReadFile()
+			await project.close()
+		}
+	})
+
+	it('reuses the recorded hashes of the listed URIs alone', async () => {
+		const outsideDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-binary-outside-')))
+		// Tracked and hashed like any other file, but outside every project root — the shape of
+		// the dependency files a partial pass such as `analyzeProject` walks past.
+		const outsideUri = core.normalizeUri(
+			pathToFileURL(join(outsideDir, 'tracked.png')).toString(),
+		)
+		await writeFile(new URL(outsideUri), BinaryPngBytes)
+
+		const { project, readUris, restoreReadFile } = createReadRecordingProject()
+		try {
+			await readyProject(project, outsideUri)
+			// Drain the checksum updates queued by `ready` first; see the trusting test above.
+			assert.equal(await project.cacheService.save(), true)
+
+			readUris.length = 0
+			assert.equal(
+				await project.cacheService.save({
+					trustRecordedHashesFor: new Set([binaryUri]),
+				}),
+				true,
+			)
+
+			assert.deepEqual(
+				readUris.filter(uri => uri === binaryUri),
+				[],
+				'a listed URI whose two hashes are both recorded must not be read again',
+			)
+			assert.deepEqual(
+				readUris.filter(uri => uri === outsideUri),
+				[outsideUri],
+				'a tracked file the caller did not list keeps the full read path, so that a change '
+					+ 'the watcher missed under it cannot reach the cache file',
+			)
+			const cache = await readCacheFile()
+			assert.equal(
+				cache.checksums.files[binaryUri],
+				project.cacheService.checksums.files[binaryUri],
+			)
+			assert.equal(
+				cache.checksums.files[outsideUri],
+				project.cacheService.checksums.files[outsideUri],
+			)
+		} finally {
+			restoreReadFile()
+			await project.close()
+			await rm(outsideDir, { recursive: true, force: true })
+		}
+	})
+
+	it('reads a listed URI back after a file notification', async () => {
+		const { project, readUris, restoreReadFile } = createReadRecordingProject()
+		try {
+			await readyProject(project)
+			// Drain the checksum updates queued by `ready` first; see the trusting test above.
+			assert.equal(await project.cacheService.save(), true)
+			project.cacheService.markFileChange(binaryUri)
+
+			readUris.length = 0
+			assert.equal(
+				await project.cacheService.save({
+					trustRecordedHashesFor: new Set([binaryUri]),
+				}),
+				true,
+			)
+
+			assert.deepEqual(
+				readUris.filter(uri => uri === binaryUri),
+				[binaryUri],
+				'a notification is a reason to distrust the recorded hashes of this very file, '
+					+ 'which listing the URI cannot overrule',
 			)
 		} finally {
 			restoreReadFile()
@@ -713,6 +829,243 @@ describe('CacheService binary file hashing (#1706)', () => {
 			)
 		} finally {
 			releaseHashRead.resolve()
+			await project.close()
+		}
+	})
+
+	it('saves once when an analysis runs to completion', async () => {
+		const project = createProject()
+		const saves = recordSaves(project)
+		try {
+			await readyProject(project)
+			const result = await project.analyzeProject()
+
+			assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
+			assert.equal(
+				saves.length,
+				1,
+				'an analysis must persist its result once on the way out, never once per file',
+			)
+			assert.equal(saves[0].result, true)
+			assert.equal(
+				saves[0].options?.trustRecordedHashes,
+				undefined,
+				'an analysis covers the project files alone, so it may not trust every tracked file',
+			)
+			assert.deepEqual([...saves[0].options?.trustRecordedHashesFor ?? []], [binaryUri])
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('lists only the files an analysis published as trusted', async () => {
+		const outsideDir = await realpath(await mkdtemp(join(tmpdir(), 'spyglass-binary-outside-')))
+		// Tracked, bound during `ready`, and outside every project root — the shape of the
+		// dependency files an analysis walks past.
+		const outsideUri = core.normalizeUri(
+			pathToFileURL(join(outsideDir, 'tracked.png')).toString(),
+		)
+		await writeFile(new URL(outsideUri), BinaryPngBytes)
+		const unreadableUri = await writeProjectFile('unreadable.png')
+
+		const project = createProject()
+		const saves = recordSaves(project)
+		const readFileFromProject = project.fs.readFile.bind(project.fs)
+		let failUnreadable = false
+		project.fs.readFile = async (uri) => {
+			if (failUnreadable && uri === unreadableUri) {
+				throw new Error('fixture prepare failure')
+			}
+			return readFileFromProject(uri)
+		}
+		try {
+			await readyProject(project, outsideUri, unreadableUri)
+			failUnreadable = true
+			const result = await project.analyzeProject({
+				onProgress: (done, total, phase) => {
+					// Lifted before the save so that the file the `prepare` pass could not read is
+					// one the analysis skipped, rather than one whose verification also fails.
+					if (phase === 'prepare' && done === total) {
+						failUnreadable = false
+					}
+				},
+			})
+
+			assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 2 })
+			assert.equal(saves.length, 1)
+			assert.equal(saves[0].result, true)
+			assert.deepEqual(
+				[...saves[0].options?.trustRecordedHashesFor ?? []],
+				[binaryUri],
+				'a tracked file outside the project roots is never analyzed and one the analysis '
+					+ 'failed to read carries nothing fresh, so neither may skip verification',
+			)
+		} finally {
+			project.fs.readFile = readFileFromProject
+			await project.close()
+			await rm(outsideDir, { recursive: true, force: true })
+		}
+	})
+
+	it('does not save the cache after the caller cancels an analysis', async () => {
+		const secondUri = await writeProjectFile('second.png')
+		const project = createProject()
+		const saves = recordSaves(project)
+		const controller = new AbortController()
+		try {
+			await readyProject(project, secondUri)
+			const result = await project.analyzeProject({
+				signal: controller.signal,
+				onProgress: (done, _total, phase) => {
+					if (phase === 'analyze' && done === 1) {
+						controller.abort()
+					}
+				},
+			})
+
+			assert.deepEqual(result, { analyzedFiles: 1, cancelled: true, totalFiles: 2 })
+			assert.equal(
+				saves.length,
+				0,
+				'a cancelled analysis covered part of the corpus, so it returns its partial '
+					+ 'diagnostics instead of persisting them',
+			)
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('does not save the cache when a file notification cancels an analysis', async () => {
+		const secondUri = await writeProjectFile('second.png')
+		const project = createProject()
+		const watcher = new FixtureWatcher(binaryUri, secondUri)
+		const saves = recordSaves(project)
+		try {
+			await project.init()
+			await project.ready({ projectRootsWatcher: watcher })
+			const result = await project.analyzeProject({
+				onProgress: (done, _total, phase) => {
+					if (phase === 'analyze' && done === 1) {
+						watcher.emit('change', binaryUri)
+					}
+				},
+			})
+
+			assert.deepEqual(result, { analyzedFiles: 1, cancelled: true, totalFiles: 2 })
+			assert.equal(
+				saves.length,
+				0,
+				'a notification stops the analysis so that a rebuild can redo it, and saving the '
+					+ 'state that rebuild is about to discard buys nothing',
+			)
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('reports a completed analysis when its save is skipped', async () => {
+		const project = createProject()
+		try {
+			await readyProject(project)
+			project.cacheService.save = async () => false
+			assert.deepEqual(
+				await project.analyzeProject(),
+				{ analyzedFiles: 1, cancelled: false, totalFiles: 1 },
+				'the diagnostics are already published, so a save the cache declined to perform '
+					+ 'does not make the analysis itself a failure',
+			)
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('reports a completed analysis when its save throws', async () => {
+		const project = createProject()
+		try {
+			await readyProject(project)
+			project.cacheService.save = async () => {
+				throw new Error('fixture save failure')
+			}
+			assert.deepEqual(
+				await project.analyzeProject(),
+				{ analyzedFiles: 1, cancelled: false, totalFiles: 1 },
+				'a failed save is logged, not raised to the caller who asked for an analysis',
+			)
+		} finally {
+			await project.close()
+		}
+	})
+
+	it('drops the analysis save when the cache generation moves during it', async () => {
+		const fs = { ...NodeJsExternals.fs }
+		const externals: core.Externals = { ...NodeJsExternals, fs }
+		const project = createProject(externals)
+		const saves = recordSaves(project)
+		const write = fs.writeFile.bind(fs)
+		const temporaryFileWritten = Promise.withResolvers<void>()
+		const releaseTemporaryWrite = Promise.withResolvers<void>()
+		fs.writeFile = async (location, data, options) => {
+			await write(location, data, options)
+			if (location.toString().endsWith('.tmp')) {
+				temporaryFileWritten.resolve()
+				await releaseTemporaryWrite.promise
+			}
+		}
+
+		try {
+			await readyProject(project)
+			const analysis = project.analyzeProject()
+			await temporaryFileWritten.promise
+			project.cacheService.invalidatePartial('lint', [binaryUri])
+			releaseTemporaryWrite.resolve()
+
+			assert.deepEqual(await analysis, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
+			assert.equal(saves.length, 1)
+			assert.equal(
+				saves[0].result,
+				false,
+				'the trusted set does not exempt a save from the generation guard',
+			)
+			assert.deepEqual(
+				(await readdir(cacheDir, { recursive: true }))
+					.filter(entry => entry.endsWith('.json.gz')),
+				[],
+				'a save whose snapshot moved must leave the cache file untouched',
+			)
+		} finally {
+			fs.writeFile = write
+			releaseTemporaryWrite.resolve()
+			await project.close()
+		}
+	})
+
+	it('verifies an unsaved client-managed document an analysis published', async () => {
+		const project = createProject()
+		const saves = recordSaves(project)
+		try {
+			await readyProject(project)
+			await project.onDidOpen(binaryUri, 'png', 1, 'unsaved editor contents')
+			await project.ensureClientManagedChecked(binaryUri)
+			const result = await project.analyzeProject()
+
+			assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
+			assert.equal(saves.length, 1)
+			assert.deepEqual(
+				[...saves[0].options?.trustRecordedHashesFor ?? []],
+				[binaryUri],
+				'the analysis published this document, so it lists the URI like any other',
+			)
+			assert.equal(
+				project.cacheService.checksums.files[binaryUri],
+				undefined,
+				'a buffer that disagrees with its file on disk has no raw-byte hash to trust',
+			)
+			assert.equal(
+				saves[0].result,
+				false,
+				'listing the URI cannot overrule that, so the verification still aborts the save',
+			)
+		} finally {
 			await project.close()
 		}
 	})
