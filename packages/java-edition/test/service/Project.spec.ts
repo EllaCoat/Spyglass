@@ -3,9 +3,18 @@ import { NodeJsExternals } from '@spyglassmc/core/lib/nodejs.js'
 import * as json from '@spyglassmc/json'
 import * as mcdoc from '@spyglassmc/mcdoc'
 import assert from 'node:assert/strict'
-import { copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import {
+	copyFile,
+	mkdir,
+	mkdtemp,
+	readdir,
+	readFile,
+	realpath,
+	rm,
+	writeFile,
+} from 'node:fs/promises'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { pathToFileURL } from 'node:url'
 import * as je from '../../lib/index.js'
@@ -900,6 +909,45 @@ describe('Project cache reset (#1975)', () => {
 			await rm(cacheDir, { recursive: true, force: true })
 		}
 	})
+
+	it('has written the cache file by the time reset settles, without close()', async () => {
+		const hooks: ResetHooks = { checkedUris: new Set() }
+		const { cacheDir, project } = await createResetProject(hooks)
+		// The cache file lands at `<cacheRoot>/symbols/<hash>.json.gz`. Listing the cache root
+		// recursively keeps the pre-reset assertion valid while `symbols/` does not exist yet,
+		// and the separator normalization keeps the comparison against the `/`-joined name
+		// returned by `computeSymbolCacheName` working on Windows.
+		const listCacheFiles = async (): Promise<string[]> => {
+			const entries = await readdir(cacheDir, { recursive: true })
+			return entries
+				.map(entry => entry.split(sep).join('/'))
+				.filter(entry => entry.endsWith('.json.gz'))
+		}
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new ResetFixtureWatcher(Object.values(fixtureFiles)),
+			})
+			const cacheFileName = await core.computeSymbolCacheName(project.projectRoots)
+			assert.deepEqual(
+				await listCacheFiles(),
+				[],
+				'the fixture must start without a cache file so the assertion below has meaning',
+			)
+
+			await project.reset()
+
+			assert.deepEqual(
+				await listCacheFiles(),
+				[cacheFileName],
+				'reset must persist the cache before it settles, instead of leaving the full-pass '
+					+ 'diagnostics in memory until the autosave interval or close()',
+			)
+		} finally {
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
 })
 
 describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', () => {
@@ -1129,9 +1177,15 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			// The save now holds its `#hashUpdateGeneration` snapshot and is blocked between the
 			// two `isSaveSnapshotCurrent` checks of `CacheService#saveOnce`.
 			await saveWriteStarted.promise
+			// `drainResets` persists the cache before `reset()` settles, and that save queues
+			// behind the blocked one, so the gate has to open from inside the reset. The rebuild's
+			// 'ready' event fires after `CacheService#reset` already invalidated the in-flight
+			// snapshot, which keeps the staleness assertion below deterministic.
+			project.on('ready', () => {
+				releaseSaveWrite.resolve()
+			})
 			// `CacheService#reset` bumps the generation, invalidating the in-flight snapshot.
 			await project.reset()
-			releaseSaveWrite.resolve()
 			assert.equal(await save, false)
 			// The next save takes a fresh snapshot of the post-reset state and persists it.
 			assert.equal(await project.cacheService.save(), true)
@@ -1139,6 +1193,102 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			// Release the gate before closing so a mid-`try` assertion failure cannot leave
 			// `project.close()` waiting on the blocked save write.
 			releaseSaveWrite.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('rebuilds for a reset requested during the final cache save before settling it', async () => {
+		const hooks: RaceHooks = {}
+		const releaseSaveWrite = Promise.withResolvers<void>()
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+
+			const saveWriteStarted = Promise.withResolvers<void>()
+			let shouldBlockWrite = true
+			hooks.beforeCacheWrite = async () => {
+				if (shouldBlockWrite) {
+					shouldBlockWrite = false
+					saveWriteStarted.resolve()
+					await releaseSaveWrite.promise
+				}
+			}
+			let rebuildCount = 0
+			project.on('ready', () => {
+				rebuildCount += 1
+			})
+
+			const firstReset = project.reset()
+			await saveWriteStarted.promise
+			const secondReset = project.reset()
+			releaseSaveWrite.resolve()
+			await secondReset
+
+			assert.equal(
+				rebuildCount,
+				2,
+				'a reset requested during the final save must rebuild before it settles',
+			)
+			await firstReset
+		} finally {
+			releaseSaveWrite.resolve()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('completes reset with a warning when the final cache save is skipped', async () => {
+		const hooks: RaceHooks = {}
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		let endCacheMutation: (() => void) | undefined
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+			let warningCount = 0
+			project.logger.warn = () => {
+				warningCount += 1
+			}
+			endCacheMutation = project.cacheService.beginStateMutation()
+
+			await assert.doesNotReject(project.reset())
+			assert.equal(warningCount, 1, 'a skipped final cache save must emit a warning')
+		} finally {
+			endCacheMutation?.()
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
+	it('completes reset with an error log when the final cache save throws', async () => {
+		const hooks: RaceHooks = {}
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		// Restored in `finally` so that `close()` still persists through the real implementation.
+		const originalSave = project.cacheService.save.bind(project.cacheService)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+			let errorCount = 0
+			project.logger.error = () => {
+				errorCount += 1
+			}
+			project.cacheService.save = () => Promise.reject(new Error('injected save failure'))
+
+			await assert.doesNotReject(project.reset())
+			assert.equal(
+				errorCount,
+				1,
+				'a throwing final cache save must be logged rather than rethrown out of reset()',
+			)
+		} finally {
+			project.cacheService.save = originalSave
 			await project.close()
 			await rm(cacheDir, { recursive: true, force: true })
 		}
