@@ -1265,6 +1265,35 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 		}
 	})
 
+	it('completes reset with an error log when the final cache save throws', async () => {
+		const hooks: RaceHooks = {}
+		const { cacheDir, project } = await createResetRaceProject(hooks)
+		// Restored in `finally` so that `close()` still persists through the real implementation.
+		const originalSave = project.cacheService.save.bind(project.cacheService)
+		try {
+			await project.init()
+			await project.ready({
+				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
+			})
+			let errorCount = 0
+			project.logger.error = () => {
+				errorCount += 1
+			}
+			project.cacheService.save = () => Promise.reject(new Error('injected save failure'))
+
+			await assert.doesNotReject(project.reset())
+			assert.equal(
+				errorCount,
+				1,
+				'a throwing final cache save must be logged rather than rethrown out of reset()',
+			)
+		} finally {
+			project.cacheService.save = originalSave
+			await project.close()
+			await rm(cacheDir, { recursive: true, force: true })
+		}
+	})
+
 	it('serializes a manual reset behind an in-flight config update, both completing without coalescing', async () => {
 		const hooks: RaceHooks = {}
 		// Declared before `try` so the `finally` release below can reach it (see the finally

@@ -1051,7 +1051,9 @@ export class Project extends EventDispatcher<{
 			// the lifecycle queue serializes it with resets and config updates, and placing it after
 			// the coalescing loop runs it once per settled rebuild batch. Editor-driven bind/check
 			// mutations do not use that queue: if one changes the cache generation during this save,
-			// `CacheService#save` returns false and the next autosave or `close()` can persist it.
+			// `CacheService#save` reports the skip by returning false — outside the narrow window
+			// it leaves unguarded between its last snapshot check and the rename — and the next
+			// autosave or `close()` can persist the state instead.
 			try {
 				const saved = await this.cacheService.save()
 				if (!saved) {
