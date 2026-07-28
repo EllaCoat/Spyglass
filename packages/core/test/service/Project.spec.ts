@@ -75,10 +75,15 @@ const testLanguageInitializer: ProjectInitializer = ({ meta }) => {
 
 interface SetupResult {
 	errors: Map<string, readonly PosRangeLanguageError[]>
+	fs: ReturnType<typeof memfs>['fs']
 	project: Project
 }
 
-async function setup(files: Record<string, string>): Promise<SetupResult> {
+async function setup(
+	files: Record<string, string>,
+	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
+	extraInitializer?: ProjectInitializer,
+): Promise<SetupResult> {
 	const { fs } = memfs(files, '/')
 	const externals = getNodeJsExternals({
 		cacheRoot: CacheRoot,
@@ -90,7 +95,9 @@ async function setup(files: Record<string, string>): Promise<SetupResult> {
 		cacheRoot: CacheRoot,
 		defaultConfig: ConfigService.merge(VanillaConfig, { env: { dependencies: [] } }),
 		externals,
-		initializers: [testLanguageInitializer],
+		initializers: extraInitializer
+			? [testLanguageInitializer, extraInitializer]
+			: [testLanguageInitializer],
 		logger: Logger.noop(),
 		projectRoots: [ProjectRoot],
 	})
@@ -104,7 +111,7 @@ async function setup(files: Record<string, string>): Promise<SetupResult> {
 		projectRootsWatcher: new TestFileWatcher(externals, [ProjectRoot]),
 	})
 
-	return { errors, project }
+	return { errors, fs, project }
 }
 
 describe('Project', () => {
@@ -140,11 +147,11 @@ describe('Project', () => {
 			})
 			try {
 				const controller = new AbortController()
-				const progress: [number, number][] = []
+				const progress: [number, number, string][] = []
 				const result = await project.analyzeProject({
-					onProgress: (done, total) => {
-						progress.push([done, total])
-						if (done === 1) {
+					onProgress: (done, total, phase) => {
+						progress.push([done, total, phase])
+						if (phase === 'analyze' && done === 1) {
 							controller.abort()
 						}
 					},
@@ -152,7 +159,131 @@ describe('Project', () => {
 				})
 
 				assert.deepEqual(result, { analyzedFiles: 1, cancelled: true, totalFiles: 2 })
-				assert.deepEqual(progress, [[1, 2]])
+				assert.deepEqual(progress, [
+					[1, 2, 'prepare'],
+					[2, 2, 'prepare'],
+					[1, 2, 'analyze'],
+				])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should report the progress of both phases in order', async () => {
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+				'/root/c.spyglasstest': 'foo',
+			})
+			try {
+				const progress: [number, number, string][] = []
+				await project.analyzeProject({
+					onProgress: (done, total, phase) => {
+						progress.push([done, total, phase])
+					},
+				})
+
+				assert.deepEqual(progress, [
+					[1, 3, 'prepare'],
+					[2, 3, 'prepare'],
+					[3, 3, 'prepare'],
+					[1, 3, 'analyze'],
+					[2, 3, 'analyze'],
+					[3, 3, 'analyze'],
+				])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should bind all files before publishing any diagnostics', async () => {
+			const boundUris: string[] = []
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+				'/root/c.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerBinder<LiteralNode>('literal', (_node, ctx) => {
+					boundUris.push(ctx.doc.uri)
+				})
+			})
+			try {
+				boundUris.length = 0
+				const publishedUris: string[] = []
+				let boundAtFirstPublish: string[] | undefined
+				project.on('documentErrored', async ({ uri }) => {
+					boundAtFirstPublish ??= [...boundUris]
+					publishedUris.push(uri)
+					// A slow listener lets a following file's diagnostics overtake this
+					// one's unless the analysis awaits every publish.
+					await new Promise((resolve) => setTimeout(resolve, 1))
+				})
+
+				await project.analyzeProject()
+
+				assert.deepEqual(
+					new Set(boundAtFirstPublish),
+					new Set([
+						`${ProjectRoot}a.spyglasstest`,
+						`${ProjectRoot}b.spyglasstest`,
+						`${ProjectRoot}c.spyglasstest`,
+					]),
+				)
+				assert.deepEqual(publishedUris, [
+					`${ProjectRoot}a.spyglasstest`,
+					`${ProjectRoot}b.spyglasstest`,
+					`${ProjectRoot}c.spyglasstest`,
+				])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should read the current content of a file that changed without a watcher event', async () => {
+			const checkedTexts: string[] = []
+			const { fs, project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (_node, ctx) => {
+					checkedTexts.push(ctx.doc.getText())
+				})
+			})
+			try {
+				fs.writeFileSync('/root/a.spyglasstest', 'bar')
+				checkedTexts.length = 0
+
+				const result = await project.analyzeProject()
+
+				assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
+				assert.deepEqual(checkedTexts, ['bar'])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should re-analyze a client-managed file that was already checked', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const checkedUris: string[] = []
+			const { errors, project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				// Opening the document already produced checker results, which every
+				// stage returns early on until the analysis drops them.
+				assert.ok(project.getClientManaged(uriA)?.node.checkerErrors)
+				checkedUris.length = 0
+				errors.clear()
+
+				const result = await project.analyzeProject()
+
+				assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
+				assert.deepEqual(checkedUris, [uriA])
+				assert.deepEqual(
+					errors.get(uriA)?.map((e) => e.message),
+					[TestCheckerMessage],
+				)
 			} finally {
 				await project.close()
 			}

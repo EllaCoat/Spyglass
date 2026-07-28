@@ -79,12 +79,19 @@ export interface ProjectReadyOptions {
 
 export interface AnalyzeProjectOptions {
 	/**
-	 * Called after each file has been analyzed.
+	 * Called after each file has been processed by the current phase of the analysis.
 	 *
-	 * @param done The amount of files that have been analyzed so far.
+	 * @param done The amount of files the current phase has processed so far.
 	 * @param total The total amount of files to analyze.
+	 * @param phase `prepare` reads and binds the file; `analyze` checks and publishes it. Both
+	 * phases walk the same file list, so `done` restarts at one when `analyze` begins.
 	 */
-	onProgress?: (this: void, done: number, total: number) => void
+	onProgress?: (
+		this: void,
+		done: number,
+		total: number,
+		phase: 'prepare' | 'analyze',
+	) => void
 	/**
 	 * A signal that can be used to cancel the analysis between two files. Files that have already
 	 * been analyzed keep their diagnostics.
@@ -94,8 +101,8 @@ export interface AnalyzeProjectOptions {
 
 export interface AnalyzeProjectResult {
 	/**
-	 * The amount of files that were analyzed. Equal to `totalFiles` unless the analysis was
-	 * cancelled.
+	 * The amount of files that made it through the checker. Equal to `totalFiles` unless the
+	 * analysis was cancelled or some files turned out not to be readable.
 	 */
 	analyzedFiles: number
 	cancelled: boolean
@@ -1750,10 +1757,35 @@ export class Project extends EventDispatcher<{
 	private static readonly AnalysisYieldInterval = 100
 
 	/**
+	 * Replace the diagnostics of a URI that turned out to be unreadable during an analysis, but
+	 * only if a bind ever registered that URI.
+	 *
+	 * A URI that was never bound was never readable to begin with (`read` also returns `undefined`
+	 * for unsupported languages, e.g. `pack.mcmeta` in a project without a JSON language).
+	 * Publishing for those would register an error key that has no file-content checksum, which
+	 * makes `CacheService#createVerifiedChecksums` abort every later save.
+	 */
+	async #publishEmptyDiagnosticsIfBound(uri: string): Promise<void> {
+		if (this.#symbolUpToDateUris.has(uri)) {
+			await this.emitAsync('documentErrored', { errors: [], uri })
+		}
+	}
+
+	/**
 	 * Run all four stages of document processing (`read`, `parse`, `bind`, and `check`, which
 	 * includes `lint`) on every supported file under {@link projectRoots} and emit the results as
 	 * `documentUpdated`/`documentErrored` events, regardless of whether the files are currently
 	 * managed by the client.
+	 *
+	 * The work is split into two passes over the same file list. The `prepare` pass reads and binds
+	 * every file; the `analyze` pass checks and publishes them. Checking a document while other
+	 * documents are still unbound makes the checker and the linter report symbols that merely have
+	 * not been registered yet, and those errors are stored on the node, where no later pass removes
+	 * them.
+	 *
+	 * Neither pass queues implicit lints (`'none'`): every file is scheduled already, so a queued
+	 * lint could only redo work this method does anyway — and each redo binds again, which queues
+	 * further documents.
 	 *
 	 * The analysis only starts after the READY process is complete, which guarantees that the
 	 * global symbol table is fully populated before any file is checked.
@@ -1776,37 +1808,111 @@ export class Project extends EventDispatcher<{
 		this.logger.info(`[Project#analyzeProject] Analyzing ${files.length} files`)
 
 		const __profiler = this.profilers.get('project#analyzeProject')
-		let done = 0
 		let cancelled = false
+
+		/** URIs the `prepare` pass bound, in the order the `analyze` pass has to process them. */
+		const boundUris: string[] = []
+		let prepared = 0
 		for (const uri of files) {
 			if (options.signal?.aborted) {
 				cancelled = true
 				this.logger.info(
-					`[Project#analyzeProject] Cancelled after ${done}/${files.length} files`,
+					`[Project#analyzeProject] Cancelled while preparing ${prepared}/${files.length} files`,
 				)
 				break
 			}
 
 			try {
-				if (this.#clientManagedUris.has(uri)) {
-					await this.ensureClientManagedChecked(uri)
+				const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+				if (clientManaged) {
+					// The editor holds the authoritative content of this document, so its
+					// node is reused instead of a disk read. That node still carries the
+					// results of the last editor pass, and every stage returns early once
+					// its own results are present. This command means “redo everything
+					// with the current config”, so those results must not survive it.
+					delete clientManaged.node.binderErrors
+					delete clientManaged.node.checkerErrors
+					delete clientManaged.node.linterErrors
+					await this.bind(clientManaged.doc, clientManaged.node, false, 'none')
+					boundUris.push(uri)
 				} else {
+					// This command is also how a user recovers from a stale cache, so the
+					// text cache is dropped to force a read from disk.
 					this.removeCachedTextDocument(uri)
 					const doc = await this.read(uri)
 					if (doc) {
+						await this.bind(doc, this.parse(doc), false, 'none')
+						boundUris.push(uri)
+					} else {
+						await this.#publishEmptyDiagnosticsIfBound(uri)
+					}
+				}
+			} catch (e) {
+				this.logger.error(`[Project#analyzeProject] Failed to prepare ${uri}`, e)
+			}
+
+			prepared += 1
+			options.onProgress?.(prepared, files.length, 'prepare')
+			if (prepared % Project.AnalysisYieldInterval === 0) {
+				await new Promise((resolve) => setTimeout(resolve, 0))
+			}
+		}
+		__profiler.task('Prepare Files')
+
+		let analyzed = 0
+		// A cancellation during the pass above aborted the signal for good, so this pass stops on
+		// its first file without a separate guard.
+		for (const uri of boundUris) {
+			if (options.signal?.aborted) {
+				cancelled = true
+				this.logger.info(
+					`[Project#analyzeProject] Cancelled after ${analyzed}/${boundUris.length} files`,
+				)
+				break
+			}
+
+			try {
+				const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+				if (clientManaged) {
+					delete clientManaged.node.checkerErrors
+					delete clientManaged.node.linterErrors
+					await this.checkWithoutLintFlush(
+						clientManaged.doc,
+						clientManaged.node,
+						false,
+						'none',
+					)
+					// Other code paths hold this very object; publishing a copy of it
+					// would leave them looking at a node nobody updates.
+					await this.emitAsync('documentUpdated', clientManaged)
+				} else {
+					const doc = await this.read(uri)
+					if (doc) {
+						// The `prepare` pass released its AST to keep memory flat, and a
+						// freshly parsed node carries no symbol, which linter rules such as
+						// `undeclaredSymbol` read from the node. Hence the second bind. It
+						// is not deduplicated against the first one: `bind` is keyed on the
+						// document and drops the key once its Promise settles, which the
+						// `prepare` pass awaited.
 						const node = this.parse(doc)
-						await this.bind(doc, node)
-						await this.check(doc, node)
-						this.emit('documentUpdated', { doc, node })
+						await this.bind(doc, node, false, 'none')
+						// `check` would flush the queued lints, which is the very
+						// self-feeding pass this two-pass split exists to avoid.
+						await this.checkWithoutLintFlush(doc, node, false, 'none')
+						// Awaiting the publish keeps one URI's diagnostics from overtaking
+						// each other when a listener is slow.
+						await this.emitAsync('documentUpdated', { doc, node })
+					} else {
+						await this.#publishEmptyDiagnosticsIfBound(uri)
 					}
 				}
 			} catch (e) {
 				this.logger.error(`[Project#analyzeProject] Failed for ${uri}`, e)
 			}
 
-			done += 1
-			options.onProgress?.(done, files.length)
-			if (done % Project.AnalysisYieldInterval === 0) {
+			analyzed += 1
+			options.onProgress?.(analyzed, files.length, 'analyze')
+			if (analyzed % Project.AnalysisYieldInterval === 0) {
 				await new Promise((resolve) => setTimeout(resolve, 0))
 			}
 		}
@@ -1815,7 +1921,7 @@ export class Project extends EventDispatcher<{
 		await this.cacheService.save()
 		__profiler.task('Save Cache').finalize()
 
-		return { analyzedFiles: done, cancelled, totalFiles: files.length }
+		return { analyzedFiles: analyzed, cancelled, totalFiles: files.length }
 	}
 
 	/**
