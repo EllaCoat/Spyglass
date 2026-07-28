@@ -560,6 +560,16 @@ describe('CacheService binary file hashing (#1706)', () => {
 				'the fixture must not have a cache that could hide a stale rebuild save',
 			)
 
+			// A rebuild checks the documents the client has open and nothing else, and it runs
+			// those checks after binding every tracked file. Opening the fixture is therefore
+			// what puts the gate below behind the hash recording this test snapshots.
+			await project.onDidOpen(
+				binaryUri,
+				'png',
+				1,
+				core.bufferToString(await readFile(new URL(binaryUri))),
+			)
+
 			shouldBlockCheck = true
 			const reset = project.reset()
 			await checkStarted.promise

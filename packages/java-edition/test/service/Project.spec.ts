@@ -1035,7 +1035,7 @@ describe('Project cache reset (#1975)', () => {
 		const hooks: ResetHooks = { checkedUris: new Set() }
 		const { cacheDir, project } = await createResetProject(hooks)
 		// The callee stays out of the watch set so that the caller's `function example:b` is
-		// undeclared and the full pass produces diagnostics worth persisting.
+		// undeclared and the rebuild produces diagnostics worth persisting.
 		const watchedUris = [fixtureFiles.pack, fixtureFiles.caller]
 		const cacheFilePath = join(
 			cacheDir,
@@ -1046,6 +1046,15 @@ describe('Project cache reset (#1975)', () => {
 		try {
 			await project.init()
 			await project.ready({ projectRootsWatcher: new ResetFixtureWatcher(watchedUris) })
+			// A rebuild only rechecks the documents the client has open, so the caller is opened
+			// with its on-disk content: that is what gives the save below a diagnostic to persist,
+			// while leaving the hashes the rebuild recorded matching the file.
+			await project.onDidOpen(
+				fixtureFiles.caller,
+				'mcfunction',
+				1,
+				await readFile(new URL(fixtureFiles.caller), 'utf8'),
+			)
 
 			await project.reset()
 
@@ -1201,6 +1210,11 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 	}
 	type RaceHooks = {
 		beforeCacheWrite?: () => Promise<void>
+		/**
+		 * Gate for holding a rebuild in flight. A rebuild binds every tracked file and checks only
+		 * the open ones, so the binder is the stage a closed fixture file still reaches.
+		 */
+		beforeBind?: (uri: string) => Promise<void>
 		beforeCheck?: (uri: string) => Promise<void>
 	}
 
@@ -1267,6 +1281,7 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			ctx.meta.registerBinder(
 				'file',
 				core.AsyncBinder.create(async (node, binderCtx) => {
+					await hooks.beforeBind?.(binderCtx.doc.uri)
 					await Promise.all(
 						(node.children ?? []).map(child => core.binder.fallback(child, binderCtx)),
 					)
@@ -1516,11 +1531,10 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			await project.ready({
 				projectRootsWatcher: new FixtureWatcher(...Object.values(fixtureFiles)),
 			})
-			// The reset's whole-corpus checker pass runs the registered `file` checker for
-			// unopened project files as well, so the gate below fires with or without an open
-			// document. The caller is opened anyway so the gated check is the one issued by
-			// `rebindAndCheckClientManaged`, keeping this a race against a rebuild of an
-			// editor-managed document.
+			// A rebuild checks the documents the client has open and nothing else, so the caller
+			// has to be opened for the gate below to fire at all. That also makes the gated check
+			// the one `rebindAndCheckClientManaged` issues, keeping this a race against a rebuild
+			// of an editor-managed document.
 			await project.onDidOpen(
 				fixtureFiles.caller,
 				'mcfunction',
@@ -1633,7 +1647,10 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			// `a.mcfunction` calls `example:b`, which a check against a symbol table that was
 			// emptied mid-analysis reports as undeclared (#1975).
 			assert.deepEqual(diagnostics.get(fixtureFiles.caller), [])
-			assert.deepEqual(diagnostics.get(fixtureFiles.callee), [])
+			// The cancelled analysis never reached the callee, and the rebuild that cancelled it
+			// publishes nothing for a closed document, so no diagnostic derived from the emptied
+			// symbol table can reach it either.
+			assert.equal(diagnostics.get(fixtureFiles.callee), undefined)
 		} finally {
 			// Release the gate before closing so a mid-`try` assertion failure cannot leave
 			// `project.close()` waiting on the blocked analysis.
@@ -1659,10 +1676,10 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			})
 
 			const rebuildStarted = Promise.withResolvers<void>()
-			let shouldBlockCheck = true
-			hooks.beforeCheck = async (uri) => {
-				if (shouldBlockCheck && uri === fixtureFiles.caller) {
-					shouldBlockCheck = false
+			let shouldBlockBind = true
+			hooks.beforeBind = async (uri) => {
+				if (shouldBlockBind && uri === fixtureFiles.caller) {
+					shouldBlockBind = false
 					rebuildStarted.resolve()
 					await releaseRebuild.promise
 				}
@@ -1713,10 +1730,10 @@ describe('Project cross-barrier races (semantics defined in Project.ts JSDoc)', 
 			})
 
 			const rebuildStarted = Promise.withResolvers<void>()
-			let shouldBlockCheck = true
-			hooks.beforeCheck = async (uri) => {
-				if (shouldBlockCheck && uri === fixtureFiles.caller) {
-					shouldBlockCheck = false
+			let shouldBlockBind = true
+			hooks.beforeBind = async (uri) => {
+				if (shouldBlockBind && uri === fixtureFiles.caller) {
+					shouldBlockBind = false
 					rebuildStarted.resolve()
 					await releaseRebuild.promise
 				}

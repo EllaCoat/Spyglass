@@ -167,8 +167,8 @@ interface SymbolRegistrarEvent {
  * - `owner-only`: URI clearers stay silent while cross-document linters may
  *   still redirect to their canonical owner. The implicit lint drain uses this
  *   to stop reverse-reference traversal without suppressing owner redirects.
- * - `none`: nothing is queued. The reset full pass uses this because it already
- *   schedules every document.
+ * - `none`: nothing is queued. Passes that already walk every document they could
+ *   redirect to — a project rebuild and {@link Project.analyzeProject} — use this.
  */
 export type LintPropagation = 'full' | 'owner-only' | 'none'
 
@@ -737,7 +737,7 @@ export class Project extends EventDispatcher<{
 			transaction.rollback()
 			throw e
 		}
-		await this.publishRebuildEvents(diagnostics)
+		await this.publishRebuildEvents(diagnostics, false)
 		this.emit('reinitialized', { contextChanged: true })
 		return true
 	}
@@ -1013,10 +1013,10 @@ export class Project extends EventDispatcher<{
 			this.logger.info(`[Project#ready] File extension ${ext}: ${count}`)
 		}
 
-		// Only the reset path (`restartForRebuild`) passes `diagnostics` in, and it
-		// is the path that owns whole-corpus diagnostics, so it is the one that
-		// runs the second checker/linter pass below.
-		const shouldRunFullPass = !shouldPublishEvents
+		// Only the reset path (`restartForRebuild`) passes `diagnostics` in. That path stages
+		// instead of streaming, and it publishes nothing for the files it binds: whole-corpus
+		// checker/linter results belong to `analyzeProject`, and a bind-only diagnostic published
+		// here would be a subset of them that no later pass replaces.
 		const __parseProfiler = this.profilers.get('project#ready#parse', 'top-n', 50)
 		const __bindProfiler = this.profilers.get('project#ready#bind', 'top-n', 50)
 		for (const uri of files) {
@@ -1024,10 +1024,7 @@ export class Project extends EventDispatcher<{
 				uri,
 				__parseProfiler,
 				__bindProfiler,
-				shouldPublishEvents ? undefined : stagedDiagnostics,
-				// The full pass restages every URI it covers, so only the URIs it
-				// skips still need the bind-only diagnostics from this pass.
-				!shouldRunFullPass || !this.#isFullCheckTarget(uri),
+				shouldPublishEvents,
 				propagateProcessorErrors,
 				freshlyPublishedUris,
 			)
@@ -1036,23 +1033,19 @@ export class Project extends EventDispatcher<{
 		__bindProfiler.finalize()
 		__profiler.task('Bind Files')
 
-		if (shouldRunFullPass) {
-			await this.#checkAllForReady(files, stagedDiagnostics, propagateProcessorErrors)
-			__profiler.task('Full Check Pass')
-		}
-
 		await this.rebindAndCheckClientManaged(propagateProcessorErrors)
 		this.#isReady = true
 		__profiler.finalize()
 		// `publishRebuildEvents` publishes the staged (possibly stale) cache
-		// diagnostics, drains the queued lints on top of them, and only then
-		// emits READY. On the staged path the caller runs it after this method
-		// settles. Re-scanned files already published fresh diagnostics during
-		// the scan above, so their pre-scan staged entries are dropped here:
-		// republishing them would roll the fresh results back to stale ones.
+		// diagnostics, drains the lints the scan above queued on top of them, and
+		// only then emits READY. On the staged path the caller runs it after this
+		// method settles, and passes `false` for the drain — see its JSDoc.
+		// Re-scanned files already published fresh diagnostics during the scan, so
+		// their pre-scan staged entries are dropped here: republishing them would
+		// roll the fresh results back to stale ones.
 		if (shouldPublishEvents) {
 			const staged = stagedDiagnostics.filter(event => !freshlyPublishedUris.has(event.data.uri))
-			await this.publishRebuildEvents(staged)
+			await this.publishRebuildEvents(staged, true)
 		}
 
 		return this
@@ -1103,6 +1096,11 @@ export class Project extends EventDispatcher<{
 
 	/**
 	 * Schedule a complete project cache reset behind other project lifecycle operations.
+	 *
+	 * A reset rebuilds the cache, the symbol table, and the recorded file hashes, binds every
+	 * tracked file, and rechecks the documents the client has open. It does not check closed
+	 * documents: their diagnostics are {@link analyzeProject}'s result, and a reset discards the
+	 * cache entry that held them, so they stay absent until the next analysis.
 	 *
 	 * Concurrent calls coalesce through the `#resetGeneration` counter: each call bumps the
 	 * generation and awaits the single in-flight {@link drainResets} pass instead of enqueueing
@@ -1168,8 +1166,8 @@ export class Project extends EventDispatcher<{
 	}
 
 	/**
-	 * Persist the cache before a settled rebuild returns to its caller. Otherwise the diagnostics
-	 * the full pass produced for the whole corpus live only in memory until the 10-minute autosave
+	 * Persist the cache before a settled rebuild returns to its caller. Otherwise the symbol table
+	 * and the file hashes the rebuild produced live only in memory until the 10-minute autosave
 	 * or `close()`, and a crash in that window loses them. Keeping this best-effort save in the
 	 * lifecycle queue serializes it with resets and config updates, and every caller runs it once
 	 * per settled rebuild batch rather than once per {@link resetOnce} pass — `CacheService#save`
@@ -1211,20 +1209,26 @@ export class Project extends EventDispatcher<{
 			transaction.rollback()
 			throw e
 		}
-		await this.publishRebuildEvents(diagnostics)
+		await this.publishRebuildEvents(diagnostics, false)
 	}
 
 	private async rebuildProjectFromEmptyCache(): Promise<ProjectDiagnosticsEvent[]> {
 		this.logger.info('[Project#resetCache] Initiated...')
 		this.#isReady = false
 		this.reparseClientManaged()
-		// Lints queued against the discarded symbol table would otherwise drain
-		// after the full pass and republish diagnostics derived from it.
+		// Lints queued against the discarded symbol table would otherwise drain at the first
+		// `check` after the rebuild and republish diagnostics derived from it.
 		this.#queuedLintUris.clear()
 		const diagnostics: ProjectDiagnosticsEvent[] = []
 
-		// Clear existing errors.
-		for (const uri of Object.keys(this.cacheService.errors)) {
+		// Retract the diagnostics the discarded cache restored. Only closed documents need this:
+		// an open one is republished from its fresh check by `publishRebuildEvents`, so clearing
+		// it first would only make its diagnostics blink. Entries that are already empty describe
+		// a document that has nothing to retract.
+		for (const [uri, errors] of Object.entries(this.cacheService.errors)) {
+			if (errors.length === 0 || this.#clientManagedDocAndNodes.has(uri)) {
+				continue
+			}
 			diagnostics.push({ data: { errors: [], uri }, name: 'documentErrored' })
 		}
 
@@ -1271,20 +1275,43 @@ export class Project extends EventDispatcher<{
 		}
 	}
 
+	/**
+	 * Recheck the documents the client has open, once every tracked file is bound. They are the
+	 * only documents a rebuild checks: the whole corpus belongs to {@link analyzeProject}.
+	 *
+	 * Nothing is queued here (`'none'`), and no queued lint is flushed either. Every open document
+	 * is already scheduled below, and a redirect to a closed one would publish exactly the
+	 * half-corpus result this pass stopped producing. See {@link publishRebuildEvents}.
+	 */
 	private async rebindAndCheckClientManaged(
 		propagateProcessorErrors: boolean,
 	): Promise<void> {
 		const entries = [...this.#clientManagedDocAndNodes.entries()]
 		// Rebuild all bindings first, then complete every check before publishing any diagnostics.
 		for (const [, { doc, node }] of entries) {
-			await this.bind(doc, node, propagateProcessorErrors)
+			await this.bind(doc, node, propagateProcessorErrors, 'none')
 		}
 		await Promise.all(
-			entries.map(([, { doc, node }]) => this.check(doc, node, propagateProcessorErrors)),
+			entries.map(([, { doc, node }]) =>
+				this.checkWithoutLintFlush(doc, node, propagateProcessorErrors, 'none')
+			),
 		)
 	}
 
-	private async publishRebuildEvents(diagnostics: ProjectDiagnosticsEvent[]): Promise<void> {
+	/**
+	 * @param drainQueuedLints Whether to drain the implicit lint queue between the staged
+	 * diagnostics and READY. An initial scan binds documents other documents depend on, and its
+	 * clearers queue those dependents; draining them after the staged (possibly stale) entries —
+	 * flushing first would let the staged entries roll the fresh results back — and before READY
+	 * is what keeps a `ready` listener from observing the stale ones. A rebuild passes `false`:
+	 * it queues nothing, because every bind and check it runs uses `'none'` propagation and
+	 * `rebuildProjectFromEmptyCache` empties the queue up front, and a drain publishes closed
+	 * documents, which is {@link analyzeProject}'s job.
+	 */
+	private async publishRebuildEvents(
+		diagnostics: ProjectDiagnosticsEvent[],
+		drainQueuedLints: boolean,
+	): Promise<void> {
 		// Diagnostics listeners (including the LSP publisher) must settle before READY is visible.
 		for (const event of diagnostics) {
 			await this.emitAsync(event.name, event.data)
@@ -1294,11 +1321,9 @@ export class Project extends EventDispatcher<{
 		for (const value of this.#clientManagedDocAndNodes.values()) {
 			await this.emitAsync('documentUpdated', value)
 		}
-		// Queued lints republish per-URI diagnostics, so they must drain after the
-		// staged (possibly stale) diagnostics above — flushing first would let the
-		// old staged entries roll the fresh results back — and before READY is
-		// emitted, so `ready` listeners never observe stale staged diagnostics.
-		await this.flushQueuedLints()
+		if (drainQueuedLints) {
+			await this.flushQueuedLints()
+		}
 		await this.emitAsync('ready', {})
 	}
 
@@ -1664,12 +1689,17 @@ export class Project extends EventDispatcher<{
 		}
 	}
 
+	/**
+	 * @param publishDiagnostics Whether this pass streams its bind-only result per file. Initial
+	 * scans do; a rebuild does not, because a bind-only diagnostic for a closed document would
+	 * replace the checker/linter result {@link analyzeProject} published for it with a subset of
+	 * itself, and nothing in the rebuild restores the difference.
+	 */
 	async #parseAndBindForReady(
 		uri: string,
 		parseProfiler: Profiler,
 		bindProfiler: Profiler,
-		diagnostics: ProjectDiagnosticsEvent[] | undefined,
-		stageDiagnostics: boolean,
+		publishDiagnostics: boolean,
 		propagateProcessorErrors: boolean,
 		publishedUris: Set<string>,
 	): Promise<void> {
@@ -1687,103 +1717,29 @@ export class Project extends EventDispatcher<{
 
 			const node = this.parse(doc)
 			parseProfiler.task(uri)
-			await this.bind(doc, node, propagateProcessorErrors)
+			// A rebuild binds every tracked file exactly once, so a queued lint could only redo
+			// work this loop does anyway, and `publishRebuildEvents` no longer drains one.
+			await this.bind(
+				doc,
+				node,
+				propagateProcessorErrors,
+				publishDiagnostics ? 'full' : 'none',
+			)
 			bindProfiler.task(uri)
-			if (diagnostics) {
-				this.cacheService.trackDocumentUpdate(doc)
-				// A following full pass stages the combined checker/linter result for
-				// this URI, so staging the bind-only entry here too would publish the
-				// same document twice.
-				if (stageDiagnostics) {
-					diagnostics.push({
-						data: this.createDocumentErrorEvent(doc, node),
-						name: 'documentErrored',
-					})
-				}
-			} else {
+			if (publishDiagnostics) {
 				// Initial scans have no rollback boundary, so preserve per-file streaming and let the
 				// document/AST become collectible before processing the next file.
 				await this.emitAsync('documentUpdated', { doc, node })
 				publishedUris.add(uri)
+			} else {
+				// Recorded even though nothing is published: `saveCacheAfterRebuild` trusts these
+				// hashes instead of reading the whole corpus again, and the publish that would
+				// otherwise record them through `CacheService` never happens on this path.
+				this.cacheService.trackDocumentUpdate(doc)
 			}
 		} finally {
 			this.#bindingInProgressUris.delete(uri)
 		}
-	}
-
-	/**
-	 * Whether the reset's full checker/linter pass covers this URI.
-	 *
-	 * Only the project's own files are covered. Dependency files — the vanilla
-	 * archives above all — outnumber them by roughly eight to one and produce no
-	 * diagnostic anyone acts on: the editor path checks a document only once the
-	 * user opens it, and an `archive:` URI cannot be client-managed at all. The
-	 * URIs are compared in the form `getTrackedFiles` produced them, before
-	 * `normalizeUri` maps them off disk, so a mapped project file cannot fall out
-	 * of the set and silently lose its checker diagnostics.
-	 */
-	#isFullCheckTarget(uri: string): boolean {
-		return this.watchedFiles.has(uri) && !this.#dependencyFiles?.has(uri)
-	}
-
-	/**
-	 * Second reset pass: rerun the checker and linter over every project document
-	 * once the global symbol table is complete. See {@link #isFullCheckTarget} for
-	 * why dependency files are left out.
-	 *
-	 * The first pass only binds, and its ASTs are released per file to keep memory
-	 * flat, so the checker and linter have to reparse and rebind here: linter rules
-	 * such as `impDocPrivate` and `undeclaredSymbol` read `node.symbol`, which a
-	 * fresh parse does not carry. Streaming a second time keeps at most one
-	 * document alive instead of retaining every AST from the first pass.
-	 *
-	 * Nothing is queued during this pass (`'none'`): every document is scheduled
-	 * already, so the cross-document redirects would only duplicate work.
-	 */
-	async #checkAllForReady(
-		files: readonly string[],
-		stagedDiagnostics: ProjectDiagnosticsEvent[],
-		propagateProcessorErrors: boolean,
-	): Promise<void> {
-		const __fullCheckProfiler = this.profilers.get('project#ready#fullCheck', 'top-n', 50)
-		for (const uri of files) {
-			if (!this.#isFullCheckTarget(uri)) {
-				continue
-			}
-			const normalized = this.normalizeUri(uri)
-			// `rebindAndCheckClientManaged` owns the editor-managed documents.
-			if (this.#clientManagedDocAndNodes.has(normalized)) {
-				continue
-			}
-
-			const doc = await this.read(normalized)
-			if (!doc) {
-				// `#symbolUpToDateUris` is cleared by `restartForRebuild` and holds
-				// exactly what the first pass bound, so a member here is a document
-				// that vanished between the two passes: replace its diagnostics.
-				// A non-member was never readable to begin with (`read` also returns
-				// `undefined` for unsupported languages, e.g. `pack.mcmeta` in a
-				// project without a JSON language). Staging an entry for those would
-				// register an error key with no file-content checksum, which makes
-				// `CacheService#createVerifiedChecksums` abort every later save.
-				if (this.#symbolUpToDateUris.has(normalized)) {
-					stagedDiagnostics.push({
-						data: { errors: [], uri: normalized },
-						name: 'documentErrored',
-					})
-				}
-				continue
-			}
-			const node = this.parse(doc)
-			await this.bind(doc, node, propagateProcessorErrors, 'none')
-			await this.checkWithoutLintFlush(doc, node, propagateProcessorErrors, 'none')
-			stagedDiagnostics.push({
-				data: this.createDocumentErrorEvent(doc, node),
-				name: 'documentErrored',
-			})
-			__fullCheckProfiler.task(normalized)
-		}
-		__fullCheckProfiler.finalize()
 	}
 
 	private bindUri(param: string | string[]): void {
