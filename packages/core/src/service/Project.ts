@@ -215,14 +215,17 @@ export type ProjectData = Pick<
  * During the INIT process of the project, the config and language feature initialization are processed.
  * The Promise returned by the {@link init} function resolves when the INIT process is complete.
  *
- * During the READY process of the project, the whole project is analyzed mainly to populate the global symbol table.
+ * During the READY process of the project, the whole project is scanned to populate the global symbol table.
  * The Promise returned by the {@link ready} function resolves when the READY process is complete.
  *
  * The following generally happens during the READY process:
  * 1. A list of file URIs under the project is obtained.
  * 2. The global symbol cache, if available, is loaded and validated against the know list of files.
  *    A list of files that need to be (re)processed is returned in this step.
- * 3. For each files in the new list, the file is read, parsed, bound, and checked.
+ * 3. For each files in the new list, the file is read, parsed, and bound. Only the documents the
+ *    client has open are also checked: checking the rest costs minutes on a large project and
+ *    produces diagnostics nobody is looking at yet, so it belongs to {@link analyzeProject},
+ *    which the user starts on demand.
  *
  * **EDITING**
  *
@@ -473,8 +476,8 @@ export class Project extends EventDispatcher<{
 				if (this.isOnlyWatched(uri)) {
 					await this.ensureBindingStarted(uri)
 					// `ensureBindingStarted` publishes a bind-only node, which replaces
-					// whatever the reset pass published for this document. Requeue it so
-					// the drain below restores the checker and linter diagnostics.
+					// whatever the last analysis published for this document. Requeue it
+					// so the drain below restores the checker and linter diagnostics.
 					this.queueLint(uri)
 				}
 				await this.flushQueuedLints()
@@ -835,7 +838,8 @@ export class Project extends EventDispatcher<{
 	}
 
 	/**
-	 * Finish the initial run of parsing, binding, and checking the entire project.
+	 * Finish the initial run of parsing and binding the entire project. Only the documents the
+	 * client has open are checked as well; see {@link analyzeProject} for the rest of the corpus.
 	 */
 	async ready(options: ProjectReadyOptions = {}): Promise<this> {
 		return (this.#readyPromise ??= this.enqueueLifecycle(() => this.runReady(options)))
@@ -1634,7 +1638,8 @@ export class Project extends EventDispatcher<{
 	 * walking the dependency graph. Cross-document linters are different: they
 	 * may still queue canonical owners from inside the drain, and those
 	 * intentional redirects are drained as well. Whole-corpus diagnostics are
-	 * the reset pass's job, not the editor path's.
+	 * {@link analyzeProject}'s job, not the editor path's: a reset only rebinds
+	 * the corpus and rechecks the open documents.
 	 */
 	private async flushQueuedLints(): Promise<void> {
 		if (!this.#isReady || this.#queuedLintUris.size === 0) {
@@ -1671,12 +1676,12 @@ export class Project extends EventDispatcher<{
 					}
 					const node = this.parse(doc)
 					// Republishing replaces this URI's diagnostics wholesale, so bind
-					// before checking: the reset pass publishes checker diagnostics for
-					// every project file, so implicit lint must always reproduce that
-					// superset. Since publishDiagnostics replaces all diagnostics for a
-					// URI, a lint-only pass would drop its checker diagnostics. Use the
-					// flush-free check path because flushing here would await this drain
-					// from inside itself.
+					// before checking: `analyzeProject` publishes checker diagnostics
+					// for every project file, so implicit lint must always reproduce
+					// that superset. Since publishDiagnostics replaces all diagnostics
+					// for a URI, a lint-only pass would drop its checker diagnostics.
+					// Use the flush-free check path because flushing here would await
+					// this drain from inside itself.
 					await this.bind(doc, node, false, 'owner-only')
 					await this.checkWithoutLintFlush(doc, node, false, 'owner-only')
 					await this.emitAsync('documentUpdated', { doc, node })
@@ -1866,6 +1871,13 @@ export class Project extends EventDispatcher<{
 	 * lifecycle operations invalidating the state it reads stop it at its next file boundary — see
 	 * {@link cancelActiveAnalysis} and {@link settleActiveAnalysis}. Such a run reports
 	 * `cancelled`, exactly like one the caller aborted through {@link AnalyzeProjectOptions.signal}.
+	 *
+	 * Every publish here is awaited, so that the diagnostics of one URI cannot overtake each other
+	 * when a listener is slow. A `documentUpdated` or `documentErrored` listener therefore must not
+	 * await a lifecycle operation of this project — `reset`, `close`, or this method — from inside
+	 * the publish. Those operations wait for the run to reach its next file boundary, and the run
+	 * cannot reach one until the publish it is sitting in returns: neither side would ever settle.
+	 * A listener that needs one has to start it without awaiting it.
 	 *
 	 * Dependency files are not analyzed.
 	 *
@@ -2112,15 +2124,31 @@ export class Project extends EventDispatcher<{
 	/**
 	 * Whether an editor notification for this URI can reach anything a running analysis reads.
 	 *
-	 * A direct `archive:` URI cannot be client-managed, and the notification handlers below return
-	 * without touching a thing for one. Cancelling for those would let browsing a dependency — a
-	 * vanilla mcdoc file, a datapack inside a zip — abort a run that takes minutes, one open and
-	 * close at a time.
+	 * The notification handlers below return without touching a thing for two kinds of URI. A
+	 * direct `archive:` one cannot be client-managed at all. An excluded one is not either: the
+	 * language has no support registered, or the user's `exclude` config covers the path. Both are
+	 * ordinary things to have open — a vanilla mcdoc file browsed out of a dependency, the README
+	 * of the datapack — and cancelling for them would abort a run that takes minutes, one
+	 * keystroke at a time.
+	 *
+	 * The handlers repeat these checks rather than sharing this one, because they run inside the
+	 * lifecycle queue, where the config may have been reloaded since the notification arrived. A
+	 * verdict this method gets wrong there costs nothing beyond timing: it is only the early
+	 * signal, and the wait that actually protects the analysis sits behind the handler's own
+	 * checks.
+	 *
+	 * @param languageID What the client called the document. Only `didOpen` carries one; `didChange`
+	 * and `didClose` pass `undefined` and are answered from the document `didOpen` registered,
+	 * whose absence is the early return those two handlers take.
 	 */
-	private canBeClientManaged(uri: string): boolean {
+	private canBeClientManaged(uri: string, languageID: string | undefined): boolean {
 		const clientUri = normalizeUri(uri)
-		return this.isCacheUri(clientUri)
-			|| !this.normalizeUri(clientUri).startsWith(ArchiveUriSupporter.Protocol)
+		const projectUri = this.normalizeUri(clientUri)
+		if (!this.isCacheUri(clientUri) && projectUri.startsWith(ArchiveUriSupporter.Protocol)) {
+			return false
+		}
+		languageID ??= this.#clientManagedDocAndNodes.get(projectUri)?.doc.languageId
+		return languageID !== undefined && !this.shouldExclude(projectUri, languageID)
 	}
 
 	/**
@@ -2132,7 +2160,7 @@ export class Project extends EventDispatcher<{
 		version: number,
 		content: string,
 	): Promise<void> {
-		if (this.canBeClientManaged(uri)) {
+		if (this.canBeClientManaged(uri, languageID)) {
 			this.cancelActiveAnalysis(`[Project#onDidOpen] ${uri}`)
 		}
 		await this.enqueueLifecycle(() => this.onDidOpenOnce(uri, languageID, version, content))
@@ -2150,16 +2178,17 @@ export class Project extends EventDispatcher<{
 		if (!isCacheUri && uri.startsWith(ArchiveUriSupporter.Protocol)) {
 			return // Direct `archive:` URIs cannot be client-managed.
 		}
+		if (this.shouldExclude(uri, languageID)) {
+			return
+		}
 		// The buffer of a freshly opened file still holds what is on disk, so the two passes of an
 		// analysis do agree on its content. What they cannot survive is the bind below: it clears
 		// the symbols of this URI before registering them again, and an async binder puts an await
 		// boundary in the middle of that, where a checker running in the analysis would read a
-		// symbol table missing entries it is about to report on. See `onDidChangeOnce` for why the
-		// wait sits inside the queued work.
+		// symbol table missing entries it is about to report on. Placed after every early return
+		// above, so that a URI the notification handler found no reason to cancel for is not
+		// cancelled here either. See `onDidChangeOnce` for why the wait sits inside the queued work.
 		await this.settleActiveAnalysis(`[Project#onDidOpen] ${uri}`)
-		if (this.shouldExclude(uri, languageID)) {
-			return
-		}
 		const doc = TextDocument.create(uri, languageID, version, content)
 		const node = this.parse(doc)
 		this.#clientManagedUris.add(uri)
@@ -2182,7 +2211,7 @@ export class Project extends EventDispatcher<{
 		changes: TextDocumentContentChangeEvent[],
 		version: number,
 	): Promise<void> {
-		if (this.canBeClientManaged(uri)) {
+		if (this.canBeClientManaged(uri, undefined)) {
 			this.cancelActiveAnalysis(`[Project#onDidChange] ${uri}`)
 		}
 		await this.enqueueLifecycle(() => this.onDidChangeOnce(uri, changes, version))
@@ -2200,13 +2229,6 @@ export class Project extends EventDispatcher<{
 		if (!isCacheUri && uri.startsWith(ArchiveUriSupporter.Protocol)) {
 			return // Direct `archive:` URIs cannot be client-managed.
 		}
-		// An analysis may be holding this very document, in which case it is holding the content
-		// from before this edit. Waiting inside the queued work rather than in the notification
-		// handler keeps the abort signal — raised in `onDidChange` — and this wait one file apart
-		// at most, and the alternative is letting the pre-edit diagnostics land after the fresh
-		// ones the check below publishes. Placed after the guard above so that a URI the handler
-		// found no reason to cancel for is not cancelled here either.
-		await this.settleActiveAnalysis(`[Project#onDidChange] ${uri}`)
 		const doc = this.#clientManagedDocAndNodes.get(uri)?.doc
 		if (!doc || this.shouldExclude(uri, doc.languageId)) {
 			// If doc is undefined, it means the document was previously excluded by onDidOpen()
@@ -2215,6 +2237,13 @@ export class Project extends EventDispatcher<{
 			// as usual.
 			return
 		}
+		// An analysis may be holding this very document, in which case it is holding the content
+		// from before this edit. Waiting inside the queued work rather than in the notification
+		// handler keeps the abort signal — raised in `onDidChange` — and this wait one file apart
+		// at most, and the alternative is letting the pre-edit diagnostics land after the fresh
+		// ones the check below publishes. Placed after every early return above, so that a URI the
+		// notification handler found no reason to cancel for is not cancelled here either.
+		await this.settleActiveAnalysis(`[Project#onDidChange] ${uri}`)
 		TextDocument.update(doc, changes, version)
 		const node = this.parse(doc)
 		this.#clientManagedDocAndNodes.set(uri, { doc, node })
@@ -2229,7 +2258,7 @@ export class Project extends EventDispatcher<{
 	 * Notify that an existing document was closed in the editor.
 	 */
 	async onDidClose(uri: string): Promise<void> {
-		if (this.canBeClientManaged(uri)) {
+		if (this.canBeClientManaged(uri, undefined)) {
 			this.cancelActiveAnalysis(`[Project#onDidClose] ${uri}`)
 		}
 		await this.enqueueLifecycle(() => this.onDidCloseOnce(uri))
@@ -2242,11 +2271,17 @@ export class Project extends EventDispatcher<{
 		if (!isCacheUri && uri.startsWith(ArchiveUriSupporter.Protocol)) {
 			return // Direct `archive:` URIs cannot be client-managed.
 		}
-		// Closing moves which content of this URI counts as authoritative back to the disk one, so
-		// an analysis that read the editor buffer is now holding a document nobody else has. See
-		// `onDidChangeOnce` for why the wait sits inside the queued work and behind the guard.
-		await this.settleActiveAnalysis(`[Project#onDidClose] ${uri}`)
 		const wasClientManaged = this.#clientManagedUris.has(uri)
+		if (wasClientManaged) {
+			// Closing moves which content of this URI counts as authoritative back to the disk one,
+			// so an analysis that read the editor buffer is now holding a document nobody else has.
+			// A URI the editor never had registered — one `onDidOpenOnce` excluded — leaves every
+			// write below a no-op, and the cache cleanup at the end only ever fires for a URI
+			// neither the watcher nor a dependency tracks, which is never one an analysis walks.
+			// See `onDidChangeOnce` for why the wait sits inside the queued work and behind the
+			// early returns.
+			await this.settleActiveAnalysis(`[Project#onDidClose] ${uri}`)
+		}
 		this.#clientManagedUris.delete(uri)
 		this.#clientManagedDocAndNodes.delete(uri)
 

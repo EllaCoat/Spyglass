@@ -599,6 +599,61 @@ describe('Project', () => {
 			}
 		})
 
+		it('Should keep analyzing while an excluded file is opened, changed, and closed', async () => {
+			// Both halves of `shouldExclude`, both under the project root: a supported language
+			// inside a `.`-prefixed directory, which the default `env.exclude` covers, and a file
+			// whose extension has no language registered for it. The analysis leaves both out of
+			// its file list, and every handler returns before it registers either document, so an
+			// editor session spent in them must not cost the run anything.
+			const excludedUri = `${ProjectRoot}.hidden/c.spyglasstest`
+			const unsupportedUri = `${ProjectRoot}notes.txt`
+			const releaseCheck = Promise.withResolvers<void>()
+			const analysisCheckStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+				'/root/.hidden/c.spyglasstest': 'foo',
+				'/root/notes.txt': 'foo',
+			}, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', async (node, ctx) => {
+					ctx.err.report(TestCheckerMessage, node)
+					if (shouldBlock) {
+						shouldBlock = false
+						analysisCheckStarted.resolve()
+						await releaseCheck.promise
+					}
+				})
+			})
+			try {
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisCheckStarted.promise
+
+				// Not awaited before the analysis is released: a notification that cancelled would
+				// also wait for the very check that is blocked here, and awaiting one here would
+				// therefore turn a regression into a hang instead of the failure below.
+				const notifications = [
+					project.onDidOpen(excludedUri, 'spyglasstest', 1, 'foo'),
+					project.onDidChange(excludedUri, [{ text: 'foo' }], 2),
+					project.onDidClose(excludedUri),
+					project.onDidOpen(unsupportedUri, 'plaintext', 1, 'foo'),
+					project.onDidChange(unsupportedUri, [{ text: 'foo' }], 2),
+					project.onDidClose(unsupportedUri),
+				]
+				await runPendingTurns()
+
+				releaseCheck.resolve()
+				const result = await analysis
+				await Promise.all(notifications)
+
+				assert.deepEqual(result, { analyzedFiles: 2, cancelled: false, totalFiles: 2 })
+			} finally {
+				releaseCheck.resolve()
+				await project.close()
+			}
+		})
+
 		it('Should wait for a running analysis before closing', async () => {
 			const releaseCheck = Promise.withResolvers<void>()
 			const analysisCheckStarted = Promise.withResolvers<void>()
