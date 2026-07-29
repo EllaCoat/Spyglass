@@ -264,6 +264,44 @@ describe('Project', () => {
 			}
 		})
 
+		it('Should publish the empty diagnostics of an unreadable file from the second pass', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			const { fs, project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			})
+			try {
+				// The initial scan bound it, so its diagnostics still have to be replaced, and the
+				// `prepare` pass can no longer read it, so replacing them is all there is to do.
+				fs.unlinkSync('/root/b.spyglasstest')
+				const events: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					events.push(`publish ${uri}`)
+				})
+
+				await project.analyzeProject({
+					onProgress: (done, _total, phase) => {
+						events.push(`${phase} ${done}`)
+					},
+				})
+
+				// Diagnostics with no errors in them are still a publish: a listener acts on them
+				// and `CacheService` records them. Emitting one from the `prepare` pass would let
+				// the run reach the outside world before every file is bound.
+				assert.deepEqual(events, [
+					'prepare 1',
+					'prepare 2',
+					`publish ${uriA}`,
+					'analyze 1',
+					`publish ${uriB}`,
+					'analyze 2',
+				])
+			} finally {
+				await project.close()
+			}
+		})
+
 		it('Should read the current content of a file that changed without a watcher event', async () => {
 			const checkedTexts: string[] = []
 			const { fs, project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
@@ -460,6 +498,101 @@ describe('Project', () => {
 				// Both passes publish the same object, so the analysis resuming after the edit
 				// would put the pre-edit diagnostics back.
 				assert.deepEqual(errors.get(uriA)?.map((e) => e.message), ['check 3'])
+			} finally {
+				releaseCheck.resolve()
+				await project.close()
+			}
+		})
+
+		it('Should hold an editor open until the analysis it cancelled has stopped', async () => {
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			const releaseBind = Promise.withResolvers<void>()
+			const analysisBindStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const boundUris: string[] = []
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerBinder<LiteralNode>(
+					'literal',
+					AsyncBinder.create(async (_node, ctx) => {
+						boundUris.push(ctx.doc.uri)
+						if (shouldBlock) {
+							shouldBlock = false
+							analysisBindStarted.resolve()
+							await releaseBind.promise
+						}
+					}),
+				)
+			})
+			try {
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisBindStarted.promise
+				boundUris.length = 0
+
+				// Opening a document binds it, and a bind empties the symbols of its URI before
+				// registering them again — with an await boundary in between, for an async binder.
+				// A pass that reads the symbol table in that window reports symbols as undeclared
+				// that are merely halfway through being registered.
+				const open = project.onDidOpen(uriB, 'spyglasstest', 1, 'foo')
+				await runPendingTurns()
+				assert.deepEqual(
+					boundUris,
+					[],
+					'the editor open bound while the analysis was still inside a bind',
+				)
+
+				releaseBind.resolve()
+				await analysis
+				await open
+
+				assert.deepEqual(boundUris, [uriB])
+			} finally {
+				releaseBind.resolve()
+				await project.close()
+			}
+		})
+
+		it('Should keep analyzing while an `archive:` URI is opened and closed', async () => {
+			// A file inside a dependency archive: watched, never client-managed, and outside every
+			// project root, so nothing an editor does to it changes what the analysis walks.
+			const archiveUri = 'archive://dependency.zip/data/test/function/foo.spyglasstest'
+			const releaseCheck = Promise.withResolvers<void>()
+			const analysisCheckStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', async (node, ctx) => {
+					ctx.err.report(TestCheckerMessage, node)
+					if (shouldBlock) {
+						shouldBlock = false
+						analysisCheckStarted.resolve()
+						await releaseCheck.promise
+					}
+				})
+			})
+			try {
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisCheckStarted.promise
+
+				// Not awaited before the analysis is released: a notification that cancelled would
+				// also wait for the very check that is blocked here, and browsing a dependency
+				// would then take a run of minutes down with it.
+				const change = project.onDidChange(archiveUri, [{ text: 'foo' }], 2)
+				const close = project.onDidClose(archiveUri)
+				await runPendingTurns()
+
+				releaseCheck.resolve()
+				const result = await analysis
+				await change
+				await close
+
+				assert.deepEqual(result, { analyzedFiles: 2, cancelled: false, totalFiles: 2 })
 			} finally {
 				releaseCheck.resolve()
 				await project.close()

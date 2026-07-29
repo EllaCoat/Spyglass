@@ -83,6 +83,16 @@ export interface SaveOptions {
 	 * `trustRecordedHashes` is set or when it is a member here, so passing both only widens the
 	 * set to every tracked file. Whatever neither option covers keeps the full read path, as do
 	 * the members a recorded reason disqualifies; see `CacheService#createVerifiedChecksums`.
+	 *
+	 * What this gives up: the window between recording a member's hashes and running the save is
+	 * as long as the pass itself — minutes, for the file it started with — and an external change
+	 * landing in that window is only noticed if the file watcher reports it before the save reads
+	 * `#fileChangePendingUris`. A change it misses, or reports too late, is persisted with the
+	 * hashes of the text the pass read, so the next session restores state built from content the
+	 * file no longer holds. Closing that window means reading every member back, which is the very
+	 * cost this option exists to remove: for `Project#analyzeProject` the verification would
+	 * dominate its final save. The saves that do not pass either option — the autosave interval
+	 * and `close()` — read every tracked file and correct such an entry then.
 	 */
 	trustRecordedHashesFor?: ReadonlySet<string>
 }
