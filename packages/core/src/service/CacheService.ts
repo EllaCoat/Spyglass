@@ -770,8 +770,13 @@ export class CacheService {
 		 * A file whose content still matches the cache is only unchanged in the sense that
 		 * matters here — that the cached state describes it — if that state is complete. For a
 		 * file whose check threw it is not: its diagnostics were kept out of the cache, so
-		 * leaving it alone would restore nothing and show nothing for it. It goes through
-		 * processing again instead, at the cost of the work its content would have saved.
+		 * nothing would restore them and nothing would show for it. Calling it changed states
+		 * that much.
+		 *
+		 * Stating it is as far as this goes today. The scan that consumes `changedFiles` skips a
+		 * file whose content matches the cache — which is what a retry marker deliberately leaves
+		 * it as — so what brings these files back for another check is
+		 * `Project#queueFailedCheckRetries`, which seeds the retry pass directly.
 		 */
 		const classifyUnchanged = (uri: string): void => {
 			if (failedCheckUris.has(uri)) {
