@@ -119,6 +119,18 @@ export interface DocAndNode {
 
 interface DocumentEvent extends DocAndNode {}
 interface DocumentErrorEvent {
+	/**
+	 * How far the check stage got for the document these `errors` come from:
+	 *
+	 * - `complete`: a checker ran to completion, so the errors are everything the document reports
+	 *   under the current config.
+	 * - `failed`: a checker threw, so the errors are a subset of that — see
+	 *   {@link FileNode.checkerFailed}.
+	 * - `not-run`: nothing checked the document. Its errors are a subset by design, not by
+	 *   failure: a bind-only publish from an initial scan, the empty diagnostics that retract a
+	 *   removed or unreadable document, or entries restored from the cache.
+	 */
+	checkOutcome: 'complete' | 'failed' | 'not-run'
 	errors: readonly PosRangeLanguageError[]
 	uri: string
 	version?: number
@@ -263,6 +275,12 @@ export class Project extends EventDispatcher<{
 	readonly #clientManagedUriMap = new TwoWayMap<string, string>()
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
+	/**
+	 * URI of files whose last check threw. Kept next to the other per-URI project state rather
+	 * than in `CacheService` so that a cache reset does not silently drop it: the failure is a
+	 * fact about this session's processing, not about the cached content.
+	 */
+	readonly #failedCheckUris = new Set<string>()
 	readonly #queuedLintUris = new Set<string>()
 	#queuedLintFlushPromise: Promise<void> | undefined
 	/** File-deletion events whose core cleanup is run inline by `#ready`. */
@@ -439,7 +457,7 @@ export class Project extends EventDispatcher<{
 			// }
 			await this.emitAsync('documentErrored', this.createDocumentErrorEvent(doc, node))
 		}).on('documentRemoved', ({ uri }) => {
-			this.emit('documentErrored', { errors: [], uri })
+			this.emit('documentErrored', { checkOutcome: 'not-run', errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
 			this.cancelActiveAnalysis(`[Project#fileCreated] ${uri}`)
 			this.cacheService.markFileChange(uri)
@@ -621,6 +639,7 @@ export class Project extends EventDispatcher<{
 			ctx: this.#ctx,
 			dependencyFiles: this.#dependencyFiles,
 			dependencyRoots: this.#dependencyRoots,
+			failedCheckUris: new Set(this.#failedCheckUris),
 			isReady: this.#isReady,
 			meta: this.#meta,
 			queuedLintUris: new Set(this.#queuedLintUris),
@@ -655,6 +674,8 @@ export class Project extends EventDispatcher<{
 				this.#ctx = snapshot.ctx
 				this.#dependencyFiles = snapshot.dependencyFiles
 				this.#dependencyRoots = snapshot.dependencyRoots
+				this.#failedCheckUris.clear()
+				snapshot.failedCheckUris.forEach(uri => this.#failedCheckUris.add(uri))
 				this.#isReady = snapshot.isReady
 				this.#meta = snapshot.meta
 				this.#queuedLintUris.clear()
@@ -991,7 +1012,9 @@ export class Project extends EventDispatcher<{
 
 		for (const [uri, values] of Object.entries(this.cacheService.errors)) {
 			stagedDiagnostics.push({
-				data: { errors: values, uri },
+				// Restored, not produced: nothing checked these documents in this session, and the
+				// cache does not record how the session that produced them ended.
+				data: { checkOutcome: 'not-run', errors: values, uri },
 				name: 'documentErrored',
 			})
 		}
@@ -1280,7 +1303,10 @@ export class Project extends EventDispatcher<{
 			if (errors.length === 0 || this.#clientManagedDocAndNodes.has(uri)) {
 				continue
 			}
-			diagnostics.push({ data: { errors: [], uri }, name: 'documentErrored' })
+			diagnostics.push({
+				data: { checkOutcome: 'not-run', errors: [], uri },
+				name: 'documentErrored',
+			})
 		}
 
 		// Reset cache.
@@ -1378,11 +1404,20 @@ export class Project extends EventDispatcher<{
 		await this.emitAsync('ready', {})
 	}
 
+	/**
+	 * The completion state travels on the node the diagnostics were collected from, so every
+	 * publish reports the state of the very pass that produced them without threading a flag
+	 * through the calls in between. A node carries at most one of the two markers: a check that
+	 * completes replaces the failure marker with its results, and a check that throws leaves
+	 * `checkerErrors` unset — with the failure marker winning if a stage after the checker ever
+	 * throws, since then the diagnostics are incomplete regardless of what the checker produced.
+	 */
 	private createDocumentErrorEvent(
 		doc: TextDocument,
 		node: FileNode<AstNode>,
 	): DocumentErrorEvent {
 		return {
+			checkOutcome: node.checkerFailed ? 'failed' : node.checkerErrors ? 'complete' : 'not-run',
 			errors: FileNode.getErrors(node).map((e) => LanguageError.withPosRange(e, doc)),
 			uri: doc.uri,
 			version: doc.version,
@@ -1554,6 +1589,14 @@ export class Project extends EventDispatcher<{
 	 * implicit lint drain calls this directly: flushing there would await the
 	 * drain's own promise and deadlock. {@link check} wraps this and flushes.
 	 *
+	 * Either outcome is recorded twice: on the node as {@link FileNode.checkerFailed}, which is
+	 * what a publish reports as its {@link DocumentErrorEvent.checkOutcome}, and per URI in
+	 * `#failedCheckUris`, which outlives the node. A failure is recorded before this method
+	 * returns and therefore before its caller publishes, so no listener sees partial diagnostics
+	 * described as anything else; a success clears both only once the fresh results are on the
+	 * node, so the reverse pairing — old partial diagnostics next to a cleared marker — cannot
+	 * happen either.
+	 *
 	 * @returns Whether the node ends up holding a complete checker result. `false` means the
 	 * checker threw and `propagateErrors` swallowed it, which leaves the document's diagnostics a
 	 * subset of what it should report. A caller that records a document as processed — see
@@ -1568,18 +1611,25 @@ export class Project extends EventDispatcher<{
 	): Promise<boolean> {
 		if (node.checkerErrors) {
 			// The results are already on the node, put there by a checker that ran to completion.
+			// Clearing here as well keeps the markers from outliving the failure they describe:
+			// this URI holds a complete result, whatever an earlier attempt on it did.
+			delete node.checkerFailed
+			this.#failedCheckUris.delete(doc.uri)
 			return true
 		}
 		const endCacheMutation = this.cacheService.beginStateMutation()
 		const __checkProfiler = this.profilers.get('project#check', 'top-n', 50)
 		const __lintProfiler = this.profilers.get('project#lint', 'top-n', 50)
+		// Created out here so that the failure path can reach the symbol table this run wrote to.
+		const ctx = CheckerContext.create(this, { doc })
 		try {
 			const checker = this.meta.getChecker(node.type)
-			const ctx = CheckerContext.create(this, { doc })
 			ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
 			await ctx.symbols.contributeAsAsync('checker', async () => {
 				await checker(StateProxy.create(node), ctx)
 				node.checkerErrors = ctx.err.dump()
+				delete node.checkerFailed
+				this.#failedCheckUris.delete(doc.uri)
 				__checkProfiler.task(doc.uri)
 				this.lint(doc, node, propagation)
 				__lintProfiler.task(doc.uri)
@@ -1587,6 +1637,13 @@ export class Project extends EventDispatcher<{
 			return true
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
+			// `contributeAsAsync` restores the previous contributor name when its callback throws
+			// and nothing else: every symbol location the checker registered before it threw stays
+			// in the table. This is not a repeat of the clear above — that one dropped the
+			// locations of an earlier run, this one drops the partial ones this run just wrote.
+			ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
+			node.checkerFailed = true
+			this.#failedCheckUris.add(doc.uri)
 			if (propagateErrors) {
 				throw e
 			}
@@ -1700,7 +1757,11 @@ export class Project extends EventDispatcher<{
 
 					const doc = await this.read(uri)
 					if (!doc) {
-						await this.emitAsync('documentErrored', { errors: [], uri })
+						await this.emitAsync('documentErrored', {
+							checkOutcome: 'not-run',
+							errors: [],
+							uri,
+						})
 						continue
 					}
 					const node = this.parse(doc)
@@ -1869,7 +1930,7 @@ export class Project extends EventDispatcher<{
 	 */
 	async #publishEmptyDiagnosticsIfBound(uri: string): Promise<void> {
 		if (this.#symbolUpToDateUris.has(uri)) {
-			await this.emitAsync('documentErrored', { errors: [], uri })
+			await this.emitAsync('documentErrored', { checkOutcome: 'not-run', errors: [], uri })
 		}
 	}
 

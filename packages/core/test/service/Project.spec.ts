@@ -7,6 +7,7 @@ import type {
 	FileWatcher,
 	FileWatcherEventMap,
 	LiteralNode,
+	MetaRegistry,
 	PosRangeLanguageError,
 	ProjectInitializer,
 	RootUriString,
@@ -74,9 +75,14 @@ const testLanguageInitializer: ProjectInitializer = ({ meta }) => {
 	})
 }
 
+/** The `checkOutcome` of a `documentErrored` event. */
+type CheckOutcome = 'complete' | 'failed' | 'not-run'
+
 interface SetupResult {
 	errors: Map<string, readonly PosRangeLanguageError[]>
 	fs: ReturnType<typeof memfs>['fs']
+	/** The `checkOutcome` each URI was last published with. */
+	outcomes: Map<string, CheckOutcome>
 	project: Project
 	watcher: TestFileWatcher
 }
@@ -104,15 +110,17 @@ async function setup(
 		projectRoots: [ProjectRoot],
 	})
 	const errors = new Map<string, readonly PosRangeLanguageError[]>()
-	project.on('documentErrored', ({ uri, errors: documentErrors }) => {
+	const outcomes = new Map<string, CheckOutcome>()
+	project.on('documentErrored', ({ checkOutcome, uri, errors: documentErrors }) => {
 		errors.set(uri, documentErrors)
+		outcomes.set(uri, checkOutcome)
 	})
 
 	const watcher = new TestFileWatcher(externals, [ProjectRoot])
 	await project.init()
 	await project.ready({ projectRootsWatcher: watcher })
 
-	return { errors, fs, project, watcher }
+	return { errors, fs, outcomes, project, watcher }
 }
 
 /**
@@ -851,6 +859,162 @@ describe('Project', () => {
 					published.includes(referencedUri),
 					'the editor path still publishes the document it bound on the way',
 				)
+			} finally {
+				await project.close()
+			}
+		})
+	})
+
+	describe('check completion state', () => {
+		/**
+		 * Register a checker that throws for the URIs `shouldThrow` selects and reports
+		 * {@link TestCheckerMessage} for the rest. The failure has to be injected like this: no
+		 * file in a real corpus makes a checker throw.
+		 */
+		const registerThrowingChecker = (
+			meta: MetaRegistry,
+			shouldThrow: (uri: string) => boolean,
+		): void => {
+			meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+				if (shouldThrow(ctx.doc.uri)) {
+					throw new Error('Test checker failure')
+				}
+				ctx.err.report(TestCheckerMessage, node)
+			})
+		}
+
+		it('Should mark a document whose editor check threw', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			const { outcomes, project } = await setup(
+				{ '/root/a.spyglasstest': 'foo' },
+				({ meta }) => registerThrowingChecker(meta, () => true),
+			)
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+
+				assert.equal(outcomes.get(uri), 'failed')
+				const node = project.getClientManaged(uri)?.node
+				assert.equal(node?.checkerFailed, true)
+				assert.equal(node?.checkerErrors, undefined)
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should mark a document whose analysis check threw', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			const { outcomes, project } = await setup(
+				{ '/root/a.spyglasstest': 'foo', '/root/b.spyglasstest': 'foo' },
+				({ meta }) => registerThrowingChecker(meta, (uri) => uri === uriB),
+			)
+			try {
+				const result = await project.analyzeProject()
+
+				assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 2 })
+				assert.equal(outcomes.get(uriA), 'complete')
+				assert.equal(outcomes.get(uriB), 'failed')
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should mark a document whose implicit lint check threw', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			let shouldQueue = false
+			const { outcomes, project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerUriSymbolClearer((uri, ctx) => {
+					if (shouldQueue && uri === uriA) {
+						ctx.queueLint?.(uriB)
+					}
+				})
+				registerThrowingChecker(meta, (uri) => uri === uriB)
+			})
+			try {
+				// Armed after the initial scan so that the drain under test is the one the editor
+				// path starts, on a document the editor never opened.
+				shouldQueue = true
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+
+				assert.equal(outcomes.get(uriA), 'complete')
+				assert.equal(outcomes.get(uriB), 'failed')
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should clear the mark once a check completes', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			let shouldThrow = true
+			const { outcomes, project } = await setup(
+				{ '/root/a.spyglasstest': 'foo' },
+				({ meta }) => registerThrowingChecker(meta, () => shouldThrow),
+			)
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+				assert.equal(outcomes.get(uri), 'failed')
+
+				shouldThrow = false
+				await project.onDidChange(uri, [{ text: 'foo' }], 2)
+
+				assert.equal(outcomes.get(uri), 'complete')
+				const node = project.getClientManaged(uri)?.node
+				assert.equal(node?.checkerFailed, undefined)
+				assert.deepEqual(node?.checkerErrors?.map((e) => e.message), [TestCheckerMessage])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should report a document nothing checked as not run', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			const { outcomes, project } = await setup({ '/root/a.spyglasstest': 'foo' })
+			try {
+				// The initial scan publishes bind-only diagnostics for every project file. Those
+				// are a subset of the file's diagnostics by design, which is the state that must
+				// not be mistaken for a checker that threw.
+				assert.equal(outcomes.get(uri), 'not-run')
+
+				await project.analyzeProject()
+
+				assert.equal(outcomes.get(uri), 'complete')
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should restore the failure state a rolled-back rebuild changed', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			let shouldThrow = false
+			const { outcomes, project } = await setup(
+				{ '/root/a.spyglasstest': 'foo' },
+				({ meta }) => registerThrowingChecker(meta, () => shouldThrow),
+			)
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+				assert.equal(outcomes.get(uri), 'complete')
+
+				// A rebuild rechecks the open documents with processor errors propagating, so a
+				// checker that throws there fails the whole rebuild and rolls it back.
+				shouldThrow = true
+				await assert.rejects(project.reset())
+
+				// Everything the failed rebuild recorded is gone again, including the failure it
+				// recorded for this document while running. The ledger it recorded that in has no
+				// reader yet, so what the rollback restored is asserted through the node that
+				// travels with it.
+				shouldThrow = false
+				const node = project.getClientManaged(uri)?.node
+				assert.equal(node?.checkerFailed, undefined)
+				assert.deepEqual(node?.checkerErrors?.map((e) => e.message), [TestCheckerMessage])
+
+				const result = await project.analyzeProject()
+				assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
+				assert.equal(outcomes.get(uri), 'complete')
 			} finally {
 				await project.close()
 			}

@@ -19,6 +19,12 @@ export interface FileNode<CN extends AstNode> extends AstNode {
 	 * Only exists when the file has been checked.
 	 */
 	linterErrors?: readonly LanguageError[]
+	/**
+	 * Only exists when the checker threw for the file, which leaves {@link checkerErrors} unset and
+	 * the errors of this node a subset of what the file should report. Removed again as soon as a
+	 * checker runs to completion for it.
+	 */
+	checkerFailed?: true
 }
 export namespace FileNode {
 	export function getErrors(node: FileNode<any>): LanguageError[] {
