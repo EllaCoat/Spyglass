@@ -1027,6 +1027,179 @@ describe('Project', () => {
 			}
 		})
 
+		it('Should return client-managed state without publishing during analysis preparation', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			const bindAStarted = Promise.withResolvers<void>()
+			const bindBStarted = Promise.withResolvers<void>()
+			const releaseBindA = Promise.withResolvers<void>()
+			const releaseBindB = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.setUriSorter((a, b) => a.localeCompare(b))
+				meta.registerBinder<LiteralNode>(
+					'literal',
+					AsyncBinder.create(async (_node, ctx) => {
+						if (!shouldBlock) {
+							return
+						}
+						if (ctx.doc.uri === uriA) {
+							bindAStarted.resolve()
+							await releaseBindA.promise
+						} else if (ctx.doc.uri === uriB) {
+							bindBStarted.resolve()
+							await releaseBindB.promise
+						}
+					}),
+				)
+			})
+			let analysis: ReturnType<Project['analyzeProject']> | undefined
+			let feature: ReturnType<Project['ensureClientManagedChecked']> | undefined
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				const published: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					published.push(uri)
+				})
+
+				shouldBlock = true
+				analysis = project.analyzeProject()
+				await bindAStarted.promise
+
+				let featureSettled = false
+				let featureResult: ReturnType<Project['getClientManaged']>
+				feature = project.ensureClientManagedChecked(uriA).then((result) => {
+					featureSettled = true
+					featureResult = result
+					return result
+				})
+				await runPendingTurns()
+				const settledWhileFirstBindWasBlocked = featureSettled
+
+				releaseBindA.resolve()
+				await bindBStarted.promise
+				await runPendingTurns()
+				const publishedDuringPrepare = [...published]
+
+				releaseBindB.resolve()
+				await analysis
+				await feature
+
+				assert.deepEqual(
+					publishedDuringPrepare,
+					[],
+					'the feature request published before every project file was bound',
+				)
+				assert.equal(
+					settledWhileFirstBindWasBlocked,
+					true,
+					'the feature request waited for the analysis bind',
+				)
+				assert.equal(featureResult, project.getClientManaged(uriA))
+			} finally {
+				releaseBindA.resolve()
+				releaseBindB.resolve()
+				await analysis?.catch(() => undefined)
+				await feature?.catch(() => undefined)
+				await project.close()
+			}
+		})
+
+		it('Should not drain queued lints from a client-managed request during analysis', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			const queueSeedUri = 'file:///referenced/seed.spyglasstest'
+			const queuedUri = 'file:///referenced/queued.spyglasstest'
+			const bindAStarted = Promise.withResolvers<void>()
+			const bindBStarted = Promise.withResolvers<void>()
+			const releaseBindA = Promise.withResolvers<void>()
+			const releaseBindB = Promise.withResolvers<void>()
+			let shouldBlock = false
+			let shouldQueue = false
+			const checkedUris: string[] = []
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+				'/referenced/seed.spyglasstest': 'foo',
+				'/referenced/queued.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.setUriSorter((a, b) => a.localeCompare(b))
+				meta.registerUriSymbolClearer((uri, ctx) => {
+					if (shouldQueue && uri === queueSeedUri) {
+						ctx.queueLint?.(queuedUri)
+					}
+				})
+				meta.registerBinder<LiteralNode>(
+					'literal',
+					AsyncBinder.create(async (_node, ctx) => {
+						if (!shouldBlock) {
+							return
+						}
+						if (ctx.doc.uri === uriA) {
+							bindAStarted.resolve()
+							await releaseBindA.promise
+						} else if (ctx.doc.uri === uriB) {
+							bindBStarted.resolve()
+							await releaseBindB.promise
+						}
+					}),
+				)
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			})
+			let analysis: ReturnType<Project['analyzeProject']> | undefined
+			let feature: ReturnType<Project['ensureClientManagedChecked']> | undefined
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				shouldQueue = true
+				await project.ensureBindingStarted(queueSeedUri)
+				shouldQueue = false
+				checkedUris.length = 0
+
+				const published: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					published.push(uri)
+				})
+
+				shouldBlock = true
+				analysis = project.analyzeProject()
+				await bindAStarted.promise
+				feature = project.ensureClientManagedChecked(uriA)
+
+				releaseBindA.resolve()
+				await bindBStarted.promise
+				await runPendingTurns()
+				const queuedChecksDuringPrepare = checkedUris.filter((uri) => uri === queuedUri)
+				const queuedPublishesDuringPrepare = published.filter((uri) => uri === queuedUri)
+
+				releaseBindB.resolve()
+				await analysis
+				await feature
+
+				assert.deepEqual(
+					queuedChecksDuringPrepare,
+					[],
+					'the feature request drained a queued lint while the analysis was preparing',
+				)
+				assert.deepEqual(
+					queuedPublishesDuringPrepare,
+					[],
+					'the drained lint published while the analysis was preparing',
+				)
+			} finally {
+				releaseBindA.resolve()
+				releaseBindB.resolve()
+				await analysis?.catch(() => undefined)
+				await feature?.catch(() => undefined)
+				await project.close()
+			}
+		})
+
 		it('Should not publish through `ensureBindingStarted` while an analysis is running', async () => {
 			const uriA = `${ProjectRoot}a.spyglasstest`
 			// Outside every project root and not watched, so nothing but the binder below reaches

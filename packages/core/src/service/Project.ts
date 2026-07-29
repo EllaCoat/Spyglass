@@ -2370,16 +2370,32 @@ export class Project extends EventDispatcher<{
 	async ensureClientManagedChecked(uri: string): Promise<DocAndNode | undefined> {
 		uri = this.normalizeUri(uri)
 		const result = this.#clientManagedDocAndNodes.get(uri)
-		if (result) {
-			const { doc, node } = result
-			if (this.#isReady) {
-				await this.bind(doc, node)
-				await this.check(doc, node)
-				this.emit('documentUpdated', result)
-			}
+		if (!result || !this.#isReady || this.#activeAnalysis !== undefined) {
 			return result
 		}
-		return undefined
+
+		// A normal feature request must not bind or check alongside `analyzeProject`: even a
+		// non-propagating bind would mutate the shared symbol table during its prepare pass, and
+		// `check` would flush queued lints across the two-pass barrier. The analysis itself leaves
+		// the lifecycle queue after registering, so the fast path above returns the current editor
+		// state immediately instead of waiting for the corpus run.
+		//
+		// Enter the queue only when no analysis was observed. Its FIFO boundary closes the opposite
+		// race: if an analysis registered after the check above, this callback sees it and stays
+		// read-only; if this callback got there first, its ordinary editor check finishes before
+		// the analysis starts.
+		return this.enqueueLifecycle(async () => {
+			const current = this.#clientManagedDocAndNodes.get(uri)
+			if (!current || !this.#isReady || this.#activeAnalysis !== undefined) {
+				return current
+			}
+
+			const { doc, node } = current
+			await this.bind(doc, node)
+			await this.check(doc, node)
+			this.emit('documentUpdated', current)
+			return current
+		})
 	}
 
 	getClientManaged(uri: string): DocAndNode | undefined {
