@@ -101,8 +101,9 @@ export interface AnalyzeProjectOptions {
 
 export interface AnalyzeProjectResult {
 	/**
-	 * The amount of files that made it through the checker. Equal to `totalFiles` unless the
-	 * analysis was cancelled or some files turned out not to be readable.
+	 * The amount of files that made it through the checker and had their diagnostics published.
+	 * Equal to `totalFiles` unless the analysis was cancelled, or a file turned out not to be
+	 * readable, or processing one of them threw.
 	 */
 	analyzedFiles: number
 	cancelled: boolean
@@ -438,6 +439,11 @@ export class Project extends EventDispatcher<{
 			this.cancelActiveAnalysis(`[Project#fileCreated] ${uri}`)
 			this.cacheService.markFileChange(uri)
 			const process = async () => {
+				// Waited for at the front of the queued work instead of in the handler itself, so
+				// the watcher event still returns synchronously and only the processing below is
+				// held back. Signalling alone would let the analysis publish the AST it already
+				// holds after this file event republished the current one.
+				await this.settleActiveAnalysis(`[Project#fileCreated] ${uri}`)
 				if (uri.endsWith(Project.RootSuffix)) {
 					this.updateRoots()
 				}
@@ -460,6 +466,8 @@ export class Project extends EventDispatcher<{
 			this.cancelActiveAnalysis(`[Project#fileModified] ${uri}`)
 			this.cacheService.markFileChange(uri)
 			const process = async () => {
+				// See `fileCreated`: the wait belongs inside the queued work, not in the handler.
+				await this.settleActiveAnalysis(`[Project#fileModified] ${uri}`)
 				this.#symbolUpToDateUris.delete(uri)
 				this.removeCachedTextDocument(uri)
 				if (this.isOnlyWatched(uri)) {
@@ -483,10 +491,14 @@ export class Project extends EventDispatcher<{
 			this.cancelActiveAnalysis(`[Project#fileDeleted] ${uri}`)
 			this.cacheService.markFileChange(uri)
 			const readyFileDeletedUris = this.#readyFileDeletedUris
-			const process = () =>
-				readyFileDeletedUris?.has(uri)
-					? undefined
-					: this.processFileDeleted(uri)
+			const process = async () => {
+				if (readyFileDeletedUris?.has(uri)) {
+					return
+				}
+				// See `fileCreated`: the wait belongs inside the queued work, not in the handler.
+				await this.settleActiveAnalysis(`[Project#fileDeleted] ${uri}`)
+				await this.processFileDeleted(uri)
+			}
 			if (this.#inlineFileDeletedUris.has(uri)) {
 				// `#ready` has already taken responsibility for the cleanup, but a
 				// removed pack/config file must retain its reinitialization trigger.
@@ -767,8 +779,12 @@ export class Project extends EventDispatcher<{
 
 	/**
 	 * Ask the analysis working outside the lifecycle queue, if any, to stop at its next file
-	 * boundary. Raising the flag is synchronous, so paths that only invalidate what a single file
-	 * contributed — watcher events and editor notifications — signal without waiting for it.
+	 * boundary. Raising the flag is synchronous, which is why callers that are about to enqueue a
+	 * lifecycle operation signal here first: the analysis then winds down while the operations
+	 * already queued ahead of them run, instead of only once their own reaches the front.
+	 *
+	 * Signalling on its own is never enough. Every path that then mutates the state the analysis
+	 * reads has to await {@link settleActiveAnalysis} before it does so.
 	 *
 	 * @param reason The lifecycle path that invalidated the analysis, e.g. `Project#reset`.
 	 */
@@ -782,14 +798,18 @@ export class Project extends EventDispatcher<{
 	}
 
 	/**
-	 * Cancel the running analysis and wait until it finished the file it is on. Operations that
-	 * replace the symbol table go through this first: emptying the table while a file is halfway
-	 * through its check publishes diagnostics derived from a table that no longer exists, which is
-	 * the very race the two-pass split in {@link analyzeProject} exists to avoid.
+	 * Cancel the running analysis and wait until it finished the file it is on. Two kinds of
+	 * operation go through this first. One replaces the symbol table: emptying it while a file is
+	 * halfway through its check publishes diagnostics derived from a table that no longer exists,
+	 * which is the very race the two-pass split in {@link analyzeProject} exists to avoid. The
+	 * other replaces the content of a single document — a watcher event or an editor notification.
+	 * There the analysis still holds the pre-change AST, and a publish it completes afterwards
+	 * puts the diagnostics of that older content back on top of the fresh ones.
 	 *
-	 * Only operations running inside the lifecycle queue may await this. An analysis enters that
-	 * queue exactly once, to register itself, and never re-enters it afterwards, so a queued
-	 * operation waiting for the analysis cannot deadlock against it.
+	 * Await this from inside the lifecycle queue, or from {@link close}, which drains that queue
+	 * rather than entering it. An analysis enters the queue exactly once, to register itself, and
+	 * never re-enters it afterwards, so a queued operation waiting for the analysis cannot
+	 * deadlock against it.
 	 */
 	private async settleActiveAnalysis(reason: string): Promise<void> {
 		const analysis = this.#activeAnalysis
@@ -1058,6 +1078,7 @@ export class Project extends EventDispatcher<{
 		clearInterval(this.#cacheSaverIntervalId)
 		// An analysis runs outside the lifecycle queue, so the drain below never waits for it. Left
 		// alone it would keep reading and publishing into a project that is being torn down.
+		// Signalled here so that it winds down while the watcher and the queue are still closing.
 		this.cancelActiveAnalysis('Project#close')
 		await this.#watcher?.close()
 		for (;;) {
@@ -1067,6 +1088,12 @@ export class Project extends EventDispatcher<{
 				break
 			}
 		}
+		// Awaited after the drain rather than before it: an `analyzeProject` call that was still
+		// waiting to register itself when `close` started registers during the drain, and only a
+		// wait placed here covers that case too. Without it a binder, a checker, or a publish
+		// would still be running once `close` settled, and its cache save would race the one
+		// below.
+		await this.settleActiveAnalysis('Project#close')
 		try {
 			await this.cacheService.save()
 		} catch (e) {
@@ -1682,8 +1709,20 @@ export class Project extends EventDispatcher<{
 			}
 
 			const node = this.parse(doc)
-			await this.bind(doc, node)
-			this.emit('documentUpdated', { doc, node })
+			// A binder that {@link analyzeProject} is running reaches this method too — mcdoc
+			// resolves module references through it — and both the default `'full'` propagation
+			// and the publish below would cross the two-pass barrier that method is built on.
+			// The queued lints outlive the run and drain on top of its results, and the bind-only
+			// node replaces a document's checker/linter result with a subset of itself: during
+			// `prepare` because nothing publishes yet, during `analyze` because the pass already
+			// published or is about to. Staying silent loses nothing, since the analysis walks
+			// every project file itself. With no analysis in flight this is the editor path and
+			// behaves as before.
+			const isAnalyzing = this.#activeAnalysis !== undefined
+			await this.bind(doc, node, false, isAnalyzing ? 'none' : 'full')
+			if (!isAnalyzing) {
+				this.emit('documentUpdated', { doc, node })
+			}
 		} finally {
 			this.#bindingInProgressUris.delete(uri)
 		}
@@ -1852,34 +1891,48 @@ export class Project extends EventDispatcher<{
 			this.#activeAnalysis = analysis
 		})
 
+		/**
+		 * Let every lifecycle operation waiting on this run proceed. Running it a second time is a
+		 * no-op, which is what lets the passes below release early while the `finally` around them
+		 * still guarantees a release on every other exit.
+		 */
+		const release = () => {
+			if (this.#activeAnalysis === analysis) {
+				this.#activeAnalysis = undefined
+			}
+			analysis.stopped.resolve()
+		}
+
 		/** Whether the caller or a lifecycle operation asked this run to stop. */
 		const isCancelled = () =>
 			analysis.controller.signal.aborted || options.signal?.aborted === true
 
-		// Listed after the barrier: an operation that ran ahead of it may have changed the roots or
-		// the set of tracked files.
-		const files = [...new Set(this.getTrackedFiles().map((uri) => this.normalizeUri(uri)))]
-			.filter((uri) =>
-				this.projectRoots.some((root) => fileUtil.isSubUriOf(uri, root))
-				&& !this.shouldExclude(uri)
-			)
-			.sort(this.meta.uriSorter)
-		this.logger.info(`[Project#analyzeProject] Analyzing ${files.length} files`)
-
-		const __profiler = this.profilers.get('project#analyzeProject')
-		let cancelled = false
-
-		/** URIs the `prepare` pass bound, in the order the `analyze` pass has to process them. */
-		const boundUris: string[] = []
-		/**
-		 * URIs the `analyze` pass carried all the way through its publish, which is what recorded
-		 * the checksums the final save reuses. Anything this run skipped, failed on, or never
-		 * reached stays out and is verified against disk instead.
-		 */
-		const analyzedUris = new Set<string>()
-		let prepared = 0
-		let analyzed = 0
 		try {
+			// Listed after the barrier: an operation that ran ahead of it may have changed the
+			// roots or the set of tracked files.
+			const files = [...new Set(this.getTrackedFiles().map((uri) => this.normalizeUri(uri)))]
+				.filter((uri) =>
+					this.projectRoots.some((root) => fileUtil.isSubUriOf(uri, root))
+					&& !this.shouldExclude(uri)
+				)
+				.sort(this.meta.uriSorter)
+			this.logger.info(`[Project#analyzeProject] Analyzing ${files.length} files`)
+
+			const __profiler = this.profilers.get('project#analyzeProject')
+			let cancelled = false
+
+			/** URIs the `prepare` pass bound. The `analyze` pass processes exactly these. */
+			const boundUris = new Set<string>()
+			/**
+			 * URIs the `analyze` pass carried all the way through its publish. That is what
+			 * `analyzedFiles` reports, and what recorded the checksums the final save reuses.
+			 * Anything this run skipped, failed on, or never reached stays out and is verified
+			 * against disk instead.
+			 */
+			const analyzedUris = new Set<string>()
+			let prepared = 0
+			let analyzed = 0
+
 			for (const uri of files) {
 				if (isCancelled()) {
 					cancelled = true
@@ -1901,7 +1954,7 @@ export class Project extends EventDispatcher<{
 						delete clientManaged.node.checkerErrors
 						delete clientManaged.node.linterErrors
 						await this.bind(clientManaged.doc, clientManaged.node, false, 'none')
-						boundUris.push(uri)
+						boundUris.add(uri)
 					} else {
 						// This command is also how a user recovers from a stale cache, so the
 						// text cache is dropped to force a read from disk.
@@ -1909,7 +1962,7 @@ export class Project extends EventDispatcher<{
 						const doc = await this.read(uri)
 						if (doc) {
 							await this.bind(doc, this.parse(doc), false, 'none')
-							boundUris.push(uri)
+							boundUris.add(uri)
 						} else {
 							await this.#publishEmptyDiagnosticsIfBound(uri)
 						}
@@ -1927,55 +1980,60 @@ export class Project extends EventDispatcher<{
 			__profiler.task('Prepare Files')
 
 			// A cancellation during the pass above stays raised, so this pass stops on its first
-			// file without a separate guard.
-			for (const uri of boundUris) {
+			// file without a separate guard. It walks the whole file list rather than the bound
+			// subset so that a file the `prepare` pass could not bind still advances its progress:
+			// both passes report against the same total, and a run that skipped one would
+			// otherwise stop short of it while claiming to have finished.
+			for (const uri of files) {
 				if (isCancelled()) {
 					cancelled = true
 					this.logger.info(
-						`[Project#analyzeProject] Cancelled after ${analyzed}/${boundUris.length} files`,
+						`[Project#analyzeProject] Cancelled after ${analyzed}/${files.length} files`,
 					)
 					break
 				}
 
-				try {
-					const clientManaged = this.#clientManagedDocAndNodes.get(uri)
-					if (clientManaged) {
-						delete clientManaged.node.checkerErrors
-						delete clientManaged.node.linterErrors
-						await this.checkWithoutLintFlush(
-							clientManaged.doc,
-							clientManaged.node,
-							false,
-							'none',
-						)
-						// Other code paths hold this very object; publishing a copy of it
-						// would leave them looking at a node nobody updates.
-						await this.emitAsync('documentUpdated', clientManaged)
-						analyzedUris.add(uri)
-					} else {
-						const doc = await this.read(uri)
-						if (doc) {
-							// The `prepare` pass released its AST to keep memory flat, and a
-							// freshly parsed node carries no symbol, which linter rules such as
-							// `undeclaredSymbol` read from the node. Hence the second bind. It
-							// is not deduplicated against the first one: `bind` is keyed on the
-							// document and drops the key once its Promise settles, which the
-							// `prepare` pass awaited.
-							const node = this.parse(doc)
-							await this.bind(doc, node, false, 'none')
-							// `check` would flush the queued lints, which is the very
-							// self-feeding pass this two-pass split exists to avoid.
-							await this.checkWithoutLintFlush(doc, node, false, 'none')
-							// Awaiting the publish keeps one URI's diagnostics from overtaking
-							// each other when a listener is slow.
-							await this.emitAsync('documentUpdated', { doc, node })
+				if (boundUris.has(uri)) {
+					try {
+						const clientManaged = this.#clientManagedDocAndNodes.get(uri)
+						if (clientManaged) {
+							delete clientManaged.node.checkerErrors
+							delete clientManaged.node.linterErrors
+							await this.checkWithoutLintFlush(
+								clientManaged.doc,
+								clientManaged.node,
+								false,
+								'none',
+							)
+							// Other code paths hold this very object; publishing a copy of it
+							// would leave them looking at a node nobody updates.
+							await this.emitAsync('documentUpdated', clientManaged)
 							analyzedUris.add(uri)
 						} else {
-							await this.#publishEmptyDiagnosticsIfBound(uri)
+							const doc = await this.read(uri)
+							if (doc) {
+								// The `prepare` pass released its AST to keep memory flat, and a
+								// freshly parsed node carries no symbol, which linter rules such
+								// as `undeclaredSymbol` read from the node. Hence the second
+								// bind. It is not deduplicated against the first one: `bind` is
+								// keyed on the document and drops the key once its Promise
+								// settles, which the `prepare` pass awaited.
+								const node = this.parse(doc)
+								await this.bind(doc, node, false, 'none')
+								// `check` would flush the queued lints, which is the very
+								// self-feeding pass this two-pass split exists to avoid.
+								await this.checkWithoutLintFlush(doc, node, false, 'none')
+								// Awaiting the publish keeps one URI's diagnostics from
+								// overtaking each other when a listener is slow.
+								await this.emitAsync('documentUpdated', { doc, node })
+								analyzedUris.add(uri)
+							} else {
+								await this.#publishEmptyDiagnosticsIfBound(uri)
+							}
 						}
+					} catch (e) {
+						this.logger.error(`[Project#analyzeProject] Failed for ${uri}`, e)
 					}
-				} catch (e) {
-					this.logger.error(`[Project#analyzeProject] Failed for ${uri}`, e)
 				}
 
 				analyzed += 1
@@ -1985,47 +2043,54 @@ export class Project extends EventDispatcher<{
 				}
 			}
 			__profiler.task('Analyze Files')
-		} finally {
+
 			// Waiters are released here rather than after the save below: the save only reads
 			// project state, and `CacheService` already drops one whose snapshot a concurrent
 			// rebuild invalidated, so making a reset wait for it would only delay the rebuild.
-			if (this.#activeAnalysis === analysis) {
-				this.#activeAnalysis = undefined
-			}
-			analysis.stopped.resolve()
-		}
+			release()
 
-		// A cancelled run persists nothing. It published a subset of the corpus, and an internal
-		// abort means a reset, a config rebuild or a reinitialization is already waiting to
-		// discard the state a save would write out; its partial diagnostics reach the caller
-		// right away instead, and the autosave interval or `close()` covers whatever survives.
-		// The signal is read again rather than the loops' `cancelled` flag: a cancellation that
-		// arrived after the last file left that flag unset, and the rebuild behind it is no less
-		// imminent. What lands after the block above cleared `#activeAnalysis` can no longer
-		// reach this signal, and for that remainder `CacheService#save` reports the skip itself.
-		if (!isCancelled()) {
-			try {
-				// Only the URIs this run published are trusted, so the dependency files it never
-				// analyzed — and the project files it failed on — stay on the read path. See
-				// `CacheService#createVerifiedChecksums`.
-				const saved = await this.cacheService.save({
-					trustRecordedHashesFor: analyzedUris,
-				})
-				if (!saved) {
-					this.logger.warn(
-						'[Project#analyzeProject] Finished analysis without saving cache',
-					)
+			// Read again rather than trusting the loops alone: a cancellation that arrived while
+			// the last file was still being processed never reached a loop boundary, and the run
+			// would report itself as complete while skipping the save below. What lands after
+			// `release` cleared `#activeAnalysis` can no longer reach this signal, and for that
+			// remainder `CacheService#save` reports the skip itself.
+			cancelled ||= isCancelled()
+
+			// A cancelled run persists nothing. It published a subset of the corpus, and an
+			// internal abort means a reset, a config rebuild or a reinitialization is already
+			// waiting to discard the state a save would write out; its partial diagnostics reach
+			// the caller right away instead, and the autosave interval or `close()` covers
+			// whatever survives.
+			if (!cancelled) {
+				try {
+					// Only the URIs this run published are trusted, so the dependency files it
+					// never analyzed — and the project files it failed on — stay on the read path.
+					// See `CacheService#createVerifiedChecksums`.
+					const saved = await this.cacheService.save({
+						trustRecordedHashesFor: analyzedUris,
+					})
+					if (!saved) {
+						this.logger.warn(
+							'[Project#analyzeProject] Finished analysis without saving cache',
+						)
+					}
+				} catch (e) {
+					// The analysis itself succeeded and its diagnostics are already published, so
+					// a failed save is reported to the log alone, exactly as
+					// `saveCacheAfterRebuild` treats one.
+					this.logger.error('[Project#analyzeProject] Failed saving cache', e)
 				}
-			} catch (e) {
-				// The analysis itself succeeded and its diagnostics are already published, so a
-				// failed save is reported to the log alone, exactly as `saveCacheAfterRebuild`
-				// treats one.
-				this.logger.error('[Project#analyzeProject] Failed saving cache', e)
 			}
-		}
-		__profiler.task('Save Cache').finalize()
+			__profiler.task('Save Cache').finalize()
 
-		return { analyzedFiles: analyzed, cancelled, totalFiles: files.length }
+			return { analyzedFiles: analyzedUris.size, cancelled, totalFiles: files.length }
+		} finally {
+			// Listing the files, sorting them, and building the profiler all run before the passes
+			// reach their own release above, and any of them can throw. A `stopped` left
+			// unresolved would make the next reset, config rebuild or reinitialization wait for
+			// this run forever.
+			release()
+		}
 	}
 
 	/**
@@ -2091,6 +2156,12 @@ export class Project extends EventDispatcher<{
 		changes: TextDocumentContentChangeEvent[],
 		version: number,
 	): Promise<void> {
+		// An analysis may be holding this very document, in which case it is holding the content
+		// from before this edit. Waiting inside the queued work rather than in the notification
+		// handler keeps the abort signal — raised in `onDidChange` — and this wait one file apart
+		// at most, and the alternative is letting the pre-edit diagnostics land after the fresh
+		// ones the check below publishes.
+		await this.settleActiveAnalysis(`[Project#onDidChange] ${uri}`)
 		const clientUri = normalizeUri(uri)
 		const isCacheUri = this.isCacheUri(clientUri)
 		uri = this.normalizeUri(clientUri)
@@ -2125,6 +2196,10 @@ export class Project extends EventDispatcher<{
 	}
 
 	private async onDidCloseOnce(uri: string): Promise<void> {
+		// Closing moves which content of this URI counts as authoritative back to the disk one, so
+		// an analysis that read the editor buffer is now holding a document nobody else has. See
+		// `onDidChangeOnce` for why the wait sits inside the queued work.
+		await this.settleActiveAnalysis(`[Project#onDidClose] ${uri}`)
 		const clientUri = normalizeUri(uri)
 		const isCacheUri = this.isCacheUri(clientUri)
 		uri = this.normalizeUri(clientUri)
