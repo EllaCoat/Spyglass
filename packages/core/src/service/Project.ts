@@ -103,7 +103,9 @@ export interface AnalyzeProjectResult {
 	/**
 	 * The amount of files that made it through the checker and had their diagnostics published.
 	 * Equal to `totalFiles` unless the analysis was cancelled, or a file turned out not to be
-	 * readable, or processing one of them threw.
+	 * readable, or processing one of them threw. A file whose checker threw does not count even
+	 * though its partial diagnostics were published: what reached the editor is not the result
+	 * the file should have produced.
 	 */
 	analyzedFiles: number
 	cancelled: boolean
@@ -1105,6 +1107,24 @@ export class Project extends EventDispatcher<{
 		}
 	}
 
+	/**
+	 * Run the initial scan again on the watcher this project already holds: relist the dependency
+	 * and project files, drop the binding state, validate the cache and bind what it reports as
+	 * added or changed, recheck the documents the client has open, then publish the staged
+	 * diagnostics and READY the way {@link ready} does. The cache itself is kept, which is what
+	 * separates this from {@link reset}: a reset discards it and rebuilds the symbol table and the
+	 * recorded hashes from nothing.
+	 *
+	 * Unlike {@link reset}, this neither enters the lifecycle queue nor cancels and awaits a
+	 * running analysis, so nothing makes it exclusive with the operations that read the state it
+	 * mutates. Run alongside {@link analyzeProject} it removes and re-registers symbols while the
+	 * passes walk them, which is the race the two-pass split of that method exists to prevent; run
+	 * alongside a reset, a config update, or a watcher event, two rebuilds interleave on one symbol
+	 * table and one `#readyPromise`.
+	 *
+	 * The caller therefore owns the exclusion: invoke it only when no analysis and no other
+	 * lifecycle operation is in flight. Use {@link reset} where those guarantees are needed.
+	 */
 	async restart(): Promise<void> {
 		this.#bindingInProgressUris.clear()
 		this.#symbolUpToDateUris.clear()
@@ -1533,15 +1553,22 @@ export class Project extends EventDispatcher<{
 	 * Checker + linter stages without the trailing queued-lint flush. The
 	 * implicit lint drain calls this directly: flushing there would await the
 	 * drain's own promise and deadlock. {@link check} wraps this and flushes.
+	 *
+	 * @returns Whether the node ends up holding a complete checker result. `false` means the
+	 * checker threw and `propagateErrors` swallowed it, which leaves the document's diagnostics a
+	 * subset of what it should report. A caller that records a document as processed — see
+	 * {@link analyzeProject}, which then lets the cache trust its recorded hashes — has to keep
+	 * such a document out of its results; a caller that only publishes can ignore this.
 	 */
 	private async checkWithoutLintFlush(
 		doc: TextDocument,
 		node: FileNode<AstNode>,
 		propagateErrors = false,
 		propagation: LintPropagation = 'full',
-	): Promise<void> {
+	): Promise<boolean> {
 		if (node.checkerErrors) {
-			return
+			// The results are already on the node, put there by a checker that ran to completion.
+			return true
 		}
 		const endCacheMutation = this.cacheService.beginStateMutation()
 		const __checkProfiler = this.profilers.get('project#check', 'top-n', 50)
@@ -1557,11 +1584,13 @@ export class Project extends EventDispatcher<{
 				this.lint(doc, node, propagation)
 				__lintProfiler.task(doc.uri)
 			})
+			return true
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
 			if (propagateErrors) {
 				throw e
 			}
+			return false
 		} finally {
 			endCacheMutation()
 			__checkProfiler.finalize()
@@ -1942,10 +1971,11 @@ export class Project extends EventDispatcher<{
 			 */
 			const unreadableUris = new Set<string>()
 			/**
-			 * URIs the `analyze` pass carried all the way through its publish. That is what
-			 * `analyzedFiles` reports, and what recorded the checksums the final save reuses.
-			 * Anything this run skipped, failed on, or never reached stays out and is verified
-			 * against disk instead.
+			 * URIs whose checker completed and whose diagnostics the `analyze` pass then
+			 * published. That is what `analyzedFiles` reports, and what recorded the checksums the
+			 * final save reuses. Anything this run skipped, failed on, or never reached stays out
+			 * and is verified against disk instead — including a file that was published after
+			 * its checker threw, since those diagnostics are a subset of its real ones.
 			 */
 			const analyzedUris = new Set<string>()
 			let prepared = 0
@@ -2021,7 +2051,7 @@ export class Project extends EventDispatcher<{
 						if (clientManaged) {
 							delete clientManaged.node.checkerErrors
 							delete clientManaged.node.linterErrors
-							await this.checkWithoutLintFlush(
+							const checked = await this.checkWithoutLintFlush(
 								clientManaged.doc,
 								clientManaged.node,
 								false,
@@ -2030,7 +2060,15 @@ export class Project extends EventDispatcher<{
 							// Other code paths hold this very object; publishing a copy of it
 							// would leave them looking at a node nobody updates.
 							await this.emitAsync('documentUpdated', clientManaged)
-							analyzedUris.add(uri)
+							// A file whose checker threw is still published — partial diagnostics
+							// beat none, and they replace whatever this URI showed before — but it
+							// is not recorded: `analyzedFiles` would count a file the checker
+							// never finished, and the final save would trust the hashes of one
+							// whose diagnostics are incomplete, freezing that state into the
+							// cache. Left out, it stays on the read path and is checked again.
+							if (checked) {
+								analyzedUris.add(uri)
+							}
 						} else {
 							const doc = await this.read(uri)
 							if (doc) {
@@ -2044,11 +2082,20 @@ export class Project extends EventDispatcher<{
 								await this.bind(doc, node, false, 'none')
 								// `check` would flush the queued lints, which is the very
 								// self-feeding pass this two-pass split exists to avoid.
-								await this.checkWithoutLintFlush(doc, node, false, 'none')
+								const checked = await this.checkWithoutLintFlush(
+									doc,
+									node,
+									false,
+									'none',
+								)
 								// Awaiting the publish keeps one URI's diagnostics from
 								// overtaking each other when a listener is slow.
 								await this.emitAsync('documentUpdated', { doc, node })
-								analyzedUris.add(uri)
+								// See the client-managed branch: a checker that threw publishes
+								// but does not count and is not trusted.
+								if (checked) {
+									analyzedUris.add(uri)
+								}
 							} else {
 								await this.#publishEmptyDiagnosticsIfBound(uri)
 							}

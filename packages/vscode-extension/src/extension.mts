@@ -148,13 +148,21 @@ export async function activate(context: vsc.ExtensionContext) {
 						// diagnostics of the other files stay absent until the project is analyzed.
 						// The analysis is offered instead of started: running it from here would
 						// turn the reset back into an operation that walks the whole project.
-						const analyzeAction = localize('reset-project-cache.analyze-project')
-						const selectedAction = await vsc.window.showInformationMessage(
-							localize('reset-project-cache.done'),
-							analyzeAction,
-						)
-						if (selectedAction === analyzeAction) {
-							await vsc.commands.executeCommand('spyglassmc.analyzeProject')
+						//
+						// Both the message and the action describe a server that has the
+						// `analyzeProject` capability. A server without it neither narrowed its
+						// reset that way nor registered the command this offers, so this extension
+						// stays silent there and the reset behaves as it did before the message
+						// existed.
+						if (customCapabilities?.analyzeProject) {
+							const analyzeAction = localize('reset-project-cache.analyze-project')
+							const selectedAction = await vsc.window.showInformationMessage(
+								localize('reset-project-cache.done'),
+								analyzeAction,
+							)
+							if (selectedAction === analyzeAction) {
+								await vsc.commands.executeCommand('spyglassmc.analyzeProject')
+							}
 						}
 					} catch (e) {
 						console.error('[client#resetProjectCache]', e)

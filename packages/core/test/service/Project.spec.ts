@@ -383,6 +383,48 @@ describe('Project', () => {
 			}
 		})
 
+		it('Should neither count nor trust a file whose checker threw', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			const { errors, project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					if (ctx.doc.uri === uriB) {
+						throw new Error('Test checker failure')
+					}
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			})
+			// The set the run hands to the cache is what turns a processed file into one whose
+			// recorded hashes are believed instead of re-read, so it is asserted on directly.
+			const trustedUris: string[][] = []
+			const cacheService = project.cacheService
+			const originalSave = cacheService.save.bind(cacheService)
+			cacheService.save = (options) => {
+				trustedUris.push([...(options?.trustRecordedHashesFor ?? [])])
+				return originalSave(options)
+			}
+			try {
+				errors.clear()
+
+				const result = await project.analyzeProject()
+
+				assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 2 })
+				assert.deepEqual(trustedUris, [[uriA]])
+				// The failed file is still published: the partial result replaces whatever this
+				// URI showed before, which beats leaving stale diagnostics behind.
+				assert.deepEqual(
+					errors.get(uriA)?.map((e) => e.message),
+					[TestCheckerMessage],
+				)
+				assert.deepEqual(errors.get(uriB), [])
+			} finally {
+				await project.close()
+			}
+		})
+
 		it('Should report a cancellation that arrived during the last file', async () => {
 			const { project } = await setup({
 				'/root/a.spyglasstest': 'foo',
