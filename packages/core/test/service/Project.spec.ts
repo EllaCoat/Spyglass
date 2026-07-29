@@ -160,8 +160,11 @@ async function setup(
 function registerThrowingChecker(
 	meta: MetaRegistry,
 	shouldThrow: (uri: string) => boolean,
+	/** Collects the URI of every document the checker is entered for, in order. */
+	checkedUris?: string[],
 ): void {
 	meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+		checkedUris?.push(ctx.doc.uri)
 		if (shouldThrow(ctx.doc.uri)) {
 			throw new Error('Test checker failure')
 		}
@@ -175,7 +178,7 @@ interface SerializedCache {
 		fileContents: Record<string, string>
 		files: Record<string, string>
 	}
-	errors: Record<string, unknown[]>
+	errors: Record<string, { message: string }[]>
 	failedChecks?: string[]
 	[key: string]: unknown
 }
@@ -1226,6 +1229,179 @@ describe('Project', () => {
 			} finally {
 				await second.project.close()
 			}
+		})
+	})
+
+	describe('failed check retry', () => {
+		const uriA = `${ProjectRoot}a.spyglasstest`
+		const uriB = `${ProjectRoot}b.spyglasstest`
+		const files = { '/root/a.spyglasstest': 'foo', '/root/b.spyglasstest': 'foo' }
+
+		/**
+		 * Run a session that analyzes the whole project and save its cache. The returned file
+		 * system is what the warm start after it reads.
+		 */
+		async function analyzeAndClose(
+			extraInitializer: ProjectInitializer,
+			extraFiles: Record<string, string> = {},
+		): Promise<SetupResult> {
+			const result = await setup({ ...files, ...extraFiles }, extraInitializer)
+			try {
+				await result.project.analyzeProject()
+			} finally {
+				await result.project.close()
+			}
+			return result
+		}
+
+		it('Should re-check a file whose checker threw on the next start', async () => {
+			let shouldThrow = true
+			const checkedUris: string[] = []
+			const initializer: ProjectInitializer = ({ meta }) =>
+				registerThrowingChecker(meta, (uri) => shouldThrow && uri === uriB, checkedUris)
+			const first = await analyzeAndClose(initializer)
+
+			shouldThrow = false
+			checkedUris.length = 0
+			const second = createSetup(first.fs, initializer)
+			try {
+				await second.project.init()
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+
+				// Nothing else is rechecked: a scan binds closed files and leaves the checking to
+				// an analysis, and this file is here only because its own check never finished.
+				assert.deepEqual(checkedUris, [uriB])
+				assert.equal(second.outcomes.get(uriB), 'complete')
+				assert.deepEqual(
+					second.errors.get(uriB)?.map((e) => e.message),
+					[TestCheckerMessage],
+				)
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set())
+			} finally {
+				await second.project.close()
+			}
+		})
+
+		it('Should retry without pulling other documents into the pass', async () => {
+			const uriC = `${ProjectRoot}c.spyglasstest`
+			let shouldThrow = true
+			let shouldQueue = false
+			const checkedUris: string[] = []
+			const initializer: ProjectInitializer = ({ meta }) => {
+				meta.registerUriSymbolClearer((uri, ctx) => {
+					if (shouldQueue && uri === uriB) {
+						ctx.queueLint?.(uriC)
+					}
+				})
+				registerThrowingChecker(meta, (uri) => shouldThrow && uri === uriB, checkedUris)
+			}
+			const first = await analyzeAndClose(initializer, { '/root/c.spyglasstest': 'foo' })
+
+			shouldThrow = false
+			// Armed only for the warm start, so that the queueing below can only come from the
+			// retry's own rebind of `b`.
+			shouldQueue = true
+			checkedUris.length = 0
+			const second = createSetup(first.fs, initializer)
+			try {
+				await second.project.init()
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+
+				// The retry rebinds `b` and runs the clearer, but propagates nothing, so the
+				// clearer has no way to queue `c`. One file's failed check must not turn into a
+				// pass over everything that refers to it.
+				assert.deepEqual(checkedUris, [uriB])
+				assert.equal(
+					second.outcomes.get(uriC),
+					'not-run',
+					'`c` was dragged into the retry instead of keeping its restored diagnostics',
+				)
+			} finally {
+				await second.project.close()
+			}
+		})
+
+		it('Should keep the marker of a closed file across a reset', async () => {
+			const partialMessage = 'Test binder partial error'
+			const { errors, fs, project } = await setup(files, ({ meta }) => {
+				meta.registerBinder<LiteralNode>('literal', (node, ctx) => {
+					if (ctx.doc.uri === uriB) {
+						ctx.err.report(partialMessage, node)
+					}
+				})
+				registerThrowingChecker(meta, (uri) => uri === uriB)
+			})
+			try {
+				await project.analyzeProject()
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uriB]))
+				assert.deepEqual(
+					errors.get(uriB)?.map((e) => e.message),
+					[partialMessage],
+					'the incomplete diagnostics still reach the editor',
+				)
+
+				await project.reset()
+
+				// A reset discards the cache; the ledger lives on the project side precisely so
+				// that it does not go with it, since a failed check is a fact about processing
+				// rather than about anything the cache held.
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uriB]))
+				// The incomplete diagnostics are retracted like every other cached entry, and the
+				// surviving marker is what still keeps them out of the next cache.
+				assert.deepEqual(errors.get(uriB), [])
+				assert.equal(await project.cacheService.save(), true)
+				assert.deepEqual(readCacheFile(fs).failedChecks, [uriB])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should leave nothing behind in the cache after a successful retry', async () => {
+			let shouldThrow = true
+			const initializer: ProjectInitializer = ({ meta }) =>
+				registerThrowingChecker(meta, (uri) => shouldThrow && uri === uriB)
+			const first = await analyzeAndClose(initializer)
+			assert.deepEqual(readCacheFile(first.fs).failedChecks, [uriB])
+			assert.equal(readCacheFile(first.fs).errors[uriB], undefined)
+
+			shouldThrow = false
+			const second = createSetup(first.fs, initializer)
+			try {
+				await second.project.init()
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+			} finally {
+				await second.project.close()
+			}
+
+			// End of the round trip: the retry completed, so the next cache carries the file's
+			// real diagnostics and no longer names it as failed.
+			const cache = readCacheFile(first.fs)
+			assert.deepEqual(cache.failedChecks, [])
+			assert.deepEqual(cache.errors[uriB]?.map((e) => e.message), [TestCheckerMessage])
+		})
+
+		it('Should drop the marker of a file that is gone on the next start', async () => {
+			const first = await analyzeAndClose(({ meta }) =>
+				registerThrowingChecker(meta, (uri) => uri === uriB)
+			)
+			assert.deepEqual(readCacheFile(first.fs).failedChecks, [uriB])
+			first.fs.unlinkSync('/root/b.spyglasstest')
+
+			const second = createSetup(first.fs)
+			try {
+				await second.project.init()
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set([uriB]))
+
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+
+				// A file that is gone is never going to be checked again, so its marker would
+				// otherwise be queued and saved for every session from here on.
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set())
+				assert.deepEqual(second.errors.get(uriA)?.map((e) => e.message), [TestCheckerMessage])
+			} finally {
+				await second.project.close()
+			}
+			assert.deepEqual(readCacheFile(first.fs).failedChecks, [])
 		})
 	})
 })

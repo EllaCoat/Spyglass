@@ -281,7 +281,7 @@ export class Project extends EventDispatcher<{
 	 * fact about this session's processing, not about the cached content. `CacheService` reads it
 	 * through {@link getFailedCheckUris} to persist it and to keep the incomplete diagnostics of
 	 * those URIs out of the cache file, and refills it through {@link restoreFailedCheckUris} when
-	 * a cache is loaded.
+	 * a cache is loaded; {@link queueFailedCheckRetries} is what then acts on what it holds.
 	 */
 	readonly #failedCheckUris = new Set<string>()
 	readonly #queuedLintUris = new Set<string>()
@@ -570,6 +570,11 @@ export class Project extends EventDispatcher<{
 			this.updateRoots()
 		}
 		this.#symbolUpToDateUris.delete(uri)
+		// Both a deleted file and one the project stopped including arrive here — the watcher
+		// reports an exclusion as an `unlink`, and `validate` reports it as removed — and neither
+		// is ever going to be checked again, so a retry marker for it would be carried, saved and
+		// queued forever.
+		this.#failedCheckUris.delete(uri)
 		this.cacheService.clearFileChange(uri)
 		this.clearUriSymbolLocations(uri)
 		if (forceDocumentRemoval) {
@@ -1121,10 +1126,32 @@ export class Project extends EventDispatcher<{
 		// roll the fresh results back to stale ones.
 		if (shouldPublishEvents) {
 			const staged = stagedDiagnostics.filter(event => !freshlyPublishedUris.has(event.data.uri))
+			this.queueFailedCheckRetries()
 			await this.publishRebuildEvents(staged, true)
 		}
 
 		return this
+	}
+
+	/**
+	 * Queue the closed files whose last check threw, so that the drain that
+	 * {@link publishRebuildEvents} runs checks them again.
+	 *
+	 * A scan binds closed files and stops there, because whole-corpus checker results are
+	 * {@link analyzeProject}'s job. These files are the exception: their diagnostics were kept out
+	 * of the cache, so nothing restores them either, and leaving them to the next analysis means
+	 * the failure outlives yet another session. Queueing them here puts the retry on the pass that
+	 * already publishes, right after the staged entries and before READY.
+	 *
+	 * Client-managed documents are left out. {@link rebindAndCheckClientManaged} has just
+	 * rechecked every one of them, which cleared the marker of each retry that succeeded.
+	 */
+	private queueFailedCheckRetries(): void {
+		for (const uri of this.#failedCheckUris) {
+			if (!this.#clientManagedDocAndNodes.has(uri)) {
+				this.#queuedLintUris.add(uri)
+			}
+		}
 	}
 
 	/**
@@ -1628,7 +1655,9 @@ export class Project extends EventDispatcher<{
 	 * checker threw and `propagateErrors` swallowed it, which leaves the document's diagnostics a
 	 * subset of what it should report. A caller that records a document as processed — see
 	 * {@link analyzeProject}, which then lets the cache trust its recorded hashes — has to keep
-	 * such a document out of its results; a caller that only publishes can ignore this.
+	 * such a document out of its results. A caller that only publishes needs nothing beyond that:
+	 * the markers above are what keep the incomplete diagnostics out of the cache and bring the
+	 * document back for another check, at the next scan through {@link queueFailedCheckRetries}.
 	 */
 	private async checkWithoutLintFlush(
 		doc: TextDocument,
@@ -1753,6 +1782,9 @@ export class Project extends EventDispatcher<{
 	 * intentional redirects are drained as well. Whole-corpus diagnostics are
 	 * {@link analyzeProject}'s job, not the editor path's: a reset only rebinds
 	 * the corpus and rechecks the open documents.
+	 *
+	 * The exception is a document {@link queueFailedCheckRetries} put here, which runs at `none`:
+	 * see the drain body.
 	 */
 	private async flushQueuedLints(): Promise<void> {
 		if (!this.#isReady || this.#queuedLintUris.size === 0) {
@@ -1799,8 +1831,15 @@ export class Project extends EventDispatcher<{
 					// for a URI, a lint-only pass would drop its checker diagnostics.
 					// Use the flush-free check path because flushing here would await
 					// this drain from inside itself.
-					await this.bind(doc, node, false, 'owner-only')
-					await this.checkWithoutLintFlush(doc, node, false, 'owner-only')
+					//
+					// A retry is the one pass that propagates nothing. It is here because its own
+					// check threw, not because another document referred to it, so a dependent it
+					// queued — or an owner its linters redirected to — would be dragged in by a
+					// failure that says nothing about them, turning one broken file into a
+					// corpus-wide re-lint. Read before the check, which clears the marker.
+					const propagation = this.#failedCheckUris.has(uri) ? 'none' : 'owner-only'
+					await this.bind(doc, node, false, propagation)
+					await this.checkWithoutLintFlush(doc, node, false, propagation)
 					await this.emitAsync('documentUpdated', { doc, node })
 				}
 			}
