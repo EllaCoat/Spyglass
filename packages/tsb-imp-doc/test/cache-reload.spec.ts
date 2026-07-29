@@ -264,9 +264,9 @@ describe('IMP-Doc cache reload correctness (P1b Step 4)', () => {
 			)
 			// onDidOpen は bind/check を直接呼ぶだけで documentUpdated を emit しない
 			// (Project.ts:912-931)。 documentErrored 経路 → cacheService.errors[uri]
-			// への反映は ensureClientManagedChecked を明示的に呼ぶ必要がある
+			// への反映は withClientFeatureAccess を明示的に呼ぶ必要がある
 			// (Project.ts:980-990)。
-			await first.ensureClientManagedChecked(callerUri)
+			await first.withClientFeatureAccess(callerUri, () => {})
 			const firstState = first.getClientManaged(callerUri)
 			assert.ok(firstState)
 			assert.equal(firstState.node.linterErrors?.length, 1)

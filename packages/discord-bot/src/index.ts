@@ -194,25 +194,28 @@ async function getAutocomplete(
 	const uri = generateRandomUri()
 	await service.project.onDidOpen(uri, 'mcfunction', 0, content)
 	try {
-		const docAndNode = await service.project.ensureClientManagedChecked(uri)
-		if (!docAndNode) {
-			throw new Error('docAndNode is undefined')
-		}
+		// The close below stays outside the callback: it is a lifecycle operation, and the callback
+		// is already holding the one it would queue behind.
+		return await service.project.withClientFeatureAccess(uri, (access) => {
+			if (access.kind !== 'checked') {
+				throw new Error(`No checked document for ${uri}: ${access.reason}`)
+			}
 
-		const { node, doc } = docAndNode
+			const { node, doc } = access
 
-		return service.complete(node, doc, content.length)
-			.sort((a, b) => (a.sortText ?? a.label).localeCompare(b.sortText ?? b.label))
-			// Convert autocomplete options into full text options
-			.map((i) => {
-				const insertText = i.insertText ?? i.label
-				return `${content.slice(0, i.range.start)}${insertText}${content.slice(i.range.end)}`
-			})
-			// Filter to the texts starting with the user input
-			.filter((v) => v.startsWith(content))
-			.map((v) => ({ name: v, value: v }))
-			// Limit to a maximum of 25 options
-			.slice(0, 25)
+			return service.complete(node, doc, content.length)
+				.sort((a, b) => (a.sortText ?? a.label).localeCompare(b.sortText ?? b.label))
+				// Convert autocomplete options into full text options
+				.map((i) => {
+					const insertText = i.insertText ?? i.label
+					return `${content.slice(0, i.range.start)}${insertText}${content.slice(i.range.end)}`
+				})
+				// Filter to the texts starting with the user input
+				.filter((v) => v.startsWith(content))
+				.map((v) => ({ name: v, value: v }))
+				// Limit to a maximum of 25 options
+				.slice(0, 25)
+		})
 	} finally {
 		await service.project.onDidClose(uri)
 	}
@@ -222,17 +225,19 @@ async function getInteractionInfo(content: string, showRaw: boolean): Promise<In
 	const uri = generateRandomUri()
 	await service.project.onDidOpen(uri, 'mcfunction', 0, content)
 	try {
-		const docAndNode = await service.project.ensureClientManagedChecked(uri)
-		if (!docAndNode) {
-			throw new Error('docAndNode is undefined')
-		}
+		// See `getAutocomplete` for why the close stays outside the callback.
+		return await service.project.withClientFeatureAccess(uri, (access) => {
+			if (access.kind !== 'checked') {
+				throw new Error(`No checked document for ${uri}: ${access.reason}`)
+			}
 
-		const { node, doc } = docAndNode
-		const errors = FileNode.getErrors(node)
-		const tokens = service.colorize(node, doc)
-		const activeErrorIndex = errors.length ? 0 : -1
+			const { node, doc } = access
+			const errors = FileNode.getErrors(node)
+			const tokens = service.colorize(node, doc)
+			const activeErrorIndex = errors.length ? 0 : -1
 
-		return { content, errors, activeErrorIndex, tokens, showRaw }
+			return { content, errors, activeErrorIndex, tokens, showRaw }
+		})
 	} finally {
 		await service.project.onDidClose(uri)
 	}

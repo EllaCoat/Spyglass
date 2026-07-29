@@ -2536,30 +2536,6 @@ export class Project extends EventDispatcher<{
 	}
 
 	/**
-	 * @deprecated Use {@link withClientFeatureAccess}. This one binds, checks and publishes without
-	 * entering the lifecycle queue and without looking at {@link analyzeProject}, so a single
-	 * feature request that arrives mid-analysis breaks that method's two-pass barrier: it publishes
-	 * out of a symbol table the first pass has not finished filling, drains the queued lints the
-	 * passes deliberately leave alone, and mutates the table the passes are walking. Kept while its
-	 * callers migrate.
-	 */
-	@SingletonPromise()
-	async ensureClientManagedChecked(uri: string): Promise<DocAndNode | undefined> {
-		uri = this.normalizeUri(uri)
-		const result = this.#clientManagedDocAndNodes.get(uri)
-		if (result) {
-			const { doc, node } = result
-			if (this.#isReady) {
-				await this.bind(doc, node)
-				await this.check(doc, node)
-				this.emit('documentUpdated', result)
-			}
-			return result
-		}
-		return undefined
-	}
-
-	/**
 	 * Run `callback` with whatever a language feature is allowed to read for `uri` at this moment,
 	 * and hold the project still for as long as it runs.
 	 *

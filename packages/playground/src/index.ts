@@ -55,19 +55,20 @@ const onChange = EditorView.updateListener.of((update) => {
 })
 
 async function spyglassCompletions(ctx: CompletionContext): Promise<CompletionResult | null> {
-	const docAndNodes = await service.project.ensureClientManagedChecked($uri.value)
-	if (!docAndNodes) {
-		return null
-	}
-	const items = service.complete(docAndNodes.node, docAndNodes.doc, ctx.pos)
-	if (!items.length) {
-		return null
-	}
-	return {
-		from: items[0].range.start,
-		to: items[0].range.end,
-		options: items.map((v) => ({ label: v.label, detail: v.detail, info: v.documentation })),
-	}
+	return await service.project.withClientFeatureAccess($uri.value, (access) => {
+		if (access.kind !== 'checked') {
+			return null
+		}
+		const items = service.complete(access.node, access.doc, ctx.pos)
+		if (!items.length) {
+			return null
+		}
+		return {
+			from: items[0].range.start,
+			to: items[0].range.end,
+			options: items.map((v) => ({ label: v.label, detail: v.detail, info: v.documentation })),
+		}
+	})
 }
 
 const diagnosticField = StateField.define<DecorationSet>({
