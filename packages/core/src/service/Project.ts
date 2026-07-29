@@ -2063,9 +2063,13 @@ export class Project extends EventDispatcher<{
 							// A file whose checker threw is still published — partial diagnostics
 							// beat none, and they replace whatever this URI showed before — but it
 							// is not recorded: `analyzedFiles` would count a file the checker
-							// never finished, and the final save would trust the hashes of one
-							// whose diagnostics are incomplete, freezing that state into the
-							// cache. Left out, it stays on the read path and is checked again.
+							// never finished, and the save would skip reading a file whose
+							// diagnostics are incomplete. Left out, it is verified against disk
+							// like any file this run did not reach. That verification is all this
+							// buys: the hashes recorded while publishing still match the file, so
+							// the cache keeps the partial diagnostics and the next start does not
+							// recheck it. Making a failed checker retry needs the cache to
+							// represent the failure, which it has no way to express today.
 							if (checked) {
 								analyzedUris.add(uri)
 							}
