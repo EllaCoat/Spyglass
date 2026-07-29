@@ -794,7 +794,7 @@ describe('Project cache reset (#1975)', () => {
 				[{ text: `${content}\n` }],
 				2,
 			)
-			await project.ensureClientManagedChecked(fixtureFiles.caller)
+			await project.withClientFeatureAccess(fixtureFiles.caller, () => {})
 
 			assert.deepEqual(getLinterErrors(project), [])
 
@@ -856,7 +856,7 @@ describe('Project cache reset (#1975)', () => {
 					displayedDiagnostics = errors
 				}
 			})
-			await project.ensureClientManagedChecked(fixtureFiles.caller)
+			await project.withClientFeatureAccess(fixtureFiles.caller, () => {})
 			assert.ok(getLinterErrors(project).length > 0)
 			const previousDisplayedDiagnostics = structuredClone(displayedDiagnostics)
 			assert.ok(previousDisplayedDiagnostics.length > 0)

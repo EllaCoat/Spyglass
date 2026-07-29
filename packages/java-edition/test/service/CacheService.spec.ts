@@ -314,7 +314,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		try {
 			await readyProject(project)
 			await project.onDidOpen(binaryUri, 'png', 1, 'unsaved editor contents')
-			await project.ensureClientManagedChecked(binaryUri)
+			await project.withClientFeatureAccess(binaryUri, () => {})
 			assert.equal(await project.cacheService.save(), false)
 		} finally {
 			await project.close()
@@ -723,7 +723,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 			// while keeping `checksums.fileContents`, which is the state a trusting save must not
 			// take at face value.
 			await project.onDidOpen(binaryUri, 'png', 1, 'unsaved editor contents')
-			await project.ensureClientManagedChecked(binaryUri)
+			await project.withClientFeatureAccess(binaryUri, () => {})
 			// Drain the checksum updates queued by `ready` and by the edit above; see the first
 			// test of this trio.
 			assert.equal(await project.cacheService.save(), false)
@@ -1045,7 +1045,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		try {
 			await readyProject(project)
 			await project.onDidOpen(binaryUri, 'png', 1, 'unsaved editor contents')
-			await project.ensureClientManagedChecked(binaryUri)
+			await project.withClientFeatureAccess(binaryUri, () => {})
 			const result = await project.analyzeProject()
 
 			assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })

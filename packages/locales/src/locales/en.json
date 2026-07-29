@@ -234,6 +234,7 @@
   "score-holder": "a score holder",
   "scoreholder-not-following-convention": "Invalid score_holder %0% which doesn't follow %1% convention",
   "selector": "a selector",
+  "server.feature-unavailable.analyzing-project": "Spyglass is analyzing the project. Semantic information for this document is temporarily unavailable, and comes back on its own once the analysis finishes.",
   "server.new-version": "The Data-pack Language Server has been updated to a newer version: %0%",
   "server.progress.analyze-project.title": "Analyzing project…",
   "server.progress.fixing-workspace.begin": "Fixing all auto-fixable problems in the workspace",

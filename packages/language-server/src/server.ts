@@ -15,7 +15,7 @@ import type {
 	MyLspAnalyzeProjectResult,
 	MyLspDataHackPubifyRequestParams,
 } from './util/index.js'
-import { toCore, toLS } from './util/index.js'
+import { toCore, toLS, unavailable } from './util/index.js'
 import { LspFileWatcher } from './util/LspFileWatcher.js'
 
 export * from './util/types.js'
@@ -356,56 +356,69 @@ connection.onDidCloseTextDocument(({ textDocument: { uri } }) => {
 	return service.project.onDidClose(uri)
 })
 
-connection.onCodeAction(async ({ textDocument: { uri }, range }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.codeActions) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const codeActions = service.getCodeActions(node, doc, toCore.range(range, doc))
-	return codeActions.map(a => toLS.codeAction(a, doc))
+connection.onCodeAction(({ textDocument: { uri }, range }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.codeActions) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.codeAction(access.reason)
+		}
+		const { doc, node } = access
+		const codeActions = service.getCodeActions(node, doc, toCore.range(range, doc))
+		return codeActions.map(a => toLS.codeAction(a, doc))
+	})
 })
 
-connection.onColorPresentation(async ({ textDocument: { uri }, color, range }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const presentation = service.getColorPresentation(
-		node,
-		doc,
-		toCore.range(range, doc),
-		toCore.color(color),
-	)
-	return toLS.colorPresentationArray(presentation, doc)
-})
-connection.onDocumentColor(async ({ textDocument: { uri } }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.colors) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const info = service.getColorInfo(node, doc)
-	return toLS.colorInformationArray(info, doc)
-})
-
-connection.onCompletion(async ({ textDocument: { uri }, position, context }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.completions) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const offset = toCore.offset(position, doc)
-	const items = service.complete(node, doc, offset, context?.triggerCharacter)
-	return items.map((item) =>
-		toLS.completionItem(
-			item,
+connection.onColorPresentation(({ textDocument: { uri }, color, range }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.colorPresentation(access.reason)
+		}
+		const { doc, node } = access
+		const presentation = service.getColorPresentation(
+			node,
 			doc,
-			offset,
-			capabilities.textDocument?.completion?.completionItem?.insertReplaceSupport,
+			toCore.range(range, doc),
+			toCore.color(color),
 		)
-	)
+		return toLS.colorPresentationArray(presentation, doc)
+	})
+})
+connection.onDocumentColor(({ textDocument: { uri } }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.colors) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.documentColor(access.reason)
+		}
+		const { doc, node } = access
+		const info = service.getColorInfo(node, doc)
+		return toLS.colorInformationArray(info, doc)
+	})
+})
+
+connection.onCompletion(({ textDocument: { uri }, position, context }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.completions) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.completion(access.reason)
+		}
+		const { doc, node } = access
+		const offset = toCore.offset(position, doc)
+		const items = service.complete(node, doc, offset, context?.triggerCharacter)
+		return items.map((item) =>
+			toLS.completionItem(
+				item,
+				doc,
+				offset,
+				capabilities.textDocument?.completion?.completionItem?.insertReplaceSupport,
+			)
+		)
+	})
 })
 
 connection.onRequest(
@@ -415,51 +428,53 @@ connection.onRequest(
 	},
 )
 
-connection.onDeclaration(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
-		'declaration',
-		'definition',
-	])
-	return toLS.locationLink(ans, doc, capabilities.textDocument?.declaration?.linkSupport)
-})
-connection.onDefinition(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
-		'definition',
-		'declaration',
-		'implementation',
-		'typeDefinition',
-	])
-	return toLS.locationLink(ans, doc, capabilities.textDocument?.definition?.linkSupport)
-})
-connection.onImplementation(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
-		'implementation',
-		'definition',
-	])
-	return toLS.locationLink(ans, doc, capabilities.textDocument?.implementation?.linkSupport)
-})
-connection.onReferences(
-	async ({ textDocument: { uri }, position, context: { includeDeclaration } }) => {
-		const docAndNode = await service.project.ensureClientManagedChecked(uri)
-		if (!docAndNode) {
-			return undefined
+connection.onDeclaration(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, async (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.declaration(access.reason)
 		}
-		const { doc, node } = docAndNode
+		const { doc, node } = access
+		const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
+			'declaration',
+			'definition',
+		])
+		return toLS.locationLink(ans, doc, capabilities.textDocument?.declaration?.linkSupport)
+	})
+})
+connection.onDefinition(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, async (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.definition(access.reason)
+		}
+		const { doc, node } = access
+		const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
+			'definition',
+			'declaration',
+			'implementation',
+			'typeDefinition',
+		])
+		return toLS.locationLink(ans, doc, capabilities.textDocument?.definition?.linkSupport)
+	})
+})
+connection.onImplementation(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, async (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.implementation(access.reason)
+		}
+		const { doc, node } = access
+		const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
+			'implementation',
+			'definition',
+		])
+		return toLS.locationLink(ans, doc, capabilities.textDocument?.implementation?.linkSupport)
+	})
+})
+connection.onReferences(({ textDocument: { uri }, position, context: { includeDeclaration } }) => {
+	return service.project.withClientFeatureAccess(uri, async (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.references(access.reason)
+		}
+		const { doc, node } = access
 		const ans = await service.getSymbolLocations(
 			node,
 			doc,
@@ -467,68 +482,81 @@ connection.onReferences(
 			includeDeclaration ? undefined : ['reference'],
 		)
 		return toLS.locationLink(ans, doc, false)
-	},
-)
-connection.onTypeDefinition(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
-		'typeDefinition',
-	])
-	return toLS.locationLink(ans, doc, capabilities.textDocument?.typeDefinition?.linkSupport)
+	})
+})
+connection.onTypeDefinition(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, async (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.typeDefinition(access.reason)
+		}
+		const { doc, node } = access
+		const ans = await service.getSymbolLocations(node, doc, toCore.offset(position, doc), [
+			'typeDefinition',
+		])
+		return toLS.locationLink(ans, doc, capabilities.textDocument?.typeDefinition?.linkSupport)
+	})
 })
 
-connection.onDocumentHighlight(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.documentHighlighting) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const ans = await service.getSymbolLocations(
-		node,
-		doc,
-		toCore.offset(position, doc),
-		undefined,
-		true,
-	)
-	return toLS.documentHighlight(ans)
+connection.onDocumentHighlight(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, async (access) => {
+		if (!service.project.config.env.feature.documentHighlighting) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.documentHighlight(access.reason)
+		}
+		const { doc, node } = access
+		const ans = await service.getSymbolLocations(
+			node,
+			doc,
+			toCore.offset(position, doc),
+			undefined,
+			true,
+		)
+		return toLS.documentHighlight(ans)
+	})
 })
 
-connection.onDocumentSymbol(async ({ textDocument: { uri } }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	return toLS.documentSymbolsFromTables(
-		[service.project.symbols.global, ...core.AstNode.getLocalsToLeaves(node)],
-		doc,
-		capabilities.textDocument?.documentSymbol?.hierarchicalDocumentSymbolSupport,
-		capabilities.textDocument?.documentSymbol?.symbolKind?.valueSet,
-	)
+connection.onDocumentSymbol(({ textDocument: { uri } }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.documentSymbol(access.reason)
+		}
+		const { doc, node } = access
+		// The global table is read from inside the callback, which is the whole point of holding
+		// the lifecycle operation open around it.
+		return toLS.documentSymbolsFromTables(
+			[service.project.symbols.global, ...core.AstNode.getLocalsToLeaves(node)],
+			doc,
+			capabilities.textDocument?.documentSymbol?.hierarchicalDocumentSymbolSupport,
+			capabilities.textDocument?.documentSymbol?.symbolKind?.valueSet,
+		)
+	})
 })
 
-connection.onHover(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.hover) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const ans = service.getHover(node, doc, toCore.offset(position, doc))
-	return ans ? toLS.hover(ans, doc) : undefined
+connection.onHover(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.hover) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.hover(access.reason)
+		}
+		const { doc, node } = access
+		const ans = service.getHover(node, doc, toCore.offset(position, doc))
+		return ans ? toLS.hover(ans, doc) : undefined
+	})
 })
 
-connection.languages.inlayHint.on(async ({ textDocument: { uri }, range }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode) {
-		return []
-	}
-	const { doc, node } = docAndNode
-	const hints = service.getInlayHints(node, doc, toCore.range(range, doc))
-	return toLS.inlayHints(hints, doc)
+connection.languages.inlayHint.on(({ textDocument: { uri }, range }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (access.kind !== 'checked') {
+			return unavailable.inlayHint(access.reason)
+		}
+		const { doc, node } = access
+		const hints = service.getInlayHints(node, doc, toCore.range(range, doc))
+		return toLS.inlayHints(hints, doc)
+	})
 })
 
 let isAnalyzingProject = false
@@ -585,66 +613,87 @@ connection.onRequest('spyglassmc/showCacheRoot', async (): Promise<void> => {
 	return service.project.showCacheRoot()
 })
 
-connection.languages.semanticTokens.on(async ({ textDocument: { uri } }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.semanticColoring) {
-		return { data: [] }
-	}
-	const { doc, node } = docAndNode
-	const tokens = service.colorize(node, doc)
-	return toLS.semanticTokens(
-		tokens,
-		doc,
-		capabilities.textDocument?.semanticTokens?.multilineTokenSupport,
-	)
+connection.languages.semanticTokens.on(({ textDocument: { uri } }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.semanticColoring) {
+			return { data: [] }
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.semanticTokens(access.reason)
+		}
+		const { doc, node } = access
+		const tokens = service.colorize(node, doc)
+		return toLS.semanticTokens(
+			tokens,
+			doc,
+			capabilities.textDocument?.semanticTokens?.multilineTokenSupport,
+		)
+	})
 })
-connection.languages.semanticTokens.onRange(async ({ textDocument: { uri }, range }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.semanticColoring) {
-		return { data: [] }
-	}
-	const { doc, node } = docAndNode
-	const tokens = service.colorize(node, doc, toCore.range(range, doc))
-	return toLS.semanticTokens(
-		tokens,
-		doc,
-		capabilities.textDocument?.semanticTokens?.multilineTokenSupport,
-	)
+connection.languages.semanticTokens.onRange(({ textDocument: { uri }, range }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.semanticColoring) {
+			return { data: [] }
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.semanticTokens(access.reason)
+		}
+		const { doc, node } = access
+		const tokens = service.colorize(node, doc, toCore.range(range, doc))
+		return toLS.semanticTokens(
+			tokens,
+			doc,
+			capabilities.textDocument?.semanticTokens?.multilineTokenSupport,
+		)
+	})
 })
 
-connection.onSignatureHelp(async ({ textDocument: { uri }, position }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.signatures) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	const help = service.getSignatureHelp(node, doc, toCore.offset(position, doc))
-	return toLS.signatureHelp(help)
+connection.onSignatureHelp(({ textDocument: { uri }, position }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.signatures) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.signatureHelp(access.reason)
+		}
+		const { doc, node } = access
+		const help = service.getSignatureHelp(node, doc, toCore.offset(position, doc))
+		return toLS.signatureHelp(help)
+	})
 })
 
 connection.onWorkspaceSymbol(({ query }) => {
-	return toLS.symbolInformationArrayFromTable(
-		service.project.symbols.global,
-		query,
-		capabilities.textDocument?.documentSymbol?.symbolKind?.valueSet,
-	)
+	return service.project.withGlobalSymbolAccess((access) => {
+		if (access.kind !== 'readable') {
+			return unavailable.workspaceSymbol(access.reason)
+		}
+		return toLS.symbolInformationArrayFromTable(
+			access.symbols,
+			query,
+			capabilities.textDocument?.documentSymbol?.symbolKind?.valueSet,
+		)
+	})
 })
 
-connection.onDocumentFormatting(async ({ textDocument: { uri }, options }) => {
-	const docAndNode = await service.project.ensureClientManagedChecked(uri)
-	if (!docAndNode || !service.project.config.env.feature.formatting) {
-		return undefined
-	}
-	const { doc, node } = docAndNode
-	if (node.parserErrors.length !== 0) {
-		// Don't format if there are errors.
-		return undefined
-	}
-	let text = service.format(node, doc, options.tabSize, options.insertSpaces)
-	if (options.insertFinalNewline && text.charAt(text.length - 1) !== '\n') {
-		text += '\n'
-	}
-	return [toLS.textEdit(node.range, text, doc)]
+connection.onDocumentFormatting(({ textDocument: { uri }, options }) => {
+	return service.project.withClientFeatureAccess(uri, (access) => {
+		if (!service.project.config.env.feature.formatting) {
+			return undefined
+		}
+		if (access.kind !== 'checked') {
+			return unavailable.documentFormatting(access.reason)
+		}
+		const { doc, node } = access
+		if (node.parserErrors.length !== 0) {
+			// Don't format if there are errors.
+			return undefined
+		}
+		let text = service.format(node, doc, options.tabSize, options.insertSpaces)
+		if (options.insertFinalNewline && text.charAt(text.length - 1) !== '\n') {
+			text += '\n'
+		}
+		return [toLS.textEdit(node.range, text, doc)]
+	})
 })
 
 connection.onDidChangeConfiguration(updateEditorConfiguration)
