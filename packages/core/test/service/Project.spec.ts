@@ -4,6 +4,7 @@ import type fsp from 'node:fs/promises'
 import { describe, it } from 'node:test'
 import { gunzipSync, gzipSync } from 'node:zlib'
 import type {
+	ClientFeatureAccess,
 	Externals,
 	FileWatcher,
 	FileWatcherEventMap,
@@ -982,6 +983,335 @@ describe('Project', () => {
 					'the editor path still publishes the document it bound on the way',
 				)
 			} finally {
+				await project.close()
+			}
+		})
+	})
+
+	describe('withClientFeatureAccess()', () => {
+		it('Should refuse a request made while the `prepare` pass is binding', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const releaseBind = Promise.withResolvers<void>()
+			const analysisBindStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const checkedUris: string[] = []
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerBinder<LiteralNode>(
+					'literal',
+					AsyncBinder.create(async () => {
+						if (shouldBlock) {
+							shouldBlock = false
+							analysisBindStarted.resolve()
+							await releaseBind.promise
+						}
+					}),
+				)
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisBindStarted.promise
+
+				checkedUris.length = 0
+				const published: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					published.push(uri)
+				})
+
+				// Not awaited: a request that queues behind the analysis is answered only once the
+				// whole corpus has been walked, so awaiting it here would hang the suite instead of
+				// failing the assertion below.
+				let answer: string | undefined
+				const request = project
+					.withClientFeatureAccess(
+						uriA,
+						(access) => access.kind === 'checked' ? 'checked' : access.reason,
+					)
+					.then((result) => {
+						answer = result
+					})
+				await runPendingTurns()
+
+				assert.equal(
+					answer,
+					'analysis-running',
+					'the request did not settle while the `prepare` pass held a bind',
+				)
+				assert.deepEqual(checkedUris, [], 'the request checked a document mid-analysis')
+				assert.deepEqual(published, [], 'the request published mid-analysis')
+
+				releaseBind.resolve()
+				await request
+				await analysis
+			} finally {
+				releaseBind.resolve()
+				await project.close()
+			}
+		})
+
+		it('Should leave a queued lint undrained when it refuses a request', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			// Outside every project root and not watched, so the initial scan never bound it and
+			// `ensureBindingStarted` is what runs its clearer: a bind that propagates and that
+			// nothing on its path flushes afterwards, which is how `b` ends up queued and stays so.
+			const referencedUri = 'file:///referenced/module.spyglasstest'
+			const releaseCheck = Promise.withResolvers<void>()
+			const analysisCheckStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const checkedUris: string[] = []
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+				'/referenced/module.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerUriSymbolClearer((uri, ctx) => {
+					if (uri === referencedUri) {
+						ctx.queueLint?.(uriB)
+					}
+				})
+				meta.registerChecker<LiteralNode>('literal', async (node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					ctx.err.report(TestCheckerMessage, node)
+					if (shouldBlock) {
+						shouldBlock = false
+						analysisCheckStarted.resolve()
+						await releaseCheck.promise
+					}
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				await project.ensureBindingStarted(referencedUri)
+
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisCheckStarted.promise
+
+				checkedUris.length = 0
+				const published: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					published.push(uri)
+				})
+
+				let answer: string | undefined
+				const request = project
+					.withClientFeatureAccess(
+						uriA,
+						(access) => access.kind === 'checked' ? 'checked' : access.reason,
+					)
+					.then((result) => {
+						answer = result
+					})
+				await runPendingTurns()
+
+				assert.equal(
+					answer,
+					'analysis-running',
+					'the request did not settle while the `analyze` pass held a check',
+				)
+				// The drain reads, binds, checks and republishes every queued document. Started
+				// from a feature request it does so on top of a run that is still publishing, and
+				// on a symbol table that run is still walking.
+				assert.deepEqual(checkedUris, [], 'the request ran checks mid-analysis')
+				assert.deepEqual(published, [], 'the request drained the queued lint mid-analysis')
+
+				releaseCheck.resolve()
+				await request
+				await analysis
+			} finally {
+				releaseCheck.resolve()
+				await project.close()
+			}
+		})
+
+		it('Should leave the analysis it refused running', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const releaseCheck = Promise.withResolvers<void>()
+			const analysisCheckStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', async (node, ctx) => {
+					ctx.err.report(TestCheckerMessage, node)
+					if (shouldBlock) {
+						shouldBlock = false
+						analysisCheckStarted.resolve()
+						await releaseCheck.promise
+					}
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisCheckStarted.promise
+
+				await project.withClientFeatureAccess(uriA, (access) => access.kind)
+
+				releaseCheck.resolve()
+				const result = await analysis
+
+				// A feature request arrives on every keystroke. Cancelling for one would mean a run
+				// that never finishes as long as the user has the editor open.
+				assert.deepEqual(result, { analyzedFiles: 2, cancelled: false, totalFiles: 2 })
+			} finally {
+				releaseCheck.resolve()
+				await project.close()
+			}
+		})
+
+		it('Should hold an analysis until the request it raced has finished', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const releaseCallback = Promise.withResolvers<void>()
+			const callbackStarted = Promise.withResolvers<void>()
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+
+				const request = project.withClientFeatureAccess(uriA, async (access) => {
+					callbackStarted.resolve()
+					await releaseCallback.promise
+					return access.kind
+				})
+				await callbackStarted.promise
+
+				// The race in the other direction: the callback is reading the state an analysis
+				// starting now would rebuild underneath it.
+				const progress: string[] = []
+				const analysis = project.analyzeProject({
+					onProgress: (done, _total, phase) => {
+						progress.push(`${phase} ${done}`)
+					},
+				})
+				await runPendingTurns()
+				assert.deepEqual(
+					progress,
+					[],
+					'the analysis started binding while the callback was still reading',
+				)
+
+				releaseCallback.resolve()
+				assert.equal(await request, 'checked')
+				const result = await analysis
+
+				assert.deepEqual(result, { analyzedFiles: 2, cancelled: false, totalFiles: 2 })
+				assert.ok(progress.length > 0, 'the analysis never ran once the callback finished')
+			} finally {
+				releaseCallback.resolve()
+				await project.close()
+			}
+		})
+
+		it('Should bind, check and publish for a request outside an analysis', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const checkedUris: string[] = []
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				const clientManaged = project.getClientManaged(uriA)
+				assert.ok(clientManaged)
+				// Opening the document already produced checker results, and every stage returns
+				// early once its own results are on the node. Dropping them is what leaves a check
+				// for the request below to run.
+				delete clientManaged.node.checkerErrors
+				delete clientManaged.node.linterErrors
+				checkedUris.length = 0
+				const published: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					published.push(uri)
+				})
+
+				let access: ClientFeatureAccess | undefined
+				const kind = await project.withClientFeatureAccess(uriA, (result) => {
+					access = result
+					return result.kind
+				})
+
+				assert.equal(kind, 'checked')
+				assert.equal(access?.kind === 'checked' ? access.doc : undefined, clientManaged.doc)
+				// Other code paths hold this very object, so a copy of it would leave them looking
+				// at a node the request never updated.
+				assert.equal(access?.kind === 'checked' ? access.node : undefined, clientManaged.node)
+				assert.deepEqual(checkedUris, [uriA])
+				assert.deepEqual(published, [uriA])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should gate a document-less symbol read on the same analysis', async () => {
+			const releaseCheck = Promise.withResolvers<void>()
+			const analysisCheckStarted = Promise.withResolvers<void>()
+			let shouldBlock = false
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', async (node, ctx) => {
+					ctx.err.report(TestCheckerMessage, node)
+					if (shouldBlock) {
+						shouldBlock = false
+						analysisCheckStarted.resolve()
+						await releaseCheck.promise
+					}
+				})
+			})
+			try {
+				shouldBlock = true
+				const analysis = project.analyzeProject()
+				await analysisCheckStarted.promise
+
+				// A workspace symbol query names no document, so it cannot go through the document
+				// gate — and it reads the one table the two-pass split exists to protect.
+				let answer: string | undefined
+				const request = project
+					.withGlobalSymbolAccess(
+						(access) => access.kind === 'readable' ? 'readable' : access.reason,
+					)
+					.then((result) => {
+						answer = result
+					})
+				await runPendingTurns()
+				assert.equal(
+					answer,
+					'analysis-running',
+					'the symbol read did not settle while the analysis held a check',
+				)
+
+				releaseCheck.resolve()
+				await request
+				await analysis
+
+				let sawLiveTable = false
+				const kind = await project.withGlobalSymbolAccess((access) => {
+					sawLiveTable = access.kind === 'readable'
+						&& access.symbols === project.symbols.global
+					return access.kind === 'readable' ? 'readable' : access.reason
+				})
+
+				assert.equal(kind, 'readable')
+				assert.ok(sawLiveTable, 'the read was handed something other than the live table')
+			} finally {
+				releaseCheck.resolve()
 				await project.close()
 			}
 		})

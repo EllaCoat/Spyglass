@@ -18,6 +18,7 @@ import { file } from '../parser/index.js'
 import { traversePreOrder } from '../processor/index.js'
 import type { PosRangeLanguageError } from '../source/index.js'
 import { LanguageError, Range, Source } from '../source/index.js'
+import type { SymbolTable } from '../symbol/index.js'
 import { SymbolUtil } from '../symbol/index.js'
 import type { PreparedCacheContext } from './CacheService.js'
 import { CacheService } from './CacheService.js'
@@ -116,6 +117,39 @@ export interface DocAndNode {
 	doc: TextDocument
 	node: FileNode<AstNode>
 }
+
+/**
+ * Why a language feature request cannot be served against the project state right now.
+ *
+ * - `analysis-running`: {@link Project.analyzeProject} is walking the corpus. Its two passes only
+ *   hold their barrier — bind every file, then check and publish every file — while nothing else
+ *   binds, checks or publishes in between, and the symbol table it reads is incomplete until the
+ *   first pass ends.
+ * - `project-not-ready`: no checked result exists for what was asked. The initial scan has not
+ *   finished, or the language client does not manage the requested document.
+ */
+export type FeatureUnavailableReason = 'analysis-running' | 'project-not-ready'
+
+/**
+ * What a language feature may read for one document. See {@link Project.withClientFeatureAccess}.
+ *
+ * The `unavailable` variant carries no document, no node and no symbols on purpose: a feature that
+ * cannot be served is left without a handle on the state an analysis is rebuilding, instead of
+ * being handed one along with a convention to respect.
+ */
+export type ClientFeatureAccess =
+	| { kind: 'checked'; doc: TextDocument; node: FileNode<AstNode> }
+	| { kind: 'unavailable'; reason: FeatureUnavailableReason }
+
+/**
+ * What a language feature may read from the global symbol table. See
+ * {@link Project.withGlobalSymbolAccess}.
+ *
+ * Same shape and same rule as {@link ClientFeatureAccess}, for the requests that name no document.
+ */
+export type GlobalSymbolAccess =
+	| { kind: 'readable'; symbols: SymbolTable }
+	| { kind: 'unavailable'; reason: FeatureUnavailableReason }
 
 interface DocumentEvent extends DocAndNode {}
 interface DocumentErrorEvent {
@@ -2501,6 +2535,14 @@ export class Project extends EventDispatcher<{
 		await this.flushQueuedLints()
 	}
 
+	/**
+	 * @deprecated Use {@link withClientFeatureAccess}. This one binds, checks and publishes without
+	 * entering the lifecycle queue and without looking at {@link analyzeProject}, so a single
+	 * feature request that arrives mid-analysis breaks that method's two-pass barrier: it publishes
+	 * out of a symbol table the first pass has not finished filling, drains the queued lints the
+	 * passes deliberately leave alone, and mutates the table the passes are walking. Kept while its
+	 * callers migrate.
+	 */
 	@SingletonPromise()
 	async ensureClientManagedChecked(uri: string): Promise<DocAndNode | undefined> {
 		uri = this.normalizeUri(uri)
@@ -2515,6 +2557,87 @@ export class Project extends EventDispatcher<{
 			return result
 		}
 		return undefined
+	}
+
+	/**
+	 * Run `callback` with whatever a language feature is allowed to read for `uri` at this moment,
+	 * and hold the project still for as long as it runs.
+	 *
+	 * With an analysis in flight the callback is handed `analysis-running` right away, from outside
+	 * the lifecycle queue. Queueing the request instead would be correct and useless: the queue does
+	 * not run again until the analysis has walked the whole corpus, which is minutes on a real
+	 * project, and a hover that answers after four minutes is a hover that never answered. Nothing
+	 * here cancels the analysis either — a feature request arrives on every keystroke, and a run
+	 * that restarts on each of them never finishes at all.
+	 *
+	 * Without one, the bind, the check, the publish and the callback all run inside a single
+	 * lifecycle operation. The callback is inside it because it is the half that reads: an analysis
+	 * registering itself while the callback walks the symbol table is the same race in the other
+	 * direction, and the queue is what orders the two.
+	 *
+	 * The analysis is therefore looked for twice, once before entering the queue and once from
+	 * inside it. Only the second check is authoritative: an analysis registers itself through this
+	 * same queue, so one that started between the first check and the enqueue is already recorded by
+	 * the time the operation runs. The first check exists only to keep a request that is going to be
+	 * refused anyway out of a queue it would sit in for minutes.
+	 *
+	 * The callback must not start another lifecycle operation — a reset, a config update, an editor
+	 * notification — since it already occupies the one it would wait for.
+	 */
+	async withClientFeatureAccess<T>(
+		uri: string,
+		callback: (access: ClientFeatureAccess) => T | Promise<T>,
+	): Promise<T> {
+		if (this.#activeAnalysis !== undefined) {
+			return await callback({ kind: 'unavailable', reason: 'analysis-running' })
+		}
+		return await this.enqueueLifecycle(async () => {
+			if (this.#activeAnalysis !== undefined) {
+				return await callback({ kind: 'unavailable', reason: 'analysis-running' })
+			}
+			// A URI the client does not manage shares the `project-not-ready` reason with a scan
+			// that has not finished: neither can produce a checked document, and the difference is
+			// not one a feature handler acts on.
+			const result = this.#isReady
+				? this.#clientManagedDocAndNodes.get(this.normalizeUri(uri))
+				: undefined
+			if (!result) {
+				return await callback({ kind: 'unavailable', reason: 'project-not-ready' })
+			}
+			await this.bind(result.doc, result.node)
+			await this.check(result.doc, result.node)
+			this.emit('documentUpdated', result)
+			return await callback({ kind: 'checked', doc: result.doc, node: result.node })
+		})
+	}
+
+	/**
+	 * Run `callback` with the global symbol table, under the same rules as
+	 * {@link withClientFeatureAccess}: refused outright while an analysis runs, held inside one
+	 * lifecycle operation otherwise.
+	 *
+	 * This is the variant for the requests that name no document — a workspace symbol query is the
+	 * one in the language server — and it reads the very same table those rules exist to protect,
+	 * mid-rebuild for the whole of an analysis. The table is passed as it is rather than copied: a
+	 * snapshot of it costs time proportional to the corpus on every request, which is what the
+	 * lifecycle operation around the callback makes unnecessary. The callback must therefore read it
+	 * and be done with it, not keep the reference.
+	 */
+	async withGlobalSymbolAccess<T>(
+		callback: (access: GlobalSymbolAccess) => T | Promise<T>,
+	): Promise<T> {
+		if (this.#activeAnalysis !== undefined) {
+			return await callback({ kind: 'unavailable', reason: 'analysis-running' })
+		}
+		return await this.enqueueLifecycle(async () => {
+			if (this.#activeAnalysis !== undefined) {
+				return await callback({ kind: 'unavailable', reason: 'analysis-running' })
+			}
+			if (!this.#isReady) {
+				return await callback({ kind: 'unavailable', reason: 'project-not-ready' })
+			}
+			return await callback({ kind: 'readable', symbols: this.symbols.global })
+		})
 	}
 
 	getClientManaged(uri: string): DocAndNode | undefined {
