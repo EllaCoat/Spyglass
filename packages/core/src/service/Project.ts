@@ -278,7 +278,10 @@ export class Project extends EventDispatcher<{
 	/**
 	 * URI of files whose last check threw. Kept next to the other per-URI project state rather
 	 * than in `CacheService` so that a cache reset does not silently drop it: the failure is a
-	 * fact about this session's processing, not about the cached content.
+	 * fact about this session's processing, not about the cached content. `CacheService` reads it
+	 * through {@link getFailedCheckUris} to persist it and to keep the incomplete diagnostics of
+	 * those URIs out of the cache file, and refills it through {@link restoreFailedCheckUris} when
+	 * a cache is loaded.
 	 */
 	readonly #failedCheckUris = new Set<string>()
 	readonly #queuedLintUris = new Set<string>()
@@ -384,6 +387,30 @@ export class Project extends EventDispatcher<{
 			`[Project#getTrackedFiles] Listed ${supportedFiles.length} supported files`,
 		)
 		return supportedFiles
+	}
+
+	/**
+	 * A snapshot of the URIs whose last check threw. `CacheService` persists it and consults it
+	 * when classifying a cached file, which is what turns the failure into one the next session
+	 * still knows about. A snapshot rather than the live set: a save reads this once and then
+	 * works asynchronously, and both the list it writes and the diagnostics it leaves out have to
+	 * come from the same reading.
+	 */
+	getFailedCheckUris(): ReadonlySet<string> {
+		return new Set(this.#failedCheckUris)
+	}
+
+	/**
+	 * Replace the failed-check ledger with what a loaded cache carried, or with nothing when the
+	 * cache was dropped. The counterpart of {@link getFailedCheckUris} and the only way anything
+	 * outside this class writes the ledger: recording a failure stays with the check stage, which
+	 * is the only place that knows one happened.
+	 */
+	restoreFailedCheckUris(uris: Iterable<string>): void {
+		this.#failedCheckUris.clear()
+		for (const uri of uris) {
+			this.#failedCheckUris.add(uri)
+		}
 	}
 
 	constructor(
@@ -2126,11 +2153,12 @@ export class Project extends EventDispatcher<{
 							// is not recorded: `analyzedFiles` would count a file the checker
 							// never finished, and the save would skip reading a file whose
 							// diagnostics are incomplete. Left out, it is verified against disk
-							// like any file this run did not reach. That verification is all this
-							// buys: the hashes recorded while publishing still match the file, so
-							// the cache keeps the partial diagnostics and the next start does not
-							// recheck it. Making a failed checker retry needs the cache to
-							// represent the failure, which it has no way to express today.
+							// like any file this run did not reach. What keeps those diagnostics
+							// from becoming its permanent result is the failure marker
+							// `checkWithoutLintFlush` recorded for it: the save leaves them out of
+							// the cache file and names the URI in `CacheFile#failedChecks`, so the
+							// next session sends the file back through processing instead of
+							// restoring a subset of its diagnostics.
 							if (checked) {
 								analyzedUris.add(uri)
 							}

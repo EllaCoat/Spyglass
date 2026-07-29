@@ -2,6 +2,7 @@ import { memfs } from 'memfs'
 import assert from 'node:assert/strict'
 import type fsp from 'node:fs/promises'
 import { describe, it } from 'node:test'
+import { gunzipSync, gzipSync } from 'node:zlib'
 import type {
 	Externals,
 	FileWatcher,
@@ -87,16 +88,33 @@ interface SetupResult {
 	watcher: TestFileWatcher
 }
 
-async function setup(
-	files: Record<string, string>,
+/**
+ * Build a project over the given file system without starting it, so that a test can drive `init`
+ * and `ready` itself. Passing the file system of an earlier session is how a warm start is set up:
+ * the second project finds the cache file the first one saved.
+ */
+function createSetup(
+	fs: ReturnType<typeof memfs>['fs'],
 	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
 	extraInitializer?: ProjectInitializer,
-): Promise<SetupResult> {
-	const { fs } = memfs(files, '/')
+): SetupResult {
+	// memfs answers a read with a pooled `Buffer`, whose `.buffer` is the whole 8 KiB pool rather
+	// than the file. Raw-byte checksums are computed over that `.buffer`, so under memfs they
+	// depend on unrelated pool contents and never reproduce, which would leave every cached file
+	// looking changed on a second start. Node's own `readFile` answers with an exact-size buffer;
+	// copying into one here is what makes this harness behave like the file system it stands in
+	// for.
+	const nodeFsp = {
+		...fs.promises,
+		readFile: async (...args: Parameters<typeof fsp.readFile>) => {
+			const content = await (fs.promises.readFile as typeof fsp.readFile)(...args)
+			return typeof content === 'string' ? content : new Uint8Array(content)
+		},
+	} as unknown as typeof fsp
 	const externals = getNodeJsExternals({
 		cacheRoot: CacheRoot,
 		logger: Logger.noop(),
-		nodeFsp: fs.promises as unknown as typeof fsp,
+		nodeFsp,
 	})
 
 	const project = new Project({
@@ -117,10 +135,66 @@ async function setup(
 	})
 
 	const watcher = new TestFileWatcher(externals, [ProjectRoot])
-	await project.init()
-	await project.ready({ projectRootsWatcher: watcher })
 
 	return { errors, fs, outcomes, project, watcher }
+}
+
+async function setup(
+	files: Record<string, string>,
+	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
+	extraInitializer?: ProjectInitializer,
+): Promise<SetupResult> {
+	const { fs } = memfs(files, '/')
+	const result = createSetup(fs, extraInitializer)
+	await result.project.init()
+	await result.project.ready({ projectRootsWatcher: result.watcher })
+
+	return result
+}
+
+/**
+ * Register a checker that throws for the URIs `shouldThrow` selects and reports
+ * {@link TestCheckerMessage} for the rest. The failure has to be injected like this: no file in a
+ * real corpus makes a checker throw.
+ */
+function registerThrowingChecker(
+	meta: MetaRegistry,
+	shouldThrow: (uri: string) => boolean,
+): void {
+	meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+		if (shouldThrow(ctx.doc.uri)) {
+			throw new Error('Test checker failure')
+		}
+		ctx.err.report(TestCheckerMessage, node)
+	})
+}
+
+/** The parts of a saved cache file the tests below inspect. */
+interface SerializedCache {
+	checksums: {
+		fileContents: Record<string, string>
+		files: Record<string, string>
+	}
+	errors: Record<string, unknown[]>
+	failedChecks?: string[]
+	[key: string]: unknown
+}
+
+function getCacheFilePath(fs: ReturnType<typeof memfs>['fs']): string {
+	const directory = '/cache/symbols'
+	const entries = (fs.readdirSync(directory) as string[])
+		.filter((entry) => entry.endsWith('.json.gz'))
+	assert.equal(entries.length, 1, 'expected exactly one saved cache file')
+	return `${directory}/${entries[0]}`
+}
+
+function readCacheFile(fs: ReturnType<typeof memfs>['fs']): SerializedCache {
+	const content = gunzipSync(fs.readFileSync(getCacheFilePath(fs)) as Buffer)
+	return JSON.parse(content.toString()) as SerializedCache
+}
+
+function writeCacheFile(fs: ReturnType<typeof memfs>['fs'], cache: SerializedCache): void {
+	fs.writeFileSync(getCacheFilePath(fs), gzipSync(JSON.stringify(cache)))
 }
 
 /**
@@ -866,23 +940,6 @@ describe('Project', () => {
 	})
 
 	describe('check completion state', () => {
-		/**
-		 * Register a checker that throws for the URIs `shouldThrow` selects and reports
-		 * {@link TestCheckerMessage} for the rest. The failure has to be injected like this: no
-		 * file in a real corpus makes a checker throw.
-		 */
-		const registerThrowingChecker = (
-			meta: MetaRegistry,
-			shouldThrow: (uri: string) => boolean,
-		): void => {
-			meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
-				if (shouldThrow(ctx.doc.uri)) {
-					throw new Error('Test checker failure')
-				}
-				ctx.err.report(TestCheckerMessage, node)
-			})
-		}
-
 		it('Should mark a document whose editor check threw', async () => {
 			const uri = `${ProjectRoot}a.spyglasstest`
 			const { outcomes, project } = await setup(
@@ -988,35 +1045,186 @@ describe('Project', () => {
 		})
 
 		it('Should restore the failure state a rolled-back rebuild changed', async () => {
-			const uri = `${ProjectRoot}a.spyglasstest`
-			let shouldThrow = false
-			const { outcomes, project } = await setup(
-				{ '/root/a.spyglasstest': 'foo' },
-				({ meta }) => registerThrowingChecker(meta, () => shouldThrow),
-			)
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			// `a` starts out failing and `b` starts out passing; the rebuild below inverts both,
+			// so the rollback has to undo a removal and an addition at once.
+			let failingUri = uriA
+			const { outcomes, project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => registerThrowingChecker(meta, (uri) => uri === failingUri))
 			try {
-				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
-				assert.equal(outcomes.get(uri), 'complete')
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				await project.onDidOpen(uriB, 'spyglasstest', 1, 'foo')
+				assert.equal(outcomes.get(uriA), 'failed')
+				assert.equal(outcomes.get(uriB), 'complete')
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uriA]))
 
 				// A rebuild rechecks the open documents with processor errors propagating, so a
 				// checker that throws there fails the whole rebuild and rolls it back.
-				shouldThrow = true
+				failingUri = uriB
 				await assert.rejects(project.reset())
 
-				// Everything the failed rebuild recorded is gone again, including the failure it
-				// recorded for this document while running. The ledger it recorded that in has no
-				// reader yet, so what the rollback restored is asserted through the node that
-				// travels with it.
-				shouldThrow = false
-				const node = project.getClientManaged(uri)?.node
-				assert.equal(node?.checkerFailed, undefined)
-				assert.deepEqual(node?.checkerErrors?.map((e) => e.message), [TestCheckerMessage])
-
-				const result = await project.analyzeProject()
-				assert.deepEqual(result, { analyzedFiles: 1, cancelled: false, totalFiles: 1 })
-				assert.equal(outcomes.get(uri), 'complete')
+				// Both directions: the entry the rebuild's successful check removed is back, and
+				// the one its failing check added is gone.
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uriA]))
+				assert.equal(project.getClientManaged(uriB)?.node.checkerFailed, undefined)
 			} finally {
 				await project.close()
+			}
+		})
+	})
+
+	describe('failed check persistence', () => {
+		const uriA = `${ProjectRoot}a.spyglasstest`
+		const uriB = `${ProjectRoot}b.spyglasstest`
+		const files = { '/root/a.spyglasstest': 'foo', '/root/b.spyglasstest': 'foo' }
+
+		/** Analyze a two-file project whose checker throws for `b`, then save and close. */
+		async function analyzeAndClose(shouldThrow: () => boolean): Promise<SetupResult> {
+			const result = await setup(
+				files,
+				({ meta }) => registerThrowingChecker(meta, (uri) => shouldThrow() && uri === uriB),
+			)
+			try {
+				await result.project.analyzeProject()
+			} finally {
+				// Saves the cache, which is what every warm start below reads.
+				await result.project.close()
+			}
+			return result
+		}
+
+		it('Should keep the diagnostics of a file whose checker threw out of the cache', async () => {
+			const { fs } = await analyzeAndClose(() => true)
+
+			const cache = readCacheFile(fs)
+			assert.deepEqual(cache.failedChecks, [uriB])
+			assert.deepEqual(
+				Object.keys(cache.errors),
+				[uriA],
+				'the partial diagnostics of the failed file must not be persisted',
+			)
+			// The hashes describe the content, which the failure says nothing about. They are also
+			// what keeps the file recognizable as unchanged, so that the retry stays a retry
+			// rather than a file the next session treats as new.
+			assert.ok(cache.checksums.fileContents[uriB])
+			assert.ok(cache.checksums.files[uriB])
+		})
+
+		it('Should keep saving with a failed check on record', async () => {
+			const { fs, project } = await setup(
+				files,
+				({ meta }) => registerThrowingChecker(meta, (uri) => uri === uriB),
+			)
+			try {
+				await project.analyzeProject()
+
+				// `createVerifiedChecksums` refuses to publish a cache in which a tracked file has
+				// an error entry but no recorded state hash, and returning `false` here is how
+				// that refusal shows. Excluding the diagnostics of a failed check while keeping
+				// its checksums stays clear of that condition; dropping the checksums instead
+				// would walk straight into it, and every save from then on would return `false`.
+				assert.equal(await project.cacheService.save(), true)
+				assert.equal(await project.cacheService.save(), true)
+
+				const cache = readCacheFile(fs)
+				for (const uri of cache.failedChecks ?? []) {
+					assert.ok(
+						cache.checksums.fileContents[uri],
+						`${uri} is on record as failed without a state hash`,
+					)
+				}
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should send a file whose checker threw back through processing on the next start', async () => {
+			const first = await analyzeAndClose(() => true)
+			// The retry itself belongs to a later stage; this session only has to prove the file
+			// is no longer treated as settled.
+			const second = createSetup(first.fs)
+			try {
+				await second.project.init()
+
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set([uriB]))
+				assert.ok(second.project.cacheService.errors[uriA])
+				assert.equal(
+					second.project.cacheService.errors[uriB],
+					undefined,
+					'nothing may restore the diagnostics of a check that threw',
+				)
+
+				let changedFiles: string[] | undefined
+				let unchangedFiles: string[] | undefined
+				const cacheService = second.project.cacheService
+				const validate = cacheService.validate.bind(cacheService)
+				cacheService.validate = async () => {
+					const result = await validate()
+					changedFiles = result.changedFiles
+					unchangedFiles = result.unchangedFiles
+					return result
+				}
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+
+				assert.deepEqual(changedFiles, [uriB])
+				assert.deepEqual(unchangedFiles, [uriA])
+			} finally {
+				await second.project.close()
+			}
+		})
+
+		it('Should treat a cache without a failed check list as having none', async () => {
+			const first = await analyzeAndClose(() => true)
+			const cache = readCacheFile(first.fs)
+			assert.deepEqual(cache.failedChecks, [uriB])
+			// What a cache saved before the field existed looks like.
+			delete cache.failedChecks
+			writeCacheFile(first.fs, cache)
+
+			const second = createSetup(first.fs)
+			try {
+				await second.project.init()
+
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set())
+
+				let unchangedFiles: string[] | undefined
+				const cacheService = second.project.cacheService
+				const validate = cacheService.validate.bind(cacheService)
+				cacheService.validate = async () => {
+					const result = await validate()
+					unchangedFiles = result.unchangedFiles
+					return result
+				}
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+
+				assert.deepEqual(unchangedFiles?.sort(), [uriA, uriB])
+			} finally {
+				await second.project.close()
+			}
+		})
+
+		it('Should accept a cache carrying a field it does not know', async () => {
+			// The forward-compatibility half of the same property: `failedChecks` is an unknown
+			// field to a build that predates it, and the schema check accepts a cache regardless
+			// of what else it carries — so no version bump is needed in either direction.
+			const first = await analyzeAndClose(() => false)
+			const cache = readCacheFile(first.fs)
+			cache['fieldFromALaterVersion'] = { anything: true }
+			writeCacheFile(first.fs, cache)
+
+			const second = createSetup(first.fs)
+			try {
+				await second.project.init()
+
+				assert.ok(
+					second.project.cacheService.errors[uriB],
+					'a cache with an unknown field was rejected instead of adopted',
+				)
+			} finally {
+				await second.project.close()
 			}
 		})
 	})
