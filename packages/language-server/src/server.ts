@@ -558,8 +558,11 @@ connection.onRequest(
 		let lastPercentage = 0
 		try {
 			return await service.project.analyzeProject({
-				onProgress: (done, total) => {
-					const percentage = Math.floor(done / total * 100)
+				onProgress: (done, total, phase) => {
+					// Both phases walk the whole file list, so each of them owns half of the
+					// bar instead of running it from 0 to 100 twice.
+					const percentage = (phase === 'prepare' ? 0 : 50)
+						+ Math.floor(done / total * 50)
 					if (percentage > lastPercentage) {
 						lastPercentage = percentage
 						reporter?.report(percentage, `${done}/${total}`)

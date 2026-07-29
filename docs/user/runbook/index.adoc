@@ -32,6 +32,14 @@ or corrupted and cause issues. To do a quick cache reset:
   kbd:[Cmd+Shift+P] on macOS).
 . Type or paste in `spyglassmc.resetProjectCache` and press kbd:[Enter].
 . Restart the editor.
+. Open the Command Palette again, type or paste in `spyglassmc.analyzeProject`,
+  and press kbd:[Enter].
+
+IMPORTANT: The last step is not optional if you care about the problems of the files that are not
+open in the editor. A cache reset only rechecks the files that are open, so the problems of every
+other file disappear from the diagnostics panel until `spyglassmc.analyzeProject` recomputes them.
+The notification shown when the reset finishes offers the same command as an action; this step is
+how you get those problems back if you dismissed it.
 
 If that did not work, you may also try a full cache reset:
 
@@ -50,6 +58,8 @@ If that did not work, you may also try a full cache reset:
    after you've deleted them.
 . Delete all contents inside the cache folder.
 . Restart the editor.
+. Open the Command Palette, type or paste in `spyglassmc.analyzeProject`, and press kbd:[Enter].
+  As above, this is what restores the problems of the files that are not open in the editor.
 
 [#custom-commands]
 == Support Modded Commands

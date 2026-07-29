@@ -228,6 +228,8 @@
   "quote": "a quote (“'” or “\"”)",
   "quote_prefer_double": "Double quote (“\"”) is preferable here",
   "quote_prefer_single": "Single quote (“'”) is preferable here",
+  "reset-project-cache.analyze-project": "Analyze Project",
+  "reset-project-cache.done": "Project cache reset. Only the files that are open in the editor were checked; run Analyze Project to see the problems of the whole project.",
   "resource-location": "a resource location",
   "score-holder": "a score holder",
   "scoreholder-not-following-convention": "Invalid score_holder %0% which doesn't follow %1% convention",

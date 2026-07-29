@@ -1523,13 +1523,13 @@ describe('IMP-Doc canonical owner redirect inside the implicit lint drain', () =
 	})
 })
 
-describe('IMP-Doc reset full-pass diagnostic preservation', () => {
-	it('checks an unopened caller on reset and keeps its diagnostics through an implicit lint', async () => {
+describe('IMP-Doc project analysis diagnostic preservation', () => {
+	it('checks an unopened caller on analysis and keeps its diagnostics through an implicit lint', async () => {
 		const projectRoot = await createCanonicalTempDir(
-			join(tmpdir(), 'spyglass-imp-doc-reset-full-pass-project-'),
+			join(tmpdir(), 'spyglass-imp-doc-analysis-project-'),
 		)
 		const cacheDir = await createCanonicalTempDir(
-			join(tmpdir(), 'spyglass-imp-doc-reset-full-pass-cache-'),
+			join(tmpdir(), 'spyglass-imp-doc-analysis-cache-'),
 		)
 		let first: core.Project | undefined
 		let second: core.Project | undefined
@@ -1569,20 +1569,23 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 				'the initial bind-only scan must not publish linter diagnostics',
 			)
 
-			await first.reset()
-			const resetErrors = first.cacheService.errors[caller.uri] ?? []
+			// A reset no longer checks closed documents, so the whole-corpus pass is what
+			// produces this caller's diagnostics.
+			const result = await first.analyzeProject()
+			assert.equal(result.cancelled, false)
+			const analyzedErrors = first.cacheService.errors[caller.uri] ?? []
 			assert.ok(
-				resetErrors.some(error => error.message.includes('impDocPrivate')),
-				'the reset full pass must publish the unopened caller linter diagnostic',
+				analyzedErrors.some(error => error.message.includes('impDocPrivate')),
+				'the analysis must publish the unopened caller linter diagnostic',
 			)
 			assert.ok(
-				resetErrors.some(error => /Expected function ID/.test(error.message)),
-				'the reset full pass must publish the unopened caller checker diagnostic',
+				analyzedErrors.some(error => /Expected function ID/.test(error.message)),
+				'the analysis must publish the unopened caller checker diagnostic',
 			)
 			await first.close()
 			first = undefined
 
-			// A warm start restores the reset diagnostics without stage provenance.
+			// A warm start restores the analyzed diagnostics without stage provenance.
 			// Opening the declaring file then queues its unopened caller through the
 			// symbol clearer, forcing the implicit lint drain to reproduce the full set.
 			second = createRuntimeProject(cacheDir, projectRootUri)
@@ -1591,22 +1594,22 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 			const restored = second.cacheService.errors[caller.uri] ?? []
 			assert.ok(
 				restored.some(error => error.message.includes('impDocPrivate')),
-				'the warm start must restore the reset linter diagnostic before any implicit lint',
+				'the warm start must restore the analyzed linter diagnostic before any implicit lint',
 			)
 			assert.ok(
 				restored.some(error => /Expected function ID/.test(error.message)),
-				'the warm start must restore the reset checker diagnostic before any implicit lint',
+				'the warm start must restore the analyzed checker diagnostic before any implicit lint',
 			)
 			await second.onDidOpen(declaration.uri, 'mcfunction', 1, declarationContent)
 			assert.equal(second.getClientManaged(caller.uri), undefined)
 			const republished = second.cacheService.errors[caller.uri] ?? []
 			assert.ok(
 				republished.some(error => error.message.includes('impDocPrivate')),
-				'the implicit lint must keep the reset linter diagnostic',
+				'the implicit lint must keep the analyzed linter diagnostic',
 			)
 			assert.ok(
 				republished.some(error => /Expected function ID/.test(error.message)),
-				'the implicit lint must keep the reset checker diagnostic',
+				'the implicit lint must keep the analyzed checker diagnostic',
 			)
 		} finally {
 			await first?.close()
@@ -1616,12 +1619,12 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 		}
 	})
 
-	it('restores the reset diagnostics on a warm start that never saw a close()', async () => {
+	it('restores the analyzed diagnostics on a warm start that never saw a close()', async () => {
 		const projectRoot = await createCanonicalTempDir(
-			join(tmpdir(), 'spyglass-imp-doc-reset-persist-project-'),
+			join(tmpdir(), 'spyglass-imp-doc-analysis-persist-project-'),
 		)
 		const cacheDir = await createCanonicalTempDir(
-			join(tmpdir(), 'spyglass-imp-doc-reset-persist-cache-'),
+			join(tmpdir(), 'spyglass-imp-doc-analysis-persist-cache-'),
 		)
 		let first: core.Project | undefined
 		let second: core.Project | undefined
@@ -1651,31 +1654,34 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 			first = createRuntimeProject(cacheDir, projectRootUri)
 			await first.init()
 			await first.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
-			await first.reset()
-			const resetErrors = first.cacheService.errors[caller.uri] ?? []
+			const result = await first.analyzeProject()
+			assert.equal(result.cancelled, false)
+			const analyzedErrors = first.cacheService.errors[caller.uri] ?? []
 			assert.ok(
-				resetErrors.some(error => error.message.includes('impDocPrivate')),
-				'the reset full pass must publish the unopened caller linter diagnostic',
+				analyzedErrors.some(error => error.message.includes('impDocPrivate')),
+				'the analysis must publish the unopened caller linter diagnostic',
 			)
 			assert.ok(
-				resetErrors.some(error => /Expected function ID/.test(error.message)),
-				'the reset full pass must publish the unopened caller checker diagnostic',
+				analyzedErrors.some(error => /Expected function ID/.test(error.message)),
+				'the analysis must publish the unopened caller checker diagnostic',
 			)
 
-			// The first project is deliberately left open: an editor crashing right after a
-			// Regenerate Cache never reaches `close()`, so the reset itself has to be what
-			// persisted the full-pass diagnostics.
+			// The first project is deliberately left open: an editor crashing right after an
+			// Analyze Project never reaches `close()`, so the analysis itself has to be what
+			// persisted the whole-corpus diagnostics.
 			second = createRuntimeProject(cacheDir, projectRootUri)
 			await second.init()
 			await second.ready({ projectRootsWatcher: new FixtureWatcher(watchedUris) })
 			const restored = second.cacheService.errors[caller.uri] ?? []
 			assert.ok(
 				restored.some(error => error.message.includes('impDocPrivate')),
-				'the warm start must restore the reset linter diagnostic without a preceding close()',
+				'the warm start must restore the analyzed linter diagnostic without a preceding '
+					+ 'close()',
 			)
 			assert.ok(
 				restored.some(error => /Expected function ID/.test(error.message)),
-				'the warm start must restore the reset checker diagnostic without a preceding close()',
+				'the warm start must restore the analyzed checker diagnostic without a preceding '
+					+ 'close()',
 			)
 		} finally {
 			await first?.close()
@@ -1687,10 +1693,10 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 
 	it('restores full diagnostics after a watched project file changes', async () => {
 		const projectRoot = await createCanonicalTempDir(
-			join(tmpdir(), 'spyglass-imp-doc-modified-full-pass-project-'),
+			join(tmpdir(), 'spyglass-imp-doc-modified-analysis-project-'),
 		)
 		const cacheDir = await createCanonicalTempDir(
-			join(tmpdir(), 'spyglass-imp-doc-modified-full-pass-cache-'),
+			join(tmpdir(), 'spyglass-imp-doc-modified-analysis-cache-'),
 		)
 		let project: core.Project | undefined
 		try {
@@ -1729,17 +1735,18 @@ describe('IMP-Doc reset full-pass diagnostic preservation', () => {
 			project = createRuntimeProject(cacheDir, projectRootUri)
 			await project.init()
 			await project.ready({ projectRootsWatcher: watcher })
-			await project.reset()
+			const result = await project.analyzeProject()
+			assert.equal(result.cancelled, false)
 			assert.equal(project.getClientManaged(caller.uri), undefined)
 			assert.equal(project.getClientManaged(changed.uri), undefined)
 			const callerErrors = project.cacheService.errors[caller.uri] ?? []
 			assert.ok(
 				callerErrors.some(error => error.message.includes('impDocPrivate')),
-				'the reset must publish the unopened caller linter diagnostic',
+				'the analysis must publish the unopened caller linter diagnostic',
 			)
 			assert.ok(
 				callerErrors.some(error => /Expected function ID/.test(error.message)),
-				'the reset must publish the unopened caller checker diagnostic',
+				'the analysis must publish the unopened caller checker diagnostic',
 			)
 			const beforeChange = project.cacheService.errors[changed.uri] ?? []
 			assert.ok(beforeChange.some(error => error.message.includes('impDocPrivate')))
