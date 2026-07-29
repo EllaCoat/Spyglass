@@ -492,7 +492,11 @@ describe('Project', () => {
 					[partialMessage],
 					'the incomplete diagnostics must still reach listeners',
 				)
-				assert.equal(cacheService.errors[uri], undefined)
+				assert.deepEqual(
+					cacheService.errors[uri]?.map((error) => error.message),
+					[partialMessage],
+					'the live registry must retain the diagnostics so reset can retract them',
+				)
 				assert.equal(cacheService.checksums.fileContents[uri], undefined)
 				assert.equal(cacheService.checksums.files[uri], undefined)
 				await first.project.close()
@@ -501,7 +505,14 @@ describe('Project', () => {
 				shouldThrow = false
 				bindCount = 0
 				checkCount = 0
-				second = await readySetup(first.fs, initializer)
+				second = createSetup(first.fs, initializer)
+				await second.project.init()
+				assert.equal(
+					second.project.cacheService.errors[uri],
+					undefined,
+					'the saved cache must omit diagnostics for the checksum-less retry marker',
+				)
+				await second.project.ready({ projectRootsWatcher: second.watcher })
 
 				assert.equal(bindCount, 1)
 				assert.equal(checkCount, 1)
@@ -509,6 +520,147 @@ describe('Project', () => {
 					second.errors.get(uri)?.map((error) => error.message),
 					[TestCheckerMessage],
 				)
+			} finally {
+				if (!firstClosed) {
+					await first.project.close()
+				}
+				await second?.project.close()
+			}
+		})
+
+		it('Should update the incomplete marker for editor and reset checks', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			let shouldThrow = true
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', () => {
+					if (shouldThrow) {
+						throw new Error('Test checker failure')
+					}
+				})
+			})
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+				assert.equal(project.cacheService.shouldRetryCheck(uri), true)
+
+				shouldThrow = false
+				await project.onDidChange(uri, [{ text: 'foo' }], 2)
+				assert.equal(project.cacheService.shouldRetryCheck(uri), false)
+
+				shouldThrow = true
+				await project.onDidChange(uri, [{ text: 'foo' }], 3)
+				assert.equal(project.cacheService.shouldRetryCheck(uri), true)
+
+				shouldThrow = false
+				await project.reset()
+				assert.equal(project.cacheService.shouldRetryCheck(uri), false)
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should update the incomplete marker for checks run by the implicit lint drain', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			let shouldQueue = false
+			let shouldThrow = true
+			const { project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, ({ meta }) => {
+				meta.registerUriSymbolClearer((uri, ctx) => {
+					if (shouldQueue && uri === uriA) {
+						ctx.queueLint?.(uriB)
+					}
+				})
+				meta.registerChecker<LiteralNode>('literal', () => {
+					if (shouldThrow) {
+						throw new Error('Test checker failure')
+					}
+				})
+			})
+			try {
+				shouldQueue = true
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				assert.equal(project.cacheService.shouldRetryCheck(uriB), true)
+
+				shouldThrow = false
+				await project.onDidChange(uriA, [{ text: 'foo' }], 2)
+				assert.equal(project.cacheService.shouldRetryCheck(uriB), false)
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should retract incomplete diagnostics when the project is reset', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			const partialMessage = 'Test binder partial error'
+			const { errors, project } = await setup(
+				{ '/root/a.spyglasstest': 'foo' },
+				({ meta }) => {
+					meta.registerBinder<LiteralNode>('literal', (node, ctx) => {
+						ctx.err.report(partialMessage, node)
+					})
+					meta.registerChecker<LiteralNode>('literal', () => {
+						throw new Error('Test checker failure')
+					})
+				},
+			)
+			try {
+				await project.analyzeProject()
+				assert.deepEqual(
+					errors.get(uri)?.map((error) => error.message),
+					[partialMessage],
+				)
+
+				await project.reset()
+
+				assert.deepEqual(errors.get(uri), [])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should not propagate from the bind that retries an incomplete file', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const uriB = `${ProjectRoot}b.spyglasstest`
+			let shouldQueue = false
+			let shouldThrow = true
+			const checkedUris: string[] = []
+			const initializer: ProjectInitializer = ({ meta }) => {
+				meta.registerUriSymbolClearer((uri, ctx) => {
+					if (shouldQueue && uri === uriA) {
+						ctx.queueLint?.(uriB)
+					}
+				})
+				meta.registerChecker<LiteralNode>('literal', (_node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					if (shouldThrow && ctx.doc.uri === uriA) {
+						throw new Error('Test checker failure')
+					}
+				})
+			}
+			const first = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+			}, initializer)
+			let firstClosed = false
+			let second: SetupResult | undefined
+			try {
+				assert.deepEqual(
+					await first.project.analyzeProject(),
+					{ analyzedFiles: 1, cancelled: false, totalFiles: 2 },
+				)
+				await first.project.close()
+				firstClosed = true
+
+				shouldQueue = true
+				shouldThrow = false
+				checkedUris.length = 0
+				second = await readySetup(first.fs, initializer)
+
+				assert.deepEqual(checkedUris, [uriA])
+				assert.equal(second.project.cacheService.shouldRetryCheck(uriA), false)
+				assert.equal(second.project.cacheService.shouldRetryCheck(uriB), false)
 			} finally {
 				if (!firstClosed) {
 					await first.project.close()

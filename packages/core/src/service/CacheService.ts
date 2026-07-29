@@ -196,10 +196,11 @@ export class CacheService {
 	/**
 	 * Files whose last published diagnostics came from a checker that did not complete.
 	 *
-	 * A saved cache represents these with a `fileContents` hash but no `files` hash or error
-	 * entry. The missing raw-file hash makes {@link validate} classify the URI as added on the
-	 * next start, while the retained content hash distinguishes it from a file that was never
-	 * processed and lets `Project#ready` retry its checker after rebinding it.
+	 * The live error registry retains their partial diagnostics for reset retraction. A saved
+	 * cache filters those diagnostics and represents the retry with a `fileContents` hash but no
+	 * `files` hash or error entry. The missing raw-file hash makes {@link validate} classify the
+	 * URI as added on the next start, while the retained content hash distinguishes it from a
+	 * file that was never processed and lets `Project#ready` retry its checker after rebinding it.
 	 */
 	#incompleteFiles = new Set<string>()
 	#invalidatedFiles = new Set<string>()
@@ -293,7 +294,7 @@ export class CacheService {
 
 	/**
 	 * Exclude a checker's incomplete state from the next cache while retaining a retry marker.
-	 * The caller publishes the partial diagnostics to the editor before invoking this method.
+	 * Its partial diagnostics remain in the live error registry so a reset can retract them.
 	 */
 	markDocumentIncomplete(uri: string): void {
 		this.#hashUpdateGeneration += 1
@@ -301,7 +302,6 @@ export class CacheService {
 		this.#fileContentUpdateTokens.delete(uri)
 		delete this.checksums.fileContents[uri]
 		delete this.checksums.files[uri]
-		delete this.errors[uri]
 	}
 
 	/** Clear the retry marker before publishing a complete checker result. */
@@ -324,6 +324,12 @@ export class CacheService {
 			// for untitled files in VS Code)
 			|| !(doc.uri.startsWith(ArchiveUriSupporter.Protocol) || doc.uri.startsWith('file:'))
 		) {
+			return
+		}
+		// The corresponding diagnostics still reach listeners and remain in `errors` so a reset
+		// can retract them, but neither they nor hashes recorded by this publish belong in a saved
+		// cache until the checker completes.
+		if (this.#incompleteFiles.has(doc.uri)) {
 			return
 		}
 		this.#hashUpdateGeneration += 1
@@ -431,9 +437,14 @@ export class CacheService {
 	 * from the set and keeps the full read path. The three exclusions above still apply to
 	 * members, because each names a concrete reason the recorded hashes cannot be believed —
 	 * a reason about the file itself, which no caller is in a position to overrule.
+	 *
+	 * @param errors The exact error snapshot the save will serialize. Marker diagnostics are
+	 * retained in the live registry but omitted from this snapshot, so the checksum safety checks
+	 * below compare against the cache payload rather than unrelated in-memory state.
 	 */
 	private async createVerifiedChecksums(
 		checksums: Checksums,
+		errors: ErrorCache,
 		generation: number,
 		trustRecordedHashes = false,
 		trustRecordedHashesFor?: ReadonlySet<string>,
@@ -489,10 +500,10 @@ export class CacheService {
 		}
 		for (const update of updates) {
 			if (this.#incompleteFiles.has(update.uri)) {
-				// A diagnostic entry here would pair errors with no raw-file checksum in the
-				// cache. Preserve the existing safety invariant instead of publishing such a
-				// snapshot if another event broke the marker's expected state.
-				if (Object.hasOwn(this.errors, update.uri)) {
+				// Marker diagnostics remain in the live error registry for reset retraction, but
+				// the save snapshot must have filtered them. Keep checking the snapshot that is
+				// actually serialized so this branch cannot weaken the checksum/error invariant.
+				if (Object.hasOwn(errors, update.uri)) {
 					return undefined
 				}
 				// Deliberately omit `files`: `validate` must rebind this unchanged file next
@@ -503,7 +514,7 @@ export class CacheService {
 			}
 			const stateHash = checksums.fileContents[update.uri]
 			if (stateHash === undefined) {
-				if (Object.hasOwn(this.errors, update.uri)) {
+				if (Object.hasOwn(errors, update.uri)) {
 					return undefined
 				}
 				verified.files[update.uri] = update.fileHash
@@ -881,8 +892,15 @@ export class CacheService {
 			await this.waitForPendingHashUpdates()
 			const sourceChecksums = this.checksums
 			const generation = this.#hashUpdateGeneration
+			const errors: ErrorCache = {}
+			for (const [uri, uriErrors] of Object.entries(this.errors)) {
+				if (!this.#incompleteFiles.has(uri)) {
+					errors[uri] = uriErrors
+				}
+			}
 			const checksums = await this.createVerifiedChecksums(
 				sourceChecksums,
+				errors,
 				generation,
 				options?.trustRecordedHashes,
 				options?.trustRecordedHashesFor,
@@ -918,7 +936,7 @@ export class CacheService {
 				projectRoots,
 				checksums,
 				symbols: SymbolTable.unlink(this.project.symbols.global),
-				errors: { ...this.errors },
+				errors,
 			}
 			__profiler.task('Unlink Symbols')
 

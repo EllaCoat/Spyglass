@@ -1556,9 +1556,10 @@ export class Project extends EventDispatcher<{
 	 *
 	 * @returns Whether the node ends up holding a complete checker result. `false` means the
 	 * checker threw and `propagateErrors` swallowed it, which leaves the document's diagnostics a
-	 * subset of what it should report. A caller that records a document as processed — see
-	 * {@link analyzeProject}, which then lets the cache trust its recorded hashes — has to keep
-	 * such a document out of its results; a caller that only publishes can ignore this.
+	 * subset of what it should report. This method marks every incomplete result for a later retry
+	 * and clears that marker after every complete result, so callers only use the return value for
+	 * their own accounting — {@link analyzeProject}, for example, excludes failures from its
+	 * `analyzedFiles`.
 	 */
 	private async checkWithoutLintFlush(
 		doc: TextDocument,
@@ -1568,6 +1569,7 @@ export class Project extends EventDispatcher<{
 	): Promise<boolean> {
 		if (node.checkerErrors) {
 			// The results are already on the node, put there by a checker that ran to completion.
+			this.cacheService.clearDocumentIncomplete(doc.uri)
 			return true
 		}
 		const endCacheMutation = this.cacheService.beginStateMutation()
@@ -1584,9 +1586,11 @@ export class Project extends EventDispatcher<{
 				this.lint(doc, node, propagation)
 				__lintProfiler.task(doc.uri)
 			})
+			this.cacheService.clearDocumentIncomplete(doc.uri)
 			return true
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
+			this.cacheService.markDocumentIncomplete(doc.uri)
 			if (propagateErrors) {
 				throw e
 			}
@@ -1797,22 +1801,18 @@ export class Project extends EventDispatcher<{
 				doc,
 				node,
 				propagateProcessorErrors,
-				publishDiagnostics ? 'full' : 'none',
+				publishDiagnostics && !shouldRetryCheck ? 'full' : 'none',
 			)
 			bindProfiler.task(uri)
 			if (publishDiagnostics) {
-				const checked = shouldRetryCheck
-					? await this.checkWithoutLintFlush(doc, node, false, 'none')
-					: true
+				if (shouldRetryCheck) {
+					await this.checkWithoutLintFlush(doc, node, false, 'none')
+				}
 				// Initial scans have no rollback boundary, so preserve per-file streaming and let the
 				// document/AST become collectible before processing the next file. The one
 				// exception to their bind-only contract is a persisted incomplete-file marker:
 				// that URI must finish the checker which failed in the previous session.
-				if (shouldRetryCheck) {
-					await this.#publishCheckedDocument({ doc, node }, checked)
-				} else {
-					await this.emitAsync('documentUpdated', { doc, node })
-				}
+				await this.emitAsync('documentUpdated', { doc, node })
 				publishedUris.add(uri)
 			} else {
 				// Recorded even though nothing is published: `saveCacheAfterRebuild` trusts these
@@ -1880,27 +1880,6 @@ export class Project extends EventDispatcher<{
 	async #publishEmptyDiagnosticsIfBound(uri: string): Promise<void> {
 		if (this.#symbolUpToDateUris.has(uri)) {
 			await this.emitAsync('documentErrored', { errors: [], uri })
-		}
-	}
-
-	/**
-	 * Publish a checked node while keeping an incomplete result visible to listeners but absent
-	 * from the cache. Save suspension covers the interval in which the publish temporarily records
-	 * its hashes and partial errors before {@link CacheService.markDocumentIncomplete} removes
-	 * both, so an autosave cannot capture that intermediate state.
-	 */
-	async #publishCheckedDocument(value: DocAndNode, checked: boolean): Promise<void> {
-		const endCacheMutation = this.cacheService.beginStateMutation()
-		try {
-			if (checked) {
-				this.cacheService.clearDocumentIncomplete(value.doc.uri)
-			}
-			await this.emitAsync('documentUpdated', value)
-		} finally {
-			if (!checked) {
-				this.cacheService.markDocumentIncomplete(value.doc.uri)
-			}
-			endCacheMutation()
 		}
 	}
 
@@ -2090,7 +2069,7 @@ export class Project extends EventDispatcher<{
 							)
 							// Other code paths hold this very object; publishing a copy of it
 							// would leave them looking at a node nobody updates.
-							await this.#publishCheckedDocument(clientManaged, checked)
+							await this.emitAsync('documentUpdated', clientManaged)
 							// A file whose checker threw is still published — partial diagnostics
 							// beat none, and they replace whatever this URI showed before — but it
 							// is not recorded: `analyzedFiles` would count a file the checker
@@ -2120,7 +2099,7 @@ export class Project extends EventDispatcher<{
 								)
 								// Awaiting the publish keeps one URI's diagnostics from
 								// overtaking each other when a listener is slow.
-								await this.#publishCheckedDocument({ doc, node }, checked)
+								await this.emitAsync('documentUpdated', { doc, node })
 								// See the client-managed branch: a checker that threw publishes
 								// but does not count and is not trusted.
 								if (checked) {
