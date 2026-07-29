@@ -10,6 +10,7 @@ import type {
 	LiteralNode,
 	MetaRegistry,
 	PosRangeLanguageError,
+	Profiler,
 	ProjectInitializer,
 	RootUriString,
 } from '../../lib/index.js'
@@ -20,6 +21,7 @@ import {
 	fileUtil,
 	literal,
 	Logger,
+	ProfilerFactory,
 	Project,
 	UriStore,
 	VanillaConfig,
@@ -29,6 +31,8 @@ import { getNodeJsExternals } from '../../lib/nodejs.js'
 const CacheRoot: RootUriString = 'file:///cache/'
 const ProjectRoot: RootUriString = 'file:///root/'
 const TestCheckerMessage = 'Test checker error'
+/** Symbol category the fixtures below register into. */
+const TestSymbolCategory = 'spyglasstest'
 
 /**
  * A {@link FileWatcher} that populates its file store with the files that exist under the watched
@@ -93,10 +97,21 @@ interface SetupResult {
  * and `ready` itself. Passing the file system of an earlier session is how a warm start is set up:
  * the second project finds the cache file the first one saved.
  */
+interface SetupOptions {
+	/**
+	 * Merged into the default config after the defaults, e.g. to move the lint fingerprint of a
+	 * session away from the one that wrote the cache it reads.
+	 */
+	config?: Record<string, unknown>
+	/** Replaces the no-op profilers, for a test that needs a stage inside a pass to throw. */
+	profilers?: ProfilerFactory
+}
+
 function createSetup(
 	fs: ReturnType<typeof memfs>['fs'],
 	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
 	extraInitializer?: ProjectInitializer,
+	options: SetupOptions = {},
 ): SetupResult {
 	// memfs answers a read with a pooled `Buffer`, whose `.buffer` is the whole 8 KiB pool rather
 	// than the file. Raw-byte checksums are computed over that `.buffer`, so under memfs they
@@ -119,12 +134,17 @@ function createSetup(
 
 	const project = new Project({
 		cacheRoot: CacheRoot,
-		defaultConfig: ConfigService.merge(VanillaConfig, { env: { dependencies: [] } }),
+		defaultConfig: ConfigService.merge(
+			VanillaConfig,
+			{ env: { dependencies: [] } },
+			options.config ?? {},
+		),
 		externals,
 		initializers: extraInitializer
 			? [testLanguageInitializer, extraInitializer]
 			: [testLanguageInitializer],
 		logger: Logger.noop(),
+		...options.profilers ? { profilers: options.profilers } : {},
 		projectRoots: [ProjectRoot],
 	})
 	const errors = new Map<string, readonly PosRangeLanguageError[]>()
@@ -143,9 +163,10 @@ async function setup(
 	files: Record<string, string>,
 	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
 	extraInitializer?: ProjectInitializer,
+	options: SetupOptions = {},
 ): Promise<SetupResult> {
 	const { fs } = memfs(files, '/')
-	const result = createSetup(fs, extraInitializer)
+	const result = createSetup(fs, extraInitializer, options)
 	await result.project.init()
 	await result.project.ready({ projectRootsWatcher: result.watcher })
 
@@ -170,6 +191,30 @@ function registerThrowingChecker(
 		}
 		ctx.err.report(TestCheckerMessage, node)
 	})
+}
+
+/**
+ * Profilers whose `project#lint` profiler throws when a task is recorded. That call sits inside
+ * the same `try` as the checker but runs after it, which is the only stage of a check a fixture
+ * can make fail from the outside once the checker itself has completed.
+ */
+class ThrowingLintProfilerFactory extends ProfilerFactory {
+	constructor() {
+		super(Logger.noop(), [])
+	}
+
+	override get(id: string): Profiler {
+		const noop: Profiler = { task: () => noop, finalize: () => {} }
+		if (id !== 'project#lint') {
+			return noop
+		}
+		return {
+			task: () => {
+				throw new Error('Test profiler failure')
+			},
+			finalize: () => {},
+		}
+	}
 }
 
 /** The parts of a saved cache file the tests below inspect. */
@@ -1030,6 +1075,76 @@ describe('Project', () => {
 			}
 		})
 
+		it('Should drop the symbols a checker registered before it threw', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			let shouldThrow = true
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (_node, ctx) => {
+					ctx.symbols.query(ctx.doc, TestSymbolCategory, 'declared-before-the-throw')
+						.enter({ usage: { type: 'definition' } })
+					if (shouldThrow) {
+						throw new Error('Test checker failure')
+					}
+				})
+			})
+			try {
+				await project.analyzeProject()
+
+				// Nothing rolls a contributor's writes back when its callback throws, so the half
+				// of the checker's work that did run would otherwise stay in the table — and, on a
+				// closed file, be saved as part of a symbol table nothing else contradicts.
+				assert.equal(
+					project.symbols.query(uri, TestSymbolCategory, 'declared-before-the-throw').symbol,
+					undefined,
+				)
+
+				shouldThrow = false
+				await project.analyzeProject()
+
+				// The same registration survives a check that completes, which is what makes the
+				// assertion above about the failure rather than about the query.
+				assert.ok(
+					project.symbols.query(uri, TestSymbolCategory, 'declared-before-the-throw').symbol,
+				)
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should not record a failure when a stage after the checker throws', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			const { outcomes, project } = await setup(
+				{ '/root/a.spyglasstest': 'foo' },
+				({ meta }) => {
+					meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+						ctx.symbols.query(ctx.doc, TestSymbolCategory, 'declared-by-the-checker')
+							.enter({ usage: { type: 'definition' } })
+						ctx.err.report(TestCheckerMessage, node)
+					})
+				},
+				{ profilers: new ThrowingLintProfilerFactory() },
+			)
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+
+				// The checker ran to completion, so nothing about it failed: its diagnostics are
+				// the file's real ones, its symbols are whole, and the document has no reason to
+				// be checked again. Recording a failure here would also leave the node holding
+				// both markers, and the early return of a later check would then read the results
+				// as a success and drop the marker without a checker ever running again.
+				const node = project.getClientManaged(uri)?.node
+				assert.deepEqual(node?.checkerErrors?.map((e) => e.message), [TestCheckerMessage])
+				assert.equal(node?.checkerFailed, undefined)
+				assert.equal(outcomes.get(uri), 'complete')
+				assert.deepEqual(project.getFailedCheckUris(), new Set())
+				assert.ok(
+					project.symbols.query(uri, TestSymbolCategory, 'declared-by-the-checker').symbol,
+				)
+			} finally {
+				await project.close()
+			}
+		})
+
 		it('Should report a document nothing checked as not run', async () => {
 			const uri = `${ProjectRoot}a.spyglasstest`
 			const { outcomes, project } = await setup({ '/root/a.spyglasstest': 'foo' })
@@ -1084,12 +1199,23 @@ describe('Project', () => {
 		const uriB = `${ProjectRoot}b.spyglasstest`
 		const files = { '/root/a.spyglasstest': 'foo', '/root/b.spyglasstest': 'foo' }
 
+		/**
+		 * Reported by `b`'s binder, so that the file a check fails for has diagnostics of its own
+		 * rather than none: a cache that leaves an empty entry out looks exactly like one that
+		 * excludes a failed check, and only the non-empty case tells the two apart.
+		 */
+		const partialMessage = 'Test binder partial error'
+
 		/** Analyze a two-file project whose checker throws for `b`, then save and close. */
 		async function analyzeAndClose(shouldThrow: () => boolean): Promise<SetupResult> {
-			const result = await setup(
-				files,
-				({ meta }) => registerThrowingChecker(meta, (uri) => shouldThrow() && uri === uriB),
-			)
+			const result = await setup(files, ({ meta }) => {
+				meta.registerBinder<LiteralNode>('literal', (node, ctx) => {
+					if (ctx.doc.uri === uriB) {
+						ctx.err.report(partialMessage, node)
+					}
+				})
+				registerThrowingChecker(meta, (uri) => shouldThrow() && uri === uriB)
+			})
 			try {
 				await result.project.analyzeProject()
 			} finally {
@@ -1100,7 +1226,16 @@ describe('Project', () => {
 		}
 
 		it('Should keep the diagnostics of a file whose checker threw out of the cache', async () => {
-			const { fs } = await analyzeAndClose(() => true)
+			const { errors, fs, project } = await analyzeAndClose(() => true)
+
+			// What the failed check did publish, and what the live registry still holds so that a
+			// reset can retract it. Its absence from the cache below is therefore an exclusion,
+			// not an empty entry that would have been written as an empty one anyway.
+			assert.deepEqual(errors.get(uriB)?.map((e) => e.message), [partialMessage])
+			assert.deepEqual(
+				project.cacheService.errors[uriB]?.map((e) => e.message),
+				[partialMessage],
+			)
 
 			const cache = readCacheFile(fs)
 			assert.deepEqual(cache.failedChecks, [uriB])
@@ -1378,6 +1513,84 @@ describe('Project', () => {
 			const cache = readCacheFile(first.fs)
 			assert.deepEqual(cache.failedChecks, [])
 			assert.deepEqual(cache.errors[uriB]?.map((e) => e.message), [TestCheckerMessage])
+		})
+
+		it('Should keep the marker when a lint change invalidates the cache', async () => {
+			let shouldThrow = true
+			const checkedUris: string[] = []
+			const initializer: ProjectInitializer = ({ meta }) =>
+				registerThrowingChecker(meta, (uri) => shouldThrow && uri === uriB, checkedUris)
+			const first = await analyzeAndClose(initializer)
+
+			shouldThrow = false
+			checkedUris.length = 0
+			// A rule this build has no linter for: it moves the lint fingerprint the cache is
+			// compared against without changing what any pass produces.
+			const second = createSetup(first.fs, initializer, {
+				config: { lint: { spyglasstestUnknownRule: true } },
+			})
+			try {
+				await second.project.init()
+
+				// Lint configuration has no say in whether a checker threw, and the invalidation
+				// that follows a lint change is not a substitute for the retry: it sends every
+				// cached file back through binding, and binding never checks anything.
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set([uriB]))
+
+				await second.project.ready({ projectRootsWatcher: second.watcher })
+
+				assert.deepEqual(checkedUris, [uriB])
+				assert.equal(second.outcomes.get(uriB), 'complete')
+				assert.deepEqual(second.project.getFailedCheckUris(), new Set())
+			} finally {
+				await second.project.close()
+			}
+		})
+
+		it('Should keep the marker of a deleted file that is still open', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			const { project } = await setup(
+				files,
+				({ meta }) => registerThrowingChecker(meta, (checked) => checked === uri),
+			)
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uri]))
+
+				// What the watcher reports when the file leaves the disk or the project's file
+				// set. The editor still holds the buffer, so the document survives and its
+				// diagnostics are not retracted — and every later edit checks it again.
+				project.emit('fileDeleted', { uri })
+				await drainLifecycle(project)
+
+				assert.ok(project.getClientManaged(uri))
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uri]))
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should drop the marker of a closed document the project does not track', async () => {
+			// Outside every root and not watched, so closing it is what ends the project's
+			// relationship with the URI.
+			const uri = 'file:///outside/a.spyglasstest'
+			const { project } = await setup(
+				files,
+				({ meta }) => registerThrowingChecker(meta, (checked) => checked === uri),
+			)
+			try {
+				await project.onDidOpen(uri, 'spyglasstest', 1, 'foo')
+				assert.deepEqual(project.getFailedCheckUris(), new Set([uri]))
+
+				await project.onDidClose(uri)
+
+				// The document is removed and its diagnostics retracted in the same step, so the
+				// marker goes with them rather than queueing a document nobody holds.
+				assert.equal(project.getClientManaged(uri), undefined)
+				assert.deepEqual(project.getFailedCheckUris(), new Set())
+			} finally {
+				await project.close()
+			}
 		})
 
 		it('Should drop the marker of a file that is gone on the next start', async () => {

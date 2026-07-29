@@ -131,12 +131,23 @@ interface CacheFile {
 	 * `Project#getFailedCheckUris`. Their `errors` entry is deliberately absent — the diagnostics
 	 * a failed check produced are a subset of the file's real ones and must not be restored —
 	 * while their checksums are kept, since the hashes describe the content and stay true
-	 * regardless of how far processing got. {@link validate} reads this list to send those files
-	 * back through processing even though their content is unchanged.
+	 * regardless of how far processing got. The session that reads this list retries those files
+	 * through `Project#queueFailedCheckRetries`.
 	 *
-	 * Optional on purpose. {@link isCacheFile} does not require it, so a cache written before this
-	 * field existed reads as “no failed checks”, and a cache written with it stays readable by a
-	 * build that does not know it. Neither direction needs a {@link LatestCacheVersion} bump.
+	 * Optional on purpose, and deliberately not worth a {@link LatestCacheVersion} bump, which
+	 * would cost every user a cold rebuild. What that buys is schema compatibility, not a
+	 * symmetric round trip:
+	 *
+	 * - A cache written before this field existed reads as “no failed checks”, which is the same
+	 *   state a session starts in.
+	 * - A build that does not know the field still reads a cache carrying it, since
+	 *   {@link isCacheFile} does not inspect it — but it drops the field on its own next save,
+	 *   and it saves the diagnostics of a failed check like any other entry. The files that were
+	 *   on the list return to being remembered as complete when they are not, which is the
+	 *   behavior this field exists to end.
+	 *
+	 * So downgrading loses the retries and restores the old symptom for those files; it does not
+	 * corrupt anything, and nothing but a fresh failure puts them back on the list.
 	 */
 	failedChecks?: string[]
 	/** Fingerprint of the context returned by project initializers. */
@@ -585,8 +596,10 @@ export class CacheService {
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
-				// Nothing cached survives, so no file is spared processing and a failure list
-				// would only name files that are being processed again anyway.
+				// The list this cache carries describes checkers from an initializer context this
+				// build no longer has, so it says nothing about the processors that are about to
+				// run. Cleared rather than merely left unread, so that what the ledger holds after
+				// this method always matches the cache that was adopted.
 				this.project.restoreFailedCheckUris([])
 				this.#invalidatedFiles.clear()
 				this.#hasValidatedFiles = false
@@ -601,14 +614,21 @@ export class CacheService {
 				this.project.logger.info(
 					'[CacheService#activate] lint context mismatch; partially invalidating cache',
 				)
+				// The failed checks stay on record. Lint configuration has no bearing on whether a
+				// checker threw, the checkers themselves are the same ones that threw, and the
+				// invalidation below does not stand in for a retry: it sends every cached file
+				// back through binding, and a scan binds closed files without checking them.
 				this.invalidatePartial('lint')
-				this.project.restoreFailedCheckUris([])
 			} else if (cache.contextHash !== prepared.hash) {
 				this.project.logger.info(
 					'[CacheService#activate] combined context mismatch; dropping cache',
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
+				// This branch means the combined fingerprint disagrees with the components it is
+				// made of, which is why every other part of this cache is being dropped as well.
+				// A list of URIs read out of a file that failed its own integrity check is not a
+				// reason to check anything; the next analysis records the failures that are real.
 				this.project.restoreFailedCheckUris([])
 				this.#invalidatedFiles.clear()
 				ans.symbols = {}

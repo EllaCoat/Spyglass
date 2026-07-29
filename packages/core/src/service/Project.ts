@@ -484,6 +484,12 @@ export class Project extends EventDispatcher<{
 			// }
 			await this.emitAsync('documentErrored', this.createDocumentErrorEvent(doc, node))
 		}).on('documentRemoved', ({ uri }) => {
+			// The single point where the project stops holding a document: a file that was deleted
+			// or excluded while nothing kept it alive, and a client document that was closed and
+			// belongs to neither the watcher nor a dependency. Nothing will check it again, so a
+			// retry marker for it would be queued and saved by every session from here on, and the
+			// diagnostics it describes are being retracted on the very next line.
+			this.#failedCheckUris.delete(uri)
 			this.emit('documentErrored', { checkOutcome: 'not-run', errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
 			this.cancelActiveAnalysis(`[Project#fileCreated] ${uri}`)
@@ -570,11 +576,6 @@ export class Project extends EventDispatcher<{
 			this.updateRoots()
 		}
 		this.#symbolUpToDateUris.delete(uri)
-		// Both a deleted file and one the project stopped including arrive here — the watcher
-		// reports an exclusion as an `unlink`, and `validate` reports it as removed — and neither
-		// is ever going to be checked again, so a retry marker for it would be carried, saved and
-		// queued forever.
-		this.#failedCheckUris.delete(uri)
 		this.cacheService.clearFileChange(uri)
 		this.clearUriSymbolLocations(uri)
 		if (forceDocumentRemoval) {
@@ -1461,10 +1462,9 @@ export class Project extends EventDispatcher<{
 	/**
 	 * The completion state travels on the node the diagnostics were collected from, so every
 	 * publish reports the state of the very pass that produced them without threading a flag
-	 * through the calls in between. A node carries at most one of the two markers: a check that
-	 * completes replaces the failure marker with its results, and a check that throws leaves
-	 * `checkerErrors` unset — with the failure marker winning if a stage after the checker ever
-	 * throws, since then the diagnostics are incomplete regardless of what the checker produced.
+	 * through the calls in between. A node carries at most one of the two markers: a checker that
+	 * completes replaces the failure marker with its results, and one that throws leaves
+	 * `checkerErrors` unset, because only the checker's own failure is recorded as one.
 	 */
 	private createDocumentErrorEvent(
 		doc: TextDocument,
@@ -1678,12 +1678,16 @@ export class Project extends EventDispatcher<{
 		const __lintProfiler = this.profilers.get('project#lint', 'top-n', 50)
 		// Created out here so that the failure path can reach the symbol table this run wrote to.
 		const ctx = CheckerContext.create(this, { doc })
+		// The `try` below covers the lint stage and the profilers as well as the checker, and only
+		// the checker's own failure is a failed check. This says which of the two happened.
+		let checkerCompleted = false
 		try {
 			const checker = this.meta.getChecker(node.type)
 			ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
 			await ctx.symbols.contributeAsAsync('checker', async () => {
 				await checker(StateProxy.create(node), ctx)
 				node.checkerErrors = ctx.err.dump()
+				checkerCompleted = true
 				delete node.checkerFailed
 				this.#failedCheckUris.delete(doc.uri)
 				__checkProfiler.task(doc.uri)
@@ -1693,17 +1697,26 @@ export class Project extends EventDispatcher<{
 			return true
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
-			// `contributeAsAsync` restores the previous contributor name when its callback throws
-			// and nothing else: every symbol location the checker registered before it threw stays
-			// in the table. This is not a repeat of the clear above — that one dropped the
-			// locations of an earlier run, this one drops the partial ones this run just wrote.
-			ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
-			node.checkerFailed = true
-			this.#failedCheckUris.add(doc.uri)
+			if (!checkerCompleted) {
+				// `contributeAsAsync` restores the previous contributor name when its callback
+				// throws and nothing else: every symbol location the checker registered before it
+				// threw stays in the table. This is not a repeat of the clear above — that one
+				// dropped the locations of an earlier run, this one drops the partial ones this
+				// run just wrote.
+				ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
+				node.checkerFailed = true
+				this.#failedCheckUris.add(doc.uri)
+			}
+			// A throw from a later stage leaves everything the checker produced intact: its
+			// symbols are complete, its diagnostics are on the node, and a lint rule that fails
+			// already costs no more than its own results — see {@link lint}. Marking the check as
+			// failed here would clear symbols nothing is wrong with, and pair a failure marker
+			// with a node that holds a complete checker result, which the early return above then
+			// reads as a success and unmarks without ever running a checker again.
 			if (propagateErrors) {
 				throw e
 			}
-			return false
+			return checkerCompleted
 		} finally {
 			endCacheMutation()
 			__checkProfiler.finalize()
