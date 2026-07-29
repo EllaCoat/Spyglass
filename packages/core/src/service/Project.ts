@@ -119,6 +119,18 @@ export interface DocAndNode {
 
 interface DocumentEvent extends DocAndNode {}
 interface DocumentErrorEvent {
+	/**
+	 * How far the check stage got for the document these `errors` come from:
+	 *
+	 * - `complete`: a checker ran to completion, so the errors are everything the document reports
+	 *   under the current config.
+	 * - `failed`: a checker threw, so the errors are a subset of that — see
+	 *   {@link FileNode.checkerFailed}.
+	 * - `not-run`: nothing checked the document. Its errors are a subset by design, not by
+	 *   failure: a bind-only publish from an initial scan, the empty diagnostics that retract a
+	 *   removed or unreadable document, or entries restored from the cache.
+	 */
+	checkOutcome: 'complete' | 'failed' | 'not-run'
 	errors: readonly PosRangeLanguageError[]
 	uri: string
 	version?: number
@@ -263,6 +275,15 @@ export class Project extends EventDispatcher<{
 	readonly #clientManagedUriMap = new TwoWayMap<string, string>()
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
+	/**
+	 * URI of files whose last check threw. Kept next to the other per-URI project state rather
+	 * than in `CacheService` so that a cache reset does not silently drop it: the failure is a
+	 * fact about this session's processing, not about the cached content. `CacheService` reads it
+	 * through {@link getFailedCheckUris} to persist it and to keep the incomplete diagnostics of
+	 * those URIs out of the cache file, and refills it through {@link restoreFailedCheckUris} when
+	 * a cache is loaded; {@link queueFailedCheckRetries} is what then acts on what it holds.
+	 */
+	readonly #failedCheckUris = new Set<string>()
 	readonly #queuedLintUris = new Set<string>()
 	#queuedLintFlushPromise: Promise<void> | undefined
 	/** File-deletion events whose core cleanup is run inline by `#ready`. */
@@ -368,6 +389,30 @@ export class Project extends EventDispatcher<{
 		return supportedFiles
 	}
 
+	/**
+	 * A snapshot of the URIs whose last check threw. `CacheService` persists it and consults it
+	 * when classifying a cached file, which is what turns the failure into one the next session
+	 * still knows about. A snapshot rather than the live set: a save reads this once and then
+	 * works asynchronously, and both the list it writes and the diagnostics it leaves out have to
+	 * come from the same reading.
+	 */
+	getFailedCheckUris(): ReadonlySet<string> {
+		return new Set(this.#failedCheckUris)
+	}
+
+	/**
+	 * Replace the failed-check ledger with what a loaded cache carried, or with nothing when the
+	 * cache was dropped. The counterpart of {@link getFailedCheckUris} and the only way anything
+	 * outside this class writes the ledger: recording a failure stays with the check stage, which
+	 * is the only place that knows one happened.
+	 */
+	restoreFailedCheckUris(uris: Iterable<string>): void {
+		this.#failedCheckUris.clear()
+		for (const uri of uris) {
+			this.#failedCheckUris.add(uri)
+		}
+	}
+
 	constructor(
 		{
 			cacheRoot,
@@ -439,7 +484,13 @@ export class Project extends EventDispatcher<{
 			// }
 			await this.emitAsync('documentErrored', this.createDocumentErrorEvent(doc, node))
 		}).on('documentRemoved', ({ uri }) => {
-			this.emit('documentErrored', { errors: [], uri })
+			// The single point where the project stops holding a document: a file that was deleted
+			// or excluded while nothing kept it alive, and a client document that was closed and
+			// belongs to neither the watcher nor a dependency. Nothing will check it again, so a
+			// retry marker for it would be queued and saved by every session from here on, and the
+			// diagnostics it describes are being retracted on the very next line.
+			this.#failedCheckUris.delete(uri)
+			this.emit('documentErrored', { checkOutcome: 'not-run', errors: [], uri })
 		}).on('fileCreated', ({ uri }) => {
 			this.cancelActiveAnalysis(`[Project#fileCreated] ${uri}`)
 			this.cacheService.markFileChange(uri)
@@ -621,6 +672,7 @@ export class Project extends EventDispatcher<{
 			ctx: this.#ctx,
 			dependencyFiles: this.#dependencyFiles,
 			dependencyRoots: this.#dependencyRoots,
+			failedCheckUris: new Set(this.#failedCheckUris),
 			isReady: this.#isReady,
 			meta: this.#meta,
 			queuedLintUris: new Set(this.#queuedLintUris),
@@ -655,6 +707,8 @@ export class Project extends EventDispatcher<{
 				this.#ctx = snapshot.ctx
 				this.#dependencyFiles = snapshot.dependencyFiles
 				this.#dependencyRoots = snapshot.dependencyRoots
+				this.#failedCheckUris.clear()
+				snapshot.failedCheckUris.forEach(uri => this.#failedCheckUris.add(uri))
 				this.#isReady = snapshot.isReady
 				this.#meta = snapshot.meta
 				this.#queuedLintUris.clear()
@@ -991,7 +1045,9 @@ export class Project extends EventDispatcher<{
 
 		for (const [uri, values] of Object.entries(this.cacheService.errors)) {
 			stagedDiagnostics.push({
-				data: { errors: values, uri },
+				// Restored, not produced: nothing checked these documents in this session, and the
+				// cache does not record how the session that produced them ended.
+				data: { checkOutcome: 'not-run', errors: values, uri },
 				name: 'documentErrored',
 			})
 		}
@@ -1071,10 +1127,32 @@ export class Project extends EventDispatcher<{
 		// roll the fresh results back to stale ones.
 		if (shouldPublishEvents) {
 			const staged = stagedDiagnostics.filter(event => !freshlyPublishedUris.has(event.data.uri))
+			this.queueFailedCheckRetries()
 			await this.publishRebuildEvents(staged, true)
 		}
 
 		return this
+	}
+
+	/**
+	 * Queue the closed files whose last check threw, so that the drain that
+	 * {@link publishRebuildEvents} runs checks them again.
+	 *
+	 * A scan binds closed files and stops there, because whole-corpus checker results are
+	 * {@link analyzeProject}'s job. These files are the exception: their diagnostics were kept out
+	 * of the cache, so nothing restores them either, and leaving them to the next analysis means
+	 * the failure outlives yet another session. Queueing them here puts the retry on the pass that
+	 * already publishes, right after the staged entries and before READY.
+	 *
+	 * Client-managed documents are left out. {@link rebindAndCheckClientManaged} has just
+	 * rechecked every one of them, which cleared the marker of each retry that succeeded.
+	 */
+	private queueFailedCheckRetries(): void {
+		for (const uri of this.#failedCheckUris) {
+			if (!this.#clientManagedDocAndNodes.has(uri)) {
+				this.#queuedLintUris.add(uri)
+			}
+		}
 	}
 
 	/**
@@ -1280,7 +1358,10 @@ export class Project extends EventDispatcher<{
 			if (errors.length === 0 || this.#clientManagedDocAndNodes.has(uri)) {
 				continue
 			}
-			diagnostics.push({ data: { errors: [], uri }, name: 'documentErrored' })
+			diagnostics.push({
+				data: { checkOutcome: 'not-run', errors: [], uri },
+				name: 'documentErrored',
+			})
 		}
 
 		// Reset cache.
@@ -1378,11 +1459,19 @@ export class Project extends EventDispatcher<{
 		await this.emitAsync('ready', {})
 	}
 
+	/**
+	 * The completion state travels on the node the diagnostics were collected from, so every
+	 * publish reports the state of the very pass that produced them without threading a flag
+	 * through the calls in between. A node carries at most one of the two markers: a checker that
+	 * completes replaces the failure marker with its results, and one that throws leaves
+	 * `checkerErrors` unset, because only the checker's own failure is recorded as one.
+	 */
 	private createDocumentErrorEvent(
 		doc: TextDocument,
 		node: FileNode<AstNode>,
 	): DocumentErrorEvent {
 		return {
+			checkOutcome: node.checkerFailed ? 'failed' : node.checkerErrors ? 'complete' : 'not-run',
 			errors: FileNode.getErrors(node).map((e) => LanguageError.withPosRange(e, doc)),
 			uri: doc.uri,
 			version: doc.version,
@@ -1554,11 +1643,21 @@ export class Project extends EventDispatcher<{
 	 * implicit lint drain calls this directly: flushing there would await the
 	 * drain's own promise and deadlock. {@link check} wraps this and flushes.
 	 *
+	 * Either outcome is recorded twice: on the node as {@link FileNode.checkerFailed}, which is
+	 * what a publish reports as its {@link DocumentErrorEvent.checkOutcome}, and per URI in
+	 * `#failedCheckUris`, which outlives the node. A failure is recorded before this method
+	 * returns and therefore before its caller publishes, so no listener sees partial diagnostics
+	 * described as anything else; a success clears both only once the fresh results are on the
+	 * node, so the reverse pairing — old partial diagnostics next to a cleared marker — cannot
+	 * happen either.
+	 *
 	 * @returns Whether the node ends up holding a complete checker result. `false` means the
 	 * checker threw and `propagateErrors` swallowed it, which leaves the document's diagnostics a
 	 * subset of what it should report. A caller that records a document as processed — see
 	 * {@link analyzeProject}, which then lets the cache trust its recorded hashes — has to keep
-	 * such a document out of its results; a caller that only publishes can ignore this.
+	 * such a document out of its results. A caller that only publishes needs nothing beyond that:
+	 * the markers above are what keep the incomplete diagnostics out of the cache and bring the
+	 * document back for another check, at the next scan through {@link queueFailedCheckRetries}.
 	 */
 	private async checkWithoutLintFlush(
 		doc: TextDocument,
@@ -1568,18 +1667,29 @@ export class Project extends EventDispatcher<{
 	): Promise<boolean> {
 		if (node.checkerErrors) {
 			// The results are already on the node, put there by a checker that ran to completion.
+			// Clearing here as well keeps the markers from outliving the failure they describe:
+			// this URI holds a complete result, whatever an earlier attempt on it did.
+			delete node.checkerFailed
+			this.#failedCheckUris.delete(doc.uri)
 			return true
 		}
 		const endCacheMutation = this.cacheService.beginStateMutation()
 		const __checkProfiler = this.profilers.get('project#check', 'top-n', 50)
 		const __lintProfiler = this.profilers.get('project#lint', 'top-n', 50)
+		// Created out here so that the failure path can reach the symbol table this run wrote to.
+		const ctx = CheckerContext.create(this, { doc })
+		// The `try` below covers the lint stage and the profilers as well as the checker, and only
+		// the checker's own failure is a failed check. This says which of the two happened.
+		let checkerCompleted = false
 		try {
 			const checker = this.meta.getChecker(node.type)
-			const ctx = CheckerContext.create(this, { doc })
 			ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
 			await ctx.symbols.contributeAsAsync('checker', async () => {
 				await checker(StateProxy.create(node), ctx)
 				node.checkerErrors = ctx.err.dump()
+				checkerCompleted = true
+				delete node.checkerFailed
+				this.#failedCheckUris.delete(doc.uri)
 				__checkProfiler.task(doc.uri)
 				this.lint(doc, node, propagation)
 				__lintProfiler.task(doc.uri)
@@ -1587,10 +1697,26 @@ export class Project extends EventDispatcher<{
 			return true
 		} catch (e) {
 			this.logger.error(`[Project] [check] Failed for ${doc.uri} # ${doc.version}`, e)
+			if (!checkerCompleted) {
+				// `contributeAsAsync` restores the previous contributor name when its callback
+				// throws and nothing else: every symbol location the checker registered before it
+				// threw stays in the table. This is not a repeat of the clear above — that one
+				// dropped the locations of an earlier run, this one drops the partial ones this
+				// run just wrote.
+				ctx.symbols.clear({ contributor: 'checker', uri: doc.uri })
+				node.checkerFailed = true
+				this.#failedCheckUris.add(doc.uri)
+			}
+			// A throw from a later stage leaves everything the checker produced intact: its
+			// symbols are complete, its diagnostics are on the node, and a lint rule that fails
+			// already costs no more than its own results — see {@link lint}. Marking the check as
+			// failed here would clear symbols nothing is wrong with, and pair a failure marker
+			// with a node that holds a complete checker result, which the early return above then
+			// reads as a success and unmarks without ever running a checker again.
 			if (propagateErrors) {
 				throw e
 			}
-			return false
+			return checkerCompleted
 		} finally {
 			endCacheMutation()
 			__checkProfiler.finalize()
@@ -1669,6 +1795,9 @@ export class Project extends EventDispatcher<{
 	 * intentional redirects are drained as well. Whole-corpus diagnostics are
 	 * {@link analyzeProject}'s job, not the editor path's: a reset only rebinds
 	 * the corpus and rechecks the open documents.
+	 *
+	 * The exception is a document {@link queueFailedCheckRetries} put here, which runs at `none`:
+	 * see the drain body.
 	 */
 	private async flushQueuedLints(): Promise<void> {
 		if (!this.#isReady || this.#queuedLintUris.size === 0) {
@@ -1700,7 +1829,11 @@ export class Project extends EventDispatcher<{
 
 					const doc = await this.read(uri)
 					if (!doc) {
-						await this.emitAsync('documentErrored', { errors: [], uri })
+						await this.emitAsync('documentErrored', {
+							checkOutcome: 'not-run',
+							errors: [],
+							uri,
+						})
 						continue
 					}
 					const node = this.parse(doc)
@@ -1711,8 +1844,15 @@ export class Project extends EventDispatcher<{
 					// for a URI, a lint-only pass would drop its checker diagnostics.
 					// Use the flush-free check path because flushing here would await
 					// this drain from inside itself.
-					await this.bind(doc, node, false, 'owner-only')
-					await this.checkWithoutLintFlush(doc, node, false, 'owner-only')
+					//
+					// A retry is the one pass that propagates nothing. It is here because its own
+					// check threw, not because another document referred to it, so a dependent it
+					// queued — or an owner its linters redirected to — would be dragged in by a
+					// failure that says nothing about them, turning one broken file into a
+					// corpus-wide re-lint. Read before the check, which clears the marker.
+					const propagation = this.#failedCheckUris.has(uri) ? 'none' : 'owner-only'
+					await this.bind(doc, node, false, propagation)
+					await this.checkWithoutLintFlush(doc, node, false, propagation)
 					await this.emitAsync('documentUpdated', { doc, node })
 				}
 			}
@@ -1869,7 +2009,7 @@ export class Project extends EventDispatcher<{
 	 */
 	async #publishEmptyDiagnosticsIfBound(uri: string): Promise<void> {
 		if (this.#symbolUpToDateUris.has(uri)) {
-			await this.emitAsync('documentErrored', { errors: [], uri })
+			await this.emitAsync('documentErrored', { checkOutcome: 'not-run', errors: [], uri })
 		}
 	}
 
@@ -2065,11 +2205,12 @@ export class Project extends EventDispatcher<{
 							// is not recorded: `analyzedFiles` would count a file the checker
 							// never finished, and the save would skip reading a file whose
 							// diagnostics are incomplete. Left out, it is verified against disk
-							// like any file this run did not reach. That verification is all this
-							// buys: the hashes recorded while publishing still match the file, so
-							// the cache keeps the partial diagnostics and the next start does not
-							// recheck it. Making a failed checker retry needs the cache to
-							// represent the failure, which it has no way to express today.
+							// like any file this run did not reach. What keeps those diagnostics
+							// from becoming its permanent result is the failure marker
+							// `checkWithoutLintFlush` recorded for it: the save leaves them out of
+							// the cache file and names the URI in `CacheFile#failedChecks`, so the
+							// next session sends the file back through processing instead of
+							// restoring a subset of its diagnostics.
 							if (checked) {
 								analyzedUris.add(uri)
 							}

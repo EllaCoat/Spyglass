@@ -126,6 +126,30 @@ interface CacheFile {
 	 */
 	contextHash: string
 	errors: ErrorCache
+	/**
+	 * URIs whose check threw in the session that wrote this cache, mirroring
+	 * `Project#getFailedCheckUris`. Their `errors` entry is deliberately absent — the diagnostics
+	 * a failed check produced are a subset of the file's real ones and must not be restored —
+	 * while their checksums are kept, since the hashes describe the content and stay true
+	 * regardless of how far processing got. The session that reads this list retries those files
+	 * through `Project#queueFailedCheckRetries`.
+	 *
+	 * Optional on purpose, and deliberately not worth a {@link LatestCacheVersion} bump, which
+	 * would cost every user a cold rebuild. What that buys is schema compatibility, not a
+	 * symmetric round trip:
+	 *
+	 * - A cache written before this field existed reads as “no failed checks”, which is the same
+	 *   state a session starts in.
+	 * - A build that does not know the field still reads a cache carrying it, since
+	 *   {@link isCacheFile} does not inspect it — but it drops the field on its own next save,
+	 *   and it saves the diagnostics of a failed check like any other entry. The files that were
+	 *   on the list return to being remembered as complete when they are not, which is the
+	 *   behavior this field exists to end.
+	 *
+	 * So downgrading loses the retries and restores the old symptom for those files; it does not
+	 * corrupt anything, and nothing but a fresh failure puts them back on the list.
+	 */
+	failedChecks?: string[]
 	/** Fingerprint of the context returned by project initializers. */
 	initializerHash: string
 	/** Fingerprint of the lint configuration. */
@@ -175,6 +199,18 @@ function isCacheFile(value: unknown): value is CacheFile {
 		&& typeof cache.errors === 'object'
 		&& !!cache.symbols
 		&& typeof cache.symbols === 'object'
+}
+
+/**
+ * Read {@link CacheFile.failedChecks} out of a cache that passed {@link isCacheFile}, which does
+ * not inspect the field: an absent one is a cache from before it existed, and anything else in its
+ * place is a file that was tampered with. Both read as “no failed checks”, which costs nothing but
+ * a session without retries — the alternative, rejecting the cache, would cost a cold rebuild.
+ */
+function readFailedChecks(cache: CacheFile): string[] {
+	return Array.isArray(cache.failedChecks)
+		? cache.failedChecks.filter((uri) => typeof uri === 'string')
+		: []
 }
 
 /**
@@ -560,18 +596,28 @@ export class CacheService {
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
+				// The list this cache carries describes checkers from an initializer context this
+				// build no longer has, so it says nothing about the processors that are about to
+				// run. Cleared rather than merely left unread, so that what the ledger holds after
+				// this method always matches the cache that was adopted.
+				this.project.restoreFailedCheckUris([])
 				this.#invalidatedFiles.clear()
 				this.#hasValidatedFiles = false
 				return ans
 			}
 			this.checksums = cache.checksums
 			this.errors = cache.errors
+			this.project.restoreFailedCheckUris(readFailedChecks(cache))
 			ans.symbols = SymbolTable.link(cache.symbols)
 			__profiler.task('Link Symbols')
 			if (cache.lintHash !== prepared.lintHash) {
 				this.project.logger.info(
 					'[CacheService#activate] lint context mismatch; partially invalidating cache',
 				)
+				// The failed checks stay on record. Lint configuration has no bearing on whether a
+				// checker threw, the checkers themselves are the same ones that threw, and the
+				// invalidation below does not stand in for a retry: it sends every cached file
+				// back through binding, and a scan binds closed files without checking them.
 				this.invalidatePartial('lint')
 			} else if (cache.contextHash !== prepared.hash) {
 				this.project.logger.info(
@@ -579,6 +625,11 @@ export class CacheService {
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
+				// This branch means the combined fingerprint disagrees with the components it is
+				// made of, which is why every other part of this cache is being dropped as well.
+				// A list of URIs read out of a file that failed its own integrity check is not a
+				// reason to check anything; the next analysis records the failures that are real.
+				this.project.restoreFailedCheckUris([])
 				this.#invalidatedFiles.clear()
 				ans.symbols = {}
 				this.#hasValidatedFiles = false
@@ -734,6 +785,27 @@ export class CacheService {
 			unchangedFiles: [],
 		}
 
+		const failedCheckUris = this.project.getFailedCheckUris()
+		/**
+		 * A file whose content still matches the cache is only unchanged in the sense that
+		 * matters here — that the cached state describes it — if that state is complete. For a
+		 * file whose check threw it is not: its diagnostics were kept out of the cache, so
+		 * nothing would restore them and nothing would show for it. Calling it changed states
+		 * that much.
+		 *
+		 * Stating it is as far as this goes today. The scan that consumes `changedFiles` skips a
+		 * file whose content matches the cache — which is what a retry marker deliberately leaves
+		 * it as — so what brings these files back for another check is
+		 * `Project#queueFailedCheckRetries`, which seeds the retry pass directly.
+		 */
+		const classifyUnchanged = (uri: string): void => {
+			if (failedCheckUris.has(uri)) {
+				ans.changedFiles.push(uri)
+			} else {
+				ans.unchangedFiles.push(uri)
+			}
+		}
+
 		const unchangedRoots: string[] = []
 		for (const [uri, checksum] of Object.entries(this.checksums.roots)) {
 			try {
@@ -751,7 +823,7 @@ export class CacheService {
 
 		for (const [uri, checksum] of Object.entries(this.checksums.files)) {
 			if (unchangedRoots.some((root) => fileUtil.isSubUriOf(uri, root))) {
-				ans.unchangedFiles.push(uri)
+				classifyUnchanged(uri)
 				continue
 			}
 			if (this.project.shouldExclude(uri)) {
@@ -762,7 +834,7 @@ export class CacheService {
 			try {
 				const hash = await this.project.fs.hash(uri)
 				if (hash === checksum) {
-					ans.unchangedFiles.push(uri)
+					classifyUnchanged(uri)
 				} else {
 					ans.changedFiles.push(uri)
 				}
@@ -852,6 +924,10 @@ export class CacheService {
 				return false
 			}
 			const __profiler = this.project.profilers.get('cache#save')
+			// One reading of the ledger feeds both the list below and the diagnostics left out of
+			// it, so the cache cannot name a file as failed while carrying its partial
+			// diagnostics, or the other way around.
+			const failedCheckUris = this.project.getFailedCheckUris()
 			const cache: CacheFile = {
 				version: LatestCacheVersion,
 				contextHash,
@@ -860,7 +936,8 @@ export class CacheService {
 				projectRoots,
 				checksums,
 				symbols: SymbolTable.unlink(this.project.symbols.global),
-				errors: { ...this.errors },
+				errors: this.createPersistedErrors(failedCheckUris),
+				failedChecks: [...failedCheckUris],
 			}
 			__profiler.task('Unlink Symbols')
 
@@ -907,6 +984,30 @@ export class CacheService {
 			this.project.logger.error(`[CacheService#save] path = ${filePath}`, e)
 			throw e
 		}
+	}
+
+	/**
+	 * The error snapshot a save publishes: everything the live registry holds except the
+	 * diagnostics of a file whose check threw, which are a subset of what that file reports and
+	 * would otherwise be restored as its complete result for as long as its content is unchanged.
+	 *
+	 * The entries stay in the live registry, which is what lets a reset retract them from the
+	 * editor, and the checksums of those URIs are published as usual: a hash describes the
+	 * content, which is true regardless of how far processing got. Dropping the hashes instead
+	 * would leave a tracked file with no recorded state while the live registry — which is what
+	 * {@link createVerifiedChecksums} consults, not this filtered snapshot — still holds an error
+	 * entry for it, the one combination that method refuses to publish, and every save from then
+	 * on would fail. Keeping both means the failure is expressed by
+	 * {@link CacheFile.failedChecks} alone.
+	 */
+	private createPersistedErrors(failedCheckUris: ReadonlySet<string>): ErrorCache {
+		const ans: ErrorCache = {}
+		for (const [uri, errors] of Object.entries(this.errors)) {
+			if (!failedCheckUris.has(uri)) {
+				ans[uri] = errors
+			}
+		}
+		return ans
 	}
 
 	private isSaveSnapshotCurrent(
