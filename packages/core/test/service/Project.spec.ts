@@ -81,12 +81,11 @@ interface SetupResult {
 	watcher: TestFileWatcher
 }
 
-async function setup(
-	files: Record<string, string>,
+function createSetup(
+	fs: ReturnType<typeof memfs>['fs'],
 	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
 	extraInitializer?: ProjectInitializer,
-): Promise<SetupResult> {
-	const { fs } = memfs(files, '/')
+): SetupResult {
 	const externals = getNodeJsExternals({
 		cacheRoot: CacheRoot,
 		logger: Logger.noop(),
@@ -109,10 +108,32 @@ async function setup(
 	})
 
 	const watcher = new TestFileWatcher(externals, [ProjectRoot])
-	await project.init()
-	await project.ready({ projectRootsWatcher: watcher })
 
 	return { errors, fs, project, watcher }
+}
+
+async function readySetup(
+	fs: ReturnType<typeof memfs>['fs'],
+	extraInitializer?: ProjectInitializer,
+): Promise<SetupResult> {
+	const result = createSetup(fs, extraInitializer)
+	await result.project.init()
+	await result.project.ready({ projectRootsWatcher: result.watcher })
+
+	return result
+}
+
+async function setup(
+	files: Record<string, string>,
+	/** Runs after {@link testLanguageInitializer} and may therefore override its processors. */
+	extraInitializer?: ProjectInitializer,
+): Promise<SetupResult> {
+	const { fs } = memfs(files, '/')
+	const result = createSetup(fs, extraInitializer)
+	await result.project.init()
+	await result.project.ready({ projectRootsWatcher: result.watcher })
+
+	return result
 }
 
 /**
@@ -422,6 +443,77 @@ describe('Project', () => {
 				assert.deepEqual(errors.get(uriB), [])
 			} finally {
 				await project.close()
+			}
+		})
+
+		it('Should rebind and recheck a file whose checker threw after a warm start', async () => {
+			const uri = `${ProjectRoot}a.spyglasstest`
+			const partialMessage = 'Test checker partial error'
+			let shouldThrow = true
+			let bindCount = 0
+			let checkCount = 0
+			const initializer: ProjectInitializer = ({ meta }) => {
+				meta.registerBinder<LiteralNode>('literal', (node, ctx) => {
+					bindCount += 1
+					if (shouldThrow) {
+						ctx.err.report(partialMessage, node)
+					}
+				})
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					checkCount += 1
+					if (shouldThrow) {
+						throw new Error('Test checker failure')
+					}
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			}
+			const first = await setup({ '/root/a.spyglasstest': 'foo' }, initializer)
+			let firstClosed = false
+			let second: SetupResult | undefined
+			try {
+				bindCount = 0
+				checkCount = 0
+				const cacheService = first.project.cacheService
+				const originalSave = cacheService.save.bind(cacheService)
+				let saved: boolean | undefined
+				cacheService.save = async (options) => {
+					saved = await originalSave(options)
+					return saved
+				}
+
+				assert.deepEqual(
+					await first.project.analyzeProject(),
+					{ analyzedFiles: 0, cancelled: false, totalFiles: 1 },
+				)
+				assert.equal(checkCount, 1)
+				assert.equal(saved, true)
+				assert.deepEqual(
+					first.errors.get(uri)?.map((error) => error.message),
+					[partialMessage],
+					'the incomplete diagnostics must still reach listeners',
+				)
+				assert.equal(cacheService.errors[uri], undefined)
+				assert.equal(cacheService.checksums.fileContents[uri], undefined)
+				assert.equal(cacheService.checksums.files[uri], undefined)
+				await first.project.close()
+				firstClosed = true
+
+				shouldThrow = false
+				bindCount = 0
+				checkCount = 0
+				second = await readySetup(first.fs, initializer)
+
+				assert.equal(bindCount, 1)
+				assert.equal(checkCount, 1)
+				assert.deepEqual(
+					second.errors.get(uri)?.map((error) => error.message),
+					[TestCheckerMessage],
+				)
+			} finally {
+				if (!firstClosed) {
+					await first.project.close()
+				}
+				await second?.project.close()
 			}
 		})
 

@@ -193,6 +193,15 @@ export class CacheService {
 	checksums = Checksums.create()
 	errors: ErrorCache = {}
 	#hasValidatedFiles = false
+	/**
+	 * Files whose last published diagnostics came from a checker that did not complete.
+	 *
+	 * A saved cache represents these with a `fileContents` hash but no `files` hash or error
+	 * entry. The missing raw-file hash makes {@link validate} classify the URI as added on the
+	 * next start, while the retained content hash distinguishes it from a file that was never
+	 * processed and lets `Project#ready` retry its checker after rebinding it.
+	 */
+	#incompleteFiles = new Set<string>()
 	#invalidatedFiles = new Set<string>()
 	#pendingCache: CacheFile | undefined
 	#activeContextHash: string | undefined
@@ -280,6 +289,31 @@ export class CacheService {
 	 */
 	clearFileChange(uri: string): void {
 		this.#fileChangePendingUris.delete(uri)
+	}
+
+	/**
+	 * Exclude a checker's incomplete state from the next cache while retaining a retry marker.
+	 * The caller publishes the partial diagnostics to the editor before invoking this method.
+	 */
+	markDocumentIncomplete(uri: string): void {
+		this.#hashUpdateGeneration += 1
+		this.#incompleteFiles.add(uri)
+		this.#fileContentUpdateTokens.delete(uri)
+		delete this.checksums.fileContents[uri]
+		delete this.checksums.files[uri]
+		delete this.errors[uri]
+	}
+
+	/** Clear the retry marker before publishing a complete checker result. */
+	clearDocumentIncomplete(uri: string): void {
+		if (this.#incompleteFiles.delete(uri)) {
+			this.#hashUpdateGeneration += 1
+		}
+	}
+
+	/** Whether an initial scan must check this URI after rebinding it. */
+	shouldRetryCheck(uri: string): boolean {
+		return this.#incompleteFiles.has(uri)
 	}
 
 	/** Track a processed document without requiring its AST to remain live until publication. */
@@ -377,10 +411,11 @@ export class CacheService {
 	 * moments ago, {@link trackDocumentUpdate} recorded both hashes from the same read, and
 	 * `saveOnce` awaits {@link waitForPendingHashUpdates} before getting here, so re-reading the
 	 * whole corpus repeats a verification that has just run. What is deliberately not trusted:
-	 * a file with no `fileContents` entry was never bound, one with no `files` entry is one
-	 * `trackDocumentUpdate` found disagreeing with its backing file (an unsaved client-managed
-	 * edit, for instance), and one in `#fileChangePendingUris` received a watcher notification
-	 * after its hashes were recorded. All three keep the full read path.
+	 * a file with no `fileContents` entry was never bound, one with no `files` entry either
+	 * disagrees with its backing file (an unsaved client-managed edit, for instance) or carries
+	 * the incomplete-checker marker described by `#incompleteFiles`, and one in
+	 * `#fileChangePendingUris` received a watcher notification after its hashes were recorded.
+	 * All three keep the full read path.
 	 *
 	 * The cost is that an external change the file watcher missed is no longer caught here, so
 	 * the reuse stays scoped to rebuild-driven saves; the autosave interval and `close()` keep
@@ -407,7 +442,8 @@ export class CacheService {
 		const readUris: string[] = []
 		for (const uri of this.project.getTrackedFiles()) {
 			if (
-				(trustRecordedHashes || trustRecordedHashesFor?.has(uri) === true)
+				!this.#incompleteFiles.has(uri)
+				&& (trustRecordedHashes || trustRecordedHashesFor?.has(uri) === true)
 				&& !this.#fileChangePendingUris.has(uri)
 				&& checksums.fileContents[uri] !== undefined
 				&& checksums.files[uri] !== undefined
@@ -452,6 +488,19 @@ export class CacheService {
 			verified.fileContents[uri] = checksums.fileContents[uri]
 		}
 		for (const update of updates) {
+			if (this.#incompleteFiles.has(update.uri)) {
+				// A diagnostic entry here would pair errors with no raw-file checksum in the
+				// cache. Preserve the existing safety invariant instead of publishing such a
+				// snapshot if another event broke the marker's expected state.
+				if (Object.hasOwn(this.errors, update.uri)) {
+					return undefined
+				}
+				// Deliberately omit `files`: `validate` must rebind this unchanged file next
+				// time. The disk-derived text hash persists that this is a checker retry marker,
+				// rather than a tracked file that has never had document state.
+				verified.fileContents[update.uri] = update.fileContentHash
+				continue
+			}
 			const stateHash = checksums.fileContents[update.uri]
 			if (stateHash === undefined) {
 				if (Object.hasOwn(this.errors, update.uri)) {
@@ -560,12 +609,17 @@ export class CacheService {
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
+				this.#incompleteFiles.clear()
 				this.#invalidatedFiles.clear()
 				this.#hasValidatedFiles = false
 				return ans
 			}
 			this.checksums = cache.checksums
 			this.errors = cache.errors
+			this.#incompleteFiles = new Set(
+				Object.keys(cache.checksums.fileContents)
+					.filter(uri => cache.checksums.files[uri] === undefined),
+			)
 			ans.symbols = SymbolTable.link(cache.symbols)
 			__profiler.task('Link Symbols')
 			if (cache.lintHash !== prepared.lintHash) {
@@ -579,6 +633,7 @@ export class CacheService {
 				)
 				this.checksums = Checksums.create()
 				this.errors = {}
+				this.#incompleteFiles.clear()
 				this.#invalidatedFiles.clear()
 				ans.symbols = {}
 				this.#hasValidatedFiles = false
@@ -663,6 +718,7 @@ export class CacheService {
 			])
 		for (const uri of targets) {
 			this.#invalidatedFiles.add(uri)
+			this.#incompleteFiles.delete(uri)
 			this.#fileContentUpdateTokens.delete(uri)
 			delete this.checksums.fileContents[uri]
 			delete this.checksums.files[uri]
@@ -697,6 +753,7 @@ export class CacheService {
 			},
 			errors: { ...this.errors },
 			hasValidatedFiles: this.#hasValidatedFiles,
+			incompleteFiles: new Set(this.#incompleteFiles),
 			invalidatedFiles: new Set(this.#invalidatedFiles),
 			pendingCache: this.#pendingCache,
 		}
@@ -719,6 +776,7 @@ export class CacheService {
 				this.checksums = snapshot.checksums
 				this.errors = snapshot.errors
 				this.#hasValidatedFiles = snapshot.hasValidatedFiles
+				this.#incompleteFiles = snapshot.incompleteFiles
 				this.#invalidatedFiles = snapshot.invalidatedFiles
 				this.#pendingCache = snapshot.pendingCache
 				settle()
@@ -928,13 +986,15 @@ export class CacheService {
 	}
 
 	async hasFileChangedSinceCache(doc: TextDocument): Promise<boolean> {
-		return (this.checksums.fileContents[doc.uri] !== (await getSha1(doc.getText())))
+		return this.#incompleteFiles.has(doc.uri)
+			|| this.checksums.fileContents[doc.uri] !== (await getSha1(doc.getText()))
 	}
 
 	reset(): LoadResult {
 		this.#hasValidatedFiles = false
 		this.#hashUpdateGeneration += 1
 		this.#fileContentUpdateTokens.clear()
+		this.#incompleteFiles.clear()
 		this.#invalidatedFiles.clear()
 		this.#rootUpdateTokens.clear()
 		this.checksums = Checksums.create()
