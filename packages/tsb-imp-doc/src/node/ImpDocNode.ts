@@ -130,6 +130,14 @@ export interface ImpDocDeclarationNode extends AstNode {
 	category: ImpDocDeclarationCategory
 	categoryRange: AstNode['range']
 	name: ImpDocValue
+	/**
+	 * `true` when the directive owns no IMP-Doc block: it sits on a plain comment
+	 * line instead of following a `#>` block of its own. v3 parsed `#declare` /
+	 * `#define` through the CommandTree `comments` section, so such a directive
+	 * still declared its symbol, with `env.defaultVisibility` (= `public`) as its
+	 * visibility. The surrounding function header's annotations never applied.
+	 */
+	bare?: boolean
 }
 
 export type ImpDocKnownAliasKind = LegacyAliasTypeId extends `alias/${infer Kind}` ? Kind : never

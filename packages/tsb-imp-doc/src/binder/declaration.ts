@@ -5,6 +5,7 @@ import type {
 	ImpDocDeclarationNode,
 	ImpDocDeclarationSource,
 	ImpDocNode,
+	ImpDocVisibility,
 } from '../node/ImpDocNode.js'
 import { getImpDocSymbolData, ImpDocNode as ImpDocNodeUtil } from '../node/ImpDocNode.js'
 import { getDocumentFunction } from '../util/documentFunction.js'
@@ -46,13 +47,13 @@ function ownerForDocument(
 export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 	(node, ctx) => {
 		const doc = enclosingImpDoc(node)
-		if (!doc) {
+		if (!doc && !node.bare) {
 			ctx.err.report('Detached IMP-Doc declaration', node)
 			return
 		}
 
 		const owner = ownerForDocument(ctx, node)
-			?? (doc.functionID?.raw
+			?? (doc?.functionID?.raw
 				? core.ResourceLocation.lengthen(doc.functionID.raw)
 				: undefined)
 		if (!owner) {
@@ -63,16 +64,26 @@ export const declaration = core.SyncBinder.create<ImpDocDeclarationNode>(
 			return
 		}
 
-		const visibility = parseVisibility(doc.annotations, owner, ctx.err)
-			?? fallbackVisibility(doc.annotations, owner, ctx.err)
+		// A bare directive (`ImpDocDeclarationNode.bare`) carries no annotations of
+		// its own, and v3 gave it none either: its cache entry was written by the
+		// CommandTree `comments` parser, which never set a visibility, so
+		// `env.defaultVisibility` (= `public`) applied. Inheriting the enclosing
+		// function header's `@private` / `@within` instead would restrict a symbol
+		// that v3 exposed everywhere.
+		const visibility: ImpDocVisibility = doc
+			? parseVisibility(doc.annotations, owner, ctx.err)
+				?? fallbackVisibility(doc.annotations, owner, ctx.err)
+			: { type: 'public' }
 
-		doc.visibility = visibility
+		if (doc) {
+			doc.visibility = visibility
+		}
 
 		const candidate: ImpDocDeclarationSource = {
 			uri: ctx.doc.uri,
 			range: node.name.range,
 			owner,
-			description: ImpDocNodeUtil.getDescription(doc),
+			...(doc ? { description: ImpDocNodeUtil.getDescription(doc) } : {}),
 		}
 
 		// `sequence` などの mapped category は canonical (v4) symbol table に集約する。
