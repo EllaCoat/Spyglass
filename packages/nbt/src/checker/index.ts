@@ -381,12 +381,15 @@ export function path(
 						({ originalNode: link }) => link.node.range,
 					)(error)
 				},
-				attachTypeInfo: (link, definition, desc = '') => {
+				attachTypeInfo: (link, definition, desc = '', getNonCanonicalTypeDef) => {
 					if (definition.kind === 'literal' && !definition.attributes?.length) {
 						return
 					}
 					if (link.node.type === 'leaf') {
 						link.path.endTypeDef = definition
+						// The path itself is walked in a read context, but whatever gets assigned
+						// to its end is not, so the end needs both types.
+						link.path.endWriteTypeDef = getNonCanonicalTypeDef?.() ?? definition
 					} else {
 						link.node.typeDef = definition
 					}

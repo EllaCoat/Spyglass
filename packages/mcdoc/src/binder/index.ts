@@ -123,6 +123,12 @@ namespace ModuleSymbolData {
 export interface TypeDefSymbolData {
 	typeDef: McdocType
 	simplifiedTypeDef?: SimplifiedMcdocType
+	/**
+	 * The simplified type as seen by a checker with `requireCanonical` set, where `#[canonical]`
+	 * union members shadow their alternatives. This differs from {@link simplifiedTypeDef}, so
+	 * the two contexts must not share a cache slot.
+	 */
+	canonicalSimplifiedTypeDef?: SimplifiedMcdocType
 }
 export namespace TypeDefSymbolData {
 	export function is(data: unknown): data is TypeDefSymbolData {

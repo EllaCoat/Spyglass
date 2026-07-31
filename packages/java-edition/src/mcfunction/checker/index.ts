@@ -201,7 +201,9 @@ function nbtChecker(
 		const tag = node.children[0]
 		if (indexedBy) {
 			if (NbtPathNode.is(indexedBy)) {
-				const indexedByTypedef = indexedBy.children[0].endTypeDef
+				// The value is assigned to the end of the path, so `#[canonical]` union members
+				// must not shadow the alternatives that the game accepts just as well.
+				const indexedByTypedef = indexedBy.children[0].endWriteTypeDef
 				const typeDef = indexedByTypedef && node.properties.isListIndex
 					? getListLikeChild(indexedByTypedef)
 					: indexedByTypedef

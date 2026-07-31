@@ -204,9 +204,16 @@ export interface NbtPathNode extends core.AstNode {
 	type: 'nbt:path'
 	children: NbtPathChild[]
 	/**
-	 * The type definition at the end of the path
+	 * The type definition at the end of the path, as seen when reading it: the path is walked
+	 * with `requireCanonical`, so `#[canonical]` union members shadow their alternatives.
 	 */
 	endTypeDef?: mcdoc.runtime.checker.SimplifiedMcdocType
+	/**
+	 * The type definition at the end of the path, as seen when writing to it: same as
+	 * {@link endTypeDef}, except that `#[canonical]` union members do not shadow their
+	 * alternatives, since all of them can be assigned to the path.
+	 */
+	endWriteTypeDef?: mcdoc.runtime.checker.SimplifiedMcdocType
 }
 export namespace NbtPathNode {
 	/* istanbul ignore next */

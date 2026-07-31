@@ -361,11 +361,46 @@ export function typeDefinition<T>(
 	}
 }
 
+/**
+ * Resolves the definitions of a node again without `#[canonical]` filtering. Unlike the
+ * definitions attached to the node, which are what the value is expected to be when read, this
+ * is what may be assigned to it.
+ *
+ * Only the definitions of this very node are simplified again; the traversal that led here keeps
+ * using the canonical types.
+ */
+function getNonCanonicalTypeDef<T>(
+	node: CheckerTreeRuntimeNode<T>,
+	ctx: McdocCheckerContext<T>,
+): SimplifiedMcdocType {
+	const nonCanonicalCtx: McdocCheckerContext<T> = { ...ctx, requireCanonical: false }
+	const members: SimplifiedMcdocTypeNoUnion[] = []
+	for (const group of node.definitionsByParent) {
+		if (!ctx.requireCanonical) {
+			// Nothing was filtered out to begin with.
+			members.push(...group.validDefinitions.map(d => d.typeDef))
+			continue
+		}
+		const simplified = simplify(group.originalTypeDef, { ctx: nonCanonicalCtx, node }).typeDef
+		if (simplified.kind === 'union') {
+			members.push(...simplified.members)
+		} else {
+			members.push(simplified)
+		}
+	}
+	return members.length === 1 ? members[0] : { kind: 'union', members }
+}
+
 function attachTypeInfo<T>(node: CheckerTreeRuntimeNode<T>, ctx: McdocCheckerContext<T>) {
 	const definitions = node.definitionsByParent.flatMap(d => d.validDefinitions)
 	if (definitions.length === 1) {
 		const { typeDef, groupNode } = definitions[0]
-		ctx.attachTypeInfo?.(node.node.originalNode, typeDef, groupNode.desc)
+		ctx.attachTypeInfo?.(
+			node.node.originalNode,
+			typeDef,
+			groupNode.desc,
+			() => getNonCanonicalTypeDef(node, ctx),
+		)
 		handleNodeAttachers(node.node, typeDef, ctx)
 
 		if (node.entryNode.runtimeKey && groupNode.keyDefinition) {
@@ -377,10 +412,12 @@ function attachTypeInfo<T>(node: CheckerTreeRuntimeNode<T>, ctx: McdocCheckerCon
 			handleNodeAttachers(node.entryNode.runtimeKey, groupNode.keyDefinition, ctx)
 		}
 	} else if (definitions.length > 1) {
-		ctx.attachTypeInfo?.(node.node.originalNode, {
-			kind: 'union',
-			members: definitions.map(d => d.typeDef),
-		})
+		ctx.attachTypeInfo?.(
+			node.node.originalNode,
+			{ kind: 'union', members: definitions.map(d => d.typeDef) },
+			undefined,
+			() => getNonCanonicalTypeDef(node, ctx),
+		)
 
 		if (node.entryNode.runtimeKey) {
 			ctx.attachTypeInfo?.(node.entryNode.runtimeKey.originalNode, {
@@ -837,6 +874,31 @@ export function simplify<T>(
 	}
 }
 
+/**
+ * `#[canonical]` union members are only honored when the context has `requireCanonical` set, so
+ * the same symbol simplifies to two different types depending on the context it is reached from.
+ * Each of them therefore gets its own cache slot, instead of whichever one ran first winning.
+ */
+function getCachedSimplifiedTypeDef<T>(
+	data: TypeDefSymbolData,
+	context: SimplifyContext<T>,
+): SimplifiedMcdocType | undefined {
+	if (!context.ctx.config.env.enableMcdocCaching) {
+		return undefined
+	}
+	return context.ctx.requireCanonical ? data.canonicalSimplifiedTypeDef : data.simplifiedTypeDef
+}
+
+function withCachedSimplifiedTypeDef<T>(
+	data: TypeDefSymbolData,
+	typeDef: SimplifiedMcdocType,
+	context: SimplifyContext<T>,
+): TypeDefSymbolData {
+	return context.ctx.requireCanonical
+		? { ...data, canonicalSimplifiedTypeDef: typeDef }
+		: { ...data, simplifiedTypeDef: typeDef }
+}
+
 function simplifyReference<T>(
 	typeDef: ReferenceType,
 	context: SimplifyContext<T>,
@@ -857,8 +919,9 @@ function simplifyReference<T>(
 		context.ctx.logger.warn(`Tried to access unknown reference ${typeDef.path}`)
 		return { typeDef: { kind: 'union', members: [] } }
 	}
-	if (context.ctx.config.env.enableMcdocCaching && data.simplifiedTypeDef) {
-		return { typeDef: data.simplifiedTypeDef }
+	const cached = getCachedSimplifiedTypeDef(data, context)
+	if (cached) {
+		return { typeDef: cached }
 	}
 	const simplifiedResult = simplify(data.typeDef, context)
 	if (typeDef.attributes?.length) {
@@ -870,10 +933,7 @@ function simplifyReference<T>(
 	if (context.ctx.config.env.enableMcdocCaching && !simplifiedResult.dynamicData) {
 		symbol.amend({
 			data: {
-				data: {
-					...data,
-					simplifiedTypeDef: simplifiedResult.typeDef,
-				} satisfies TypeDefSymbolData,
+				data: withCachedSimplifiedTypeDef(data, simplifiedResult.typeDef, context),
 			},
 		})
 	}
@@ -941,11 +1001,12 @@ function resolveIndices<T>(
 			return
 		}
 
-		if (context.ctx.config.env.enableMcdocCaching && data.simplifiedTypeDef) {
-			if (data.simplifiedTypeDef.kind === 'union') {
-				values.push(...data.simplifiedTypeDef.members)
+		const cached = getCachedSimplifiedTypeDef(data, context)
+		if (cached) {
+			if (cached.kind === 'union') {
+				values.push(...cached.members)
 			} else {
-				values.push(data.simplifiedTypeDef)
+				values.push(cached)
 			}
 		} else {
 			const simplifiedResult = simplify(data.typeDef, context)
@@ -956,7 +1017,13 @@ function resolveIndices<T>(
 					key,
 					s =>
 						s.amend({
-							data: { data: { ...data, simplifiedTypeDef: simplifiedResult.typeDef } },
+							data: {
+								data: withCachedSimplifiedTypeDef(
+									data,
+									simplifiedResult.typeDef,
+									context,
+								),
+							},
 						}),
 				)
 			}
