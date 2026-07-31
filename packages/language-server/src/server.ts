@@ -31,6 +31,18 @@ const { cache: cacheRootPath } = envPaths('spyglassmc')
 const cacheRoot = fileUtil.ensureEndingSlash(url.pathToFileURL(cacheRootPath).toString())
 
 const connection = ls.createConnection()
+/**
+ * The last diagnostics notification sent for each URI, as the serialized payload that went out and
+ * the version it went out with.
+ *
+ * A publish is skipped only when both match. The version is part of the comparison because the
+ * same diagnostics are published under versions that mean different things — the editor's version
+ * for a client-managed document, `-1` for one read from disk, none at all for the empty set that
+ * retracts a removed document's diagnostics — and an empty payload is a payload like any other:
+ * the diagnostics a client displays stay on screen until an empty set that differs from what it
+ * last received takes them away.
+ */
+const lastSentDiagnostics = new Map<string, { payload: string; version: number | undefined }>()
 let capabilities!: ls.ClientCapabilities
 let workspaceFolders!: ls.WorkspaceFolder[]
 let projectRoots!: core.RootUriString[]
@@ -131,13 +143,24 @@ connection.onInitialize(async (params) => {
 				uri = clientUri
 			}
 
+			const diagnostics = toLS.diagnostics(errors)
+			const payload = JSON.stringify(diagnostics)
+			const previous = lastSentDiagnostics.get(uri)
+			if (previous && previous.version === version && previous.payload === payload) {
+				// Notifying a client of the state it is already in is not free on its side: VS Code
+				// rebuilds the problems view around the new markers, which closes a hover open over
+				// one of them, which sends the requests that produced this publish all over again.
+				return
+			}
+			// Recorded before the notification rather than after it, so that the record follows the
+			// order the notifications go out in rather than the order their promises settle in.
+			lastSentDiagnostics.set(uri, { payload, version })
 			try {
-				await connection.sendDiagnostics({
-					diagnostics: toLS.diagnostics(errors),
-					uri,
-					version,
-				})
+				await connection.sendDiagnostics({ diagnostics, uri, version })
 			} catch (e) {
+				// Nothing reached the client, so the next publish of these very diagnostics is a
+				// publish the client still needs.
+				lastSentDiagnostics.delete(uri)
 				console.error('[sendDiagnostics]', e)
 			}
 		}).on('ready', async () => {

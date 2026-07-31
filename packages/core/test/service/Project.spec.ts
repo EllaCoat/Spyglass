@@ -1258,6 +1258,157 @@ describe('Project', () => {
 			}
 		})
 
+		it('Should publish once for concurrent requests on one document', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const checkedUris: string[] = []
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					checkedUris.push(ctx.doc.uri)
+					ctx.err.report(TestCheckerMessage, node)
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				const clientManaged = project.getClientManaged(uriA)
+				assert.ok(clientManaged)
+				// Same starting point as the single request above: dropping what the open left on
+				// the node is what leaves a check for the first of the requests below to run.
+				delete clientManaged.node.checkerErrors
+				delete clientManaged.node.linterErrors
+				checkedUris.length = 0
+				const published: string[] = []
+				project.on('documentErrored', ({ uri }) => {
+					published.push(uri)
+				})
+
+				// One editor gesture sends several requests for the same range: hovering an entry in
+				// the problems panel is the one this covers. Every one of them has to be answered.
+				const kinds = await Promise.all(
+					Array.from(
+						{ length: 5 },
+						() => project.withClientFeatureAccess(uriA, (access) => access.kind),
+					),
+				)
+				await runPendingTurns()
+
+				assert.deepEqual(kinds, ['checked', 'checked', 'checked', 'checked', 'checked'])
+				assert.deepEqual(checkedUris, [uriA], 'the requests checked the document repeatedly')
+				// Publishing diagnostics the client already holds redraws its problems panel, which
+				// drops the hover that asked, which sends the request again: the self-sustaining
+				// loop this suppression exists to break.
+				assert.deepEqual(published, [uriA], 'the requests republished identical diagnostics')
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should publish the new version of an edited document once', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' })
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				await project.withClientFeatureAccess(uriA, () => {})
+
+				const published: { uri: string; version: number | undefined }[] = []
+				project.on('documentErrored', ({ uri, version }) => {
+					published.push({ uri, version })
+				})
+				await project.onDidChange(uriA, [{ text: 'foo' }], 2)
+
+				const kinds = await Promise.all(
+					Array.from(
+						{ length: 5 },
+						() => project.withClientFeatureAccess(uriA, (access) => access.kind),
+					),
+				)
+				await runPendingTurns()
+
+				assert.deepEqual(kinds, ['checked', 'checked', 'checked', 'checked', 'checked'])
+				assert.ok(published.length > 0, 'the edit never reached the client')
+				assert.deepEqual(
+					[...new Set(published.map((event) => event.version))],
+					[2],
+					'a request published a version the editor had already replaced',
+				)
+				// The edit publishes the new version itself, and the requests that follow it add at
+				// most the one publish that carries whatever the edit did not: nothing per request.
+				assert.ok(
+					published.length <= 2,
+					`the requests republished the same version ${published.length} times`,
+				)
+				assert.deepEqual([...new Set(published.map((event) => event.uri))], [uriA])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should publish a document whose diagnostics went away', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			let shouldReport = true
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' }, ({ meta }) => {
+				meta.registerChecker<LiteralNode>('literal', (node, ctx) => {
+					if (shouldReport) {
+						ctx.err.report(TestCheckerMessage, node)
+					}
+				})
+			})
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				await project.withClientFeatureAccess(uriA, () => {})
+				const clientManaged = project.getClientManaged(uriA)
+				assert.ok(clientManaged)
+
+				const published: { errorCount: number; uri: string }[] = []
+				project.on('documentErrored', ({ errors, uri }) => {
+					published.push({ errorCount: errors.length, uri })
+				})
+
+				shouldReport = false
+				delete clientManaged.node.checkerErrors
+				delete clientManaged.node.linterErrors
+				await project.withClientFeatureAccess(uriA, () => {})
+				await runPendingTurns()
+
+				// The one publish a client cannot do without: diagnostics it already holds stay on
+				// screen until an empty set retracts them, so an empty result is a change like any
+				// other and never the thing that looks unchanged.
+				assert.deepEqual(published, [{ errorCount: 0, uri: uriA }])
+			} finally {
+				await project.close()
+			}
+		})
+
+		it('Should publish a reopened document again', async () => {
+			const uriA = `${ProjectRoot}a.spyglasstest`
+			const { project } = await setup({ '/root/a.spyglasstest': 'foo' })
+			try {
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				await project.withClientFeatureAccess(uriA, () => {})
+				await project.onDidClose(uriA)
+
+				const published: { errorCount: number; uri: string; version: number | undefined }[] = []
+				project.on('documentErrored', ({ errors, uri, version }) => {
+					published.push({ errorCount: errors.length, uri, version })
+				})
+
+				// The client comes back with the URI, the content and the version it opened the
+				// first time around. Nothing the project remembers of the earlier session may make
+				// the second one look like a repeat of it.
+				await project.onDidOpen(uriA, 'spyglasstest', 1, 'foo')
+				const kind = await project.withClientFeatureAccess(uriA, (access) => access.kind)
+				await runPendingTurns()
+
+				assert.equal(kind, 'checked')
+				assert.ok(published.length > 0, 'the reopened document reached the client empty')
+				assert.deepEqual(
+					[...new Set(published.map((event) => JSON.stringify(event)))],
+					[JSON.stringify({ errorCount: 1, uri: uriA, version: 1 })],
+				)
+			} finally {
+				await project.close()
+			}
+		})
+
 		it('Should gate a document-less symbol read on the same analysis', async () => {
 			const releaseCheck = Promise.withResolvers<void>()
 			const analysisCheckStarted = Promise.withResolvers<void>()
