@@ -300,6 +300,28 @@ interface NbtPathLink {
 	next?: NbtPathLink
 }
 
+/**
+ * Filters do not advance the path: `foo{bar:1}` still refers to `foo`.
+ *
+ * @returns The link where the path continues, which is the leaf when it ends at `link`.
+ */
+function skipPathFilters(link: NbtPathLink): NbtPathLink {
+	while (link.next && link.node.type !== 'leaf' && NbtPathFilterNode.is(link.node)) {
+		link = link.next
+	}
+	return link
+}
+
+/**
+ * @returns Whether nothing follows `link`, i.e. whether the type of `link` is the type a value
+ * assigned to the whole path needs to have. True for the leaf, and for a trailing filter, which
+ * the leaf is only reachable through.
+ */
+function isPathEnd(link: NbtPathLink): boolean {
+	const end = skipPathFilters(link)
+	return !end.next || end.node.type === 'leaf'
+}
+
 // TODO: check nbt index nodes and nbt compound nodes
 export function path(
 	registry: core.FullResourceLocation,
@@ -345,9 +367,7 @@ export function path(
 					return undefined
 				},
 				getChildren: (link): mcdoc.runtime.checker.RuntimeUnion<NbtPathLink>[] => {
-					while (link.next && link.node.type !== 'leaf' && NbtPathFilterNode.is(link.node)) {
-						link = link.next
-					}
+					link = skipPathFilters(link)
 					if (!link.next || link.node.type === 'leaf') {
 						return []
 					}
@@ -382,15 +402,18 @@ export function path(
 					)(error)
 				},
 				attachTypeInfo: (link, definition, desc = '', getNonCanonicalTypeDef) => {
-					if (definition.kind === 'literal' && !definition.attributes?.length) {
-						return
-					}
-					if (link.node.type === 'leaf') {
+					// Recorded before the literal bail-out below: a path whose end is a literal
+					// still only accepts that literal being written to it.
+					if (isPathEnd(link)) {
 						link.path.endTypeDef = definition
 						// The path itself is walked in a read context, but whatever gets assigned
 						// to its end is not, so the end needs both types.
 						link.path.endWriteTypeDef = getNonCanonicalTypeDef?.() ?? definition
-					} else {
+					}
+					if (definition.kind === 'literal' && !definition.attributes?.length) {
+						return
+					}
+					if (link.node.type !== 'leaf') {
 						link.node.typeDef = definition
 					}
 					// TODO: improve hover info

@@ -4,6 +4,7 @@ import { command as commandChecker } from '@spyglassmc/java-edition/lib/mcfuncti
 import { argument } from '@spyglassmc/java-edition/lib/mcfunction/parser/index.js'
 import { getPatch } from '@spyglassmc/java-edition/lib/mcfunction/tree/patch.js'
 import type { McdocType } from '@spyglassmc/mcdoc'
+import type { TypeDefSymbolData } from '@spyglassmc/mcdoc/lib/binder/index.js'
 import * as mcf from '@spyglassmc/mcfunction'
 import * as nbt from '@spyglassmc/nbt'
 import assert from 'node:assert/strict'
@@ -155,6 +156,11 @@ function initSymbols(symbols: core.SymbolUtil) {
 							key: 'Tags',
 							type: { kind: 'list', item: { kind: 'string' } },
 						},
+						{
+							kind: 'pair',
+							key: 'billboard',
+							type: { kind: 'literal', value: { kind: 'string', value: 'fixed' } },
+						},
 					],
 				} satisfies McdocType,
 			},
@@ -168,17 +174,35 @@ interface CheckResult {
 	pathNode: nbt.NbtPathNode
 }
 
-function createProject(enableMcdocCaching = false) {
+/**
+ * @param symbols A symbol table to adopt as-is, standing in for the one a session restores from
+ * the on-disk cache. When omitted, a fresh one is populated by {@link initSymbols}.
+ */
+function createProject(enableMcdocCaching = false, symbols?: core.SymbolTable) {
 	const project = mockProjectData({
 		ctx: { loadedVersion: '1.20.4' },
 		config: {
 			...core.VanillaConfig,
 			env: { ...core.VanillaConfig.env, enableMcdocCaching },
 		},
+		symbols: symbols ? new core.SymbolUtil(symbols) : undefined,
 	})
 	nbt.initialize({ ...project, reinitializeOnChange: () => {} })
-	initSymbols(project.symbols)
+	if (!symbols) {
+		initSymbols(project.symbols)
+	}
 	return project
+}
+
+/** The round trip a symbol table makes through the on-disk cache. */
+function reloadSymbols(symbols: core.SymbolUtil): core.SymbolTable {
+	return core.SymbolTable.deserialize(core.SymbolTable.serialize(symbols.global))
+}
+
+function getTypeDefSymbols(symbols: core.SymbolUtil): TypeDefSymbolData[] {
+	return Object.values(symbols.global.mcdoc ?? {})
+		.map(symbol => symbol.data as TypeDefSymbolData | undefined)
+		.filter((data): data is TypeDefSymbolData => data?.typeDef !== undefined)
 }
 
 function check(project: core.ProjectData, content: string): CheckResult {
@@ -252,6 +276,10 @@ describe('mcfunction checker data modify ... value', () => {
 		'data modify entity @s Tags prepend value "foo"',
 		'data modify entity @s Tags insert 0 value "foo"',
 		'data modify entity @s transformation append value 1.0f',
+		// A trailing filter does not advance the path, so the end of it is still `transformation`.
+		`data modify entity @s transformation{} set value ${DecomposedValue}`,
+		// A literal end of a path accepts that literal.
+		'data modify entity @s billboard set value "fixed"',
 	]
 	for (const content of acceptedCases) {
 		it(`Should accept '${content}'`, () => {
@@ -286,6 +314,16 @@ describe('mcfunction checker data modify ... value', () => {
 		{
 			content: 'data modify entity @s Tags append value 1b',
 			errors: ['Expected a string'],
+		},
+		// A trailing filter must not drop the end type and leave the value unchecked.
+		{
+			content: 'data modify entity @s transformation{} set value "hello"',
+			errors: ['Expected a map-like or a list'],
+		},
+		// Neither must a literal end type.
+		{
+			content: 'data modify entity @s billboard set value "other"',
+			errors: ['Expected “fixed”'],
 		},
 	]
 	for (const { content, errors: expected } of rejectedCases) {
@@ -335,6 +373,62 @@ describe('mcfunction checker data modify ... value', () => {
 			const result = check(project, second)
 			assertNoErrors(result, second)
 			assert.equal(result.pathNode.endTypeDef?.kind, 'list')
+		})
+
+		// Symbols, and with them the cached simplified types, are restored from disk as they were
+		// written, so the resolutions of a warm start have to hold up on their own.
+		const warmStartCases = [
+			`data modify entity @s transformation set value ${MatrixValue}`,
+			'data modify entity @s transformation.left_rotation set value {angle:0.1745f,axis:[0.0f,1.0f,0.0f]}',
+		]
+
+		it('Should survive a cache reload', () => {
+			const first = createProject(true)
+			for (const content of warmStartCases) {
+				assertNoErrors(check(first, content), content)
+			}
+			assert.ok(
+				getTypeDefSymbols(first.symbols).some(data => data.simplifiedTypeDefs),
+				'Nothing was cached, so the reload would not prove anything',
+			)
+
+			const second = createProject(true, reloadSymbols(first.symbols))
+			for (const content of warmStartCases) {
+				assertNoErrors(check(second, content), content)
+			}
+		})
+
+		it('Should ignore a simplified type cached before the canonical split', () => {
+			const first = createProject(true)
+			// Walking a path is the canonical context, so this fills the cache with the types a
+			// pre-split build would have put in its single slot.
+			const priming =
+				'data modify entity @s transformation.left_rotation set value [0.0f,0.0f,0.0f,1.0f]'
+			assertNoErrors(check(first, priming), priming)
+
+			let downgraded = 0
+			for (const data of getTypeDefSymbols(first.symbols)) {
+				if (!data.simplifiedTypeDefs?.canonical) {
+					continue
+				}
+				delete data.simplifiedTypeDefs
+				// Deliberately not the canonical type this stood for. A slot that cannot be
+				// attributed to either context must not reach a resolution at all, so what it
+				// holds may not matter, and a wrong type makes any use of it observable.
+				data.simplifiedTypeDef = { kind: 'string' }
+				downgraded += 1
+			}
+			assert.notEqual(downgraded, 0, 'No cached type to downgrade, so nothing is covered')
+
+			const second = createProject(true, reloadSymbols(first.symbols))
+			for (const content of warmStartCases) {
+				assertNoErrors(check(second, content), content)
+			}
+			assert.deepEqual(
+				getTypeDefSymbols(second.symbols).filter(data => data.simplifiedTypeDef).length,
+				0,
+				'The pre-split slot has to be dropped, or a later resolution could still reach it',
+			)
 		})
 	})
 })

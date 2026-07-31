@@ -878,6 +878,9 @@ export function simplify<T>(
  * `#[canonical]` union members are only honored when the context has `requireCanonical` set, so
  * the same symbol simplifies to two different types depending on the context it is reached from.
  * Each of them therefore gets its own cache slot, instead of whichever one ran first winning.
+ *
+ * The deprecated single slot of {@link TypeDefSymbolData} is never consulted: it holds one of the
+ * two forms without recording which, and caches in that shape are still restored from disk.
  */
 function getCachedSimplifiedTypeDef<T>(
 	data: TypeDefSymbolData,
@@ -886,7 +889,9 @@ function getCachedSimplifiedTypeDef<T>(
 	if (!context.ctx.config.env.enableMcdocCaching) {
 		return undefined
 	}
-	return context.ctx.requireCanonical ? data.canonicalSimplifiedTypeDef : data.simplifiedTypeDef
+	return context.ctx.requireCanonical
+		? data.simplifiedTypeDefs?.canonical
+		: data.simplifiedTypeDefs?.nonCanonical
 }
 
 function withCachedSimplifiedTypeDef<T>(
@@ -894,9 +899,15 @@ function withCachedSimplifiedTypeDef<T>(
 	typeDef: SimplifiedMcdocType,
 	context: SimplifyContext<T>,
 ): TypeDefSymbolData {
-	return context.ctx.requireCanonical
-		? { ...data, canonicalSimplifiedTypeDef: typeDef }
-		: { ...data, simplifiedTypeDef: typeDef }
+	// Drops the deprecated slot rather than carrying it along, so a cache written before the
+	// split converges on the current shape as its symbols get simplified again.
+	const { simplifiedTypeDef: _legacy, ...rest } = data
+	return {
+		...rest,
+		simplifiedTypeDefs: context.ctx.requireCanonical
+			? { ...rest.simplifiedTypeDefs, canonical: typeDef }
+			: { ...rest.simplifiedTypeDefs, nonCanonical: typeDef },
+	}
 }
 
 function simplifyReference<T>(
