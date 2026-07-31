@@ -10,7 +10,7 @@ Unofficial fork of [Spyglass](https://github.com/SpyglassMC/Spyglass) that adds 
 | Upstream ID | `SPGoding.datapack-language-server` |
 | Source | <https://github.com/EllaCoat/Spyglass> |
 
-Everything below the *Required setup* section is upstream documentation and applies unchanged.
+The *Configuration*, *Features* and *Credits* sections below are upstream documentation and apply unchanged. *Commands* describes this fork, whose analysis behaviour differs from upstream.
 
 ## Installing
 
@@ -40,13 +40,24 @@ A locally installed VSIX has no Marketplace counterpart, so VS Code will not rep
 }
 ```
 
-### 3. Open the project as a multi-root workspace
+### 3. Open one repository per window
 
-IMP-Doc `@within` and `#declare` resolution needs every referenced pack inside the same project. Open the Core and Asset repositories together as a multi-root workspace and put a byte-identical `spyglass.json` at the root of each folder. Configuration is merged with later roots winning, so a drifting copy silently overrides the other one.
+A pack declares everything it needs, so IMP-Doc `@within` and `#declare` resolve within a single project. Open one repository on its own and put a `spyglass.json` at its root. This is the standard setup.
+
+A multi-root workspace holding several packs at once also works, but it is a different case and two effects are expected there rather than defects:
+
+- Configuration is merged with later roots winning, so a `spyglass.json` that has drifted from the others silently overrides them. Keep the copies byte-identical.
+- `impDocVisibilityConflict` can fire on declarations that legitimately exist in more than one pack. The rule compares the declarations of a symbol and never looks at the number of roots, so it reports a conflict that lives inside a single pack just as well; only the ones caused by packs overlapping are specific to this setup.
+
+All the roots of such a workspace have to be in place when the server starts. Open the `.code-workspace` file rather than assembling the workspace by hand: a folder added to a running window through *Add Folder to Workspace* is not taken into the project, and only becomes part of it after *Developer: Reload Window*.
 
 ### 4. Version policy
 
 The version is bumped on every rebuild that changes the packaged bytes, so a given `tsb-spyglass-<version>.vsix` corresponds to exactly one build. Publishing scripts (`npm run release`) are deliberately wired to fail; use `npm run package:vsix` instead.
+
+### 5. Analyze the project before reading its diagnostics
+
+Once the repository is open and the server has finished starting up, run `Spyglass: Analyze Project` and let it run to the end. Until it has, the files you do not have open are not guaranteed to carry checker and linter diagnostics, and the Problems panel is a mixture: the documents you have open are checked and linted in full, closed files a previous analysis reached are restored from a warm cache, and everything else this scan read afresh shows the output of the binding stage alone. Survey the diagnostics of the whole project, and compare them against another implementation, only after that run has completed.
 
 ## Configuration
 > Full documentation: https://spyglassmc.com/user/config
@@ -103,11 +114,25 @@ You can find all the references of objectives, tags, data storages, functions, a
 ## Commands
 > Full documentation: https://spyglassmc.com/user/commands
 
+Open the Command Palette (Ctrl+Shift+P, Shift+Cmd+P on macOS, or other configured hotkey) and type `Spyglass`.
+
+### Analyze project
+`Spyglass: Analyze Project` reads, parses, binds and checks every tracked file that sits under a project root and that the configuration does not exclude, then publishes the diagnostics it finds; dependencies such as the vanilla data pack are left out. **This is how the checker and the linter are run over a whole workspace.** The initial scan already binds the corpus and publishes what the binding stage finds, and a warm cache restores the diagnostics a previous analysis produced for closed files, but a full check of every file only happens here. It reports progress and can be cancelled.
+
+Cancelling does not undo the part that already ran, and what is left behind depends on where the run stopped. Its first pass only reads and binds, so a cancellation there updates no diagnostics at all. Its second pass publishes them file by file, so a cancellation there leaves the files it reached with their new diagnostics and the rest with whatever they showed before, or with none. Either way the run skips saving the cache on its way out, although what it published can still be written by a later autosave or by a clean shutdown of the server. The notification that follows tells the two apart — a cancelled run reports how many files of the total it analyzed, a completed one does not — but the Problems panel keeps no mark of it, so a partial result read later is indistinguishable from a finished one. Run the command again to the end before taking the panel for the whole picture.
+
+While it runs, no feature computes a partial result from a symbol table that is mid-rebuild. A hover is the only request that says so: as long as the hover feature is enabled, it answers that the project is still being analyzed. Completion, code actions, document symbols and the rest answer with an empty result, which the editor renders exactly like a genuine absence of candidates, so completions falling silent during an analysis is expected rather than a defect.
+
 ### Reset project cache
-Spyglass uses a cache to speedup the process of validating, finding references/definitions, document links, etc. However the cache may become outdated because of various reasons, which could lead to strange behaviors. You can use the `Spyglass: Reset Project Cache` command to regenerate the cache manually. You can open the command prompt using Ctrl+Shift+P (or other configured hotkey).
+Spyglass uses a cache to speedup the process of validating, finding references/definitions, document links, etc. However the cache may become outdated because of various reasons, which could lead to strange behaviors. `Spyglass: Reset Project Cache` regenerates it manually.
+
+The reset rebuilds the cache, the symbol table and the file hashes, and binds every tracked file again. It then rechecks the documents you have open, linter included, but **it does not check closed documents**: their diagnostics were produced by *Analyze Project*, and the reset discards the cache entry that held them. They stay absent until the next analysis, so run *Analyze Project* afterwards to get the complete set back.
+
+### Show output
+`Spyglass: Show Output` opens the language server log, which records the project lifecycle, the timing of each stage and the reason a file failed to be checked.
 
 ### Open cache folder
-If you are still experiencing problems after running the above command, you can navigate to the cache folder by using the `Spyglass: Open Cache Folder` command and wiping the folder. This removes the downloaded vanilla data pack, project caches, etc.
+If you are still experiencing problems after running `Spyglass: Reset Project Cache`, you can navigate to the cache folder by using the `Spyglass: Open Cache Folder` command and wiping the folder. This removes the downloaded vanilla data pack, project caches, etc.
 
 ## Credits
 This extension is only possible thanks to all the contributors that have worked on this project!
