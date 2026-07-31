@@ -30,7 +30,7 @@ interface SerializedCacheFixture {
 		files: Record<string, string>
 	}
 	contextHash: string
-	errors?: Record<string, unknown[]>
+	errors?: Record<string, core.PosRangeLanguageError[]>
 	initializerHash: string
 	lintHash?: string
 	version: number
@@ -311,9 +311,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 		// re-checked, so adopting a cache from a build whose checkers reported something else
 		// keeps reporting it. Bumping the format version is what ends that, which only holds as
 		// long as a fix to a checker comes with a bump.
-		const staleError = {
+		const staleError: core.PosRangeLanguageError = {
 			message: 'diagnostic of a build whose checkers have since been fixed',
-			range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			posRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
 			severity: 3,
 		}
 		const withStaleErrors = (version: number): SerializedCacheFixture => ({
