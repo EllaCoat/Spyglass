@@ -17,6 +17,8 @@ import type {
 } from './util/index.js'
 import { toCore, toLS, unavailable } from './util/index.js'
 import { LspFileWatcher } from './util/LspFileWatcher.js'
+import type { SentDiagnostics } from './util/publishDiagnostics.js'
+import { isRepeatOfLastSentDiagnostics } from './util/publishDiagnostics.js'
 
 export * from './util/types.js'
 
@@ -32,17 +34,11 @@ const cacheRoot = fileUtil.ensureEndingSlash(url.pathToFileURL(cacheRootPath).to
 
 const connection = ls.createConnection()
 /**
- * The last diagnostics notification sent for each URI, as the serialized payload that went out and
- * the version it went out with.
- *
- * A publish is skipped only when both match. The version is part of the comparison because the
- * same diagnostics are published under versions that mean different things — the editor's version
- * for a client-managed document, `-1` for one read from disk, none at all for the empty set that
- * retracts a removed document's diagnostics — and an empty payload is a payload like any other:
- * the diagnostics a client displays stay on screen until an empty set that differs from what it
- * last received takes them away.
+ * The last diagnostics notification sent for each URI. Entries whose payload was empty are dropped
+ * as soon as they are sent, so what this holds is one entry per URI the client is currently
+ * displaying diagnostics for.
  */
-const lastSentDiagnostics = new Map<string, { payload: string; version: number | undefined }>()
+const lastSentDiagnostics = new Map<string, SentDiagnostics>()
 let capabilities!: ls.ClientCapabilities
 let workspaceFolders!: ls.WorkspaceFolder[]
 let projectRoots!: core.RootUriString[]
@@ -145,22 +141,36 @@ connection.onInitialize(async (params) => {
 
 			const diagnostics = toLS.diagnostics(errors)
 			const payload = JSON.stringify(diagnostics)
-			const previous = lastSentDiagnostics.get(uri)
-			if (previous && previous.version === version && previous.payload === payload) {
+			if (isRepeatOfLastSentDiagnostics(lastSentDiagnostics.get(uri), payload, version)) {
 				// Notifying a client of the state it is already in is not free on its side: VS Code
 				// rebuilds the problems view around the new markers, which closes a hover open over
 				// one of them, which sends the requests that produced this publish all over again.
 				return
 			}
 			// Recorded before the notification rather than after it, so that the record follows the
-			// order the notifications go out in rather than the order their promises settle in.
-			lastSentDiagnostics.set(uri, { payload, version })
+			// order the notifications go out in rather than the order their promises settle in. The
+			// object identity is what tells the two branches below whether the record is still the
+			// one this notification made, or one a later notification for the same URI replaced it
+			// with while this one was in flight.
+			const sent: SentDiagnostics = { payload, version }
+			lastSentDiagnostics.set(uri, sent)
 			try {
 				await connection.sendDiagnostics({ diagnostics, uri, version })
+				if (diagnostics.length === 0 && lastSentDiagnostics.get(uri) === sent) {
+					// An empty set is the one payload worth forgetting: repeating it costs a client
+					// nothing — a URI with no diagnostics has no problems entry to hover, so no
+					// request comes back — while remembering it keeps an entry per URI that ever
+					// published, including the many that publish nothing and the temporary ones a
+					// long-running session never sees again.
+					lastSentDiagnostics.delete(uri)
+				}
 			} catch (e) {
-				// Nothing reached the client, so the next publish of these very diagnostics is a
-				// publish the client still needs.
-				lastSentDiagnostics.delete(uri)
+				if (lastSentDiagnostics.get(uri) === sent) {
+					// Nothing reached the client, so the next publish of these very diagnostics is
+					// a publish the client still needs. A record a later notification already
+					// replaced describes what that one sent and is not this failure's to drop.
+					lastSentDiagnostics.delete(uri)
+				}
 				console.error('[sendDiagnostics]', e)
 			}
 		}).on('ready', async () => {

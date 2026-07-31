@@ -1468,6 +1468,45 @@ describe('Project', () => {
 		})
 	})
 
+	describe('published diagnostics versions', () => {
+		it('Should publish every document under the version of the content it read', async () => {
+			const openUri = `${ProjectRoot}a.spyglasstest`
+			const diskUri = `${ProjectRoot}b.spyglasstest`
+			const goneUri = `${ProjectRoot}c.spyglasstest`
+			const { fs, project } = await setup({
+				'/root/a.spyglasstest': 'foo',
+				'/root/b.spyglasstest': 'foo',
+				'/root/c.spyglasstest': 'foo',
+			})
+			try {
+				await project.onDidOpen(openUri, 'spyglasstest', 7, 'foo')
+				// Bound by the initial scan and unreadable from here on, which leaves the analysis
+				// nothing to publish for it but the empty set that retracts what it published
+				// before.
+				fs.unlinkSync('/root/c.spyglasstest')
+
+				const versions = new Map<string, number | undefined>()
+				project.on('documentErrored', ({ uri, version }) => {
+					versions.set(uri, version)
+				})
+
+				await project.analyzeProject()
+
+				// The three versions a publish carries, all of them at once. A consumer that keeps
+				// the last publish of a URI around to recognize the next identical one has to tell
+				// them apart: they say which content the diagnostics describe, and one that reads
+				// them as interchangeable answers a retraction with silence.
+				assert.deepEqual(Object.fromEntries(versions), {
+					[openUri]: 7,
+					[diskUri]: -1,
+					[goneUri]: undefined,
+				})
+			} finally {
+				await project.close()
+			}
+		})
+	})
+
 	describe('check completion state', () => {
 		it('Should mark a document whose editor check threw', async () => {
 			const uri = `${ProjectRoot}a.spyglasstest`
