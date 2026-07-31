@@ -49,6 +49,7 @@ describe('impDocBareDeclaration', () => {
 				[
 					['BareTag', core.ErrorSeverity.Warning],
 					['bare:store', core.ErrorSeverity.Warning],
+					['bare:target', core.ErrorSeverity.Warning],
 				],
 			)
 			for (const error of errors) {
@@ -70,7 +71,11 @@ describe('impDocBareDeclaration', () => {
 		try {
 			assert.deepEqual(
 				errors.map(error => error.severity),
-				[core.ErrorSeverity.Error, core.ErrorSeverity.Error],
+				[
+					core.ErrorSeverity.Error,
+					core.ErrorSeverity.Error,
+					core.ErrorSeverity.Error,
+				],
 			)
 		} finally {
 			await close()

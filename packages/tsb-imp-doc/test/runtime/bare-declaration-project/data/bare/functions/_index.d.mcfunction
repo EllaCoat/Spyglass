@@ -7,6 +7,7 @@
 
 #declare tag BareTag
 #define storage bare:store
+#declare function bare:target
 
 #> Scoped
 # @private
