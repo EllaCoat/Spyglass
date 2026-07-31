@@ -151,6 +151,25 @@ export type GlobalSymbolAccess =
 	| { kind: 'readable'; symbols: SymbolTable }
 	| { kind: 'unavailable'; reason: FeatureUnavailableReason }
 
+/**
+ * What one document's diagnostics were made of when a language feature request last published
+ * them. See {@link Project.withClientFeatureAccess}.
+ *
+ * Every entry but the version is the array a stage left on the node rather than its contents: a
+ * stage that runs again replaces its array wholesale — the implicit lint drain deletes
+ * `linterErrors` before it lints again, and every other stage assigns a fresh dump — so comparing
+ * the references is comparing the results. The comparison errs towards publishing: two runs that
+ * produce equal errors in different arrays count as a change, and none of them can make a changed
+ * result look unchanged.
+ */
+interface PublishedFeatureState {
+	binderErrors: readonly LanguageError[] | undefined
+	checkerErrors: readonly LanguageError[] | undefined
+	checkerFailed: true | undefined
+	linterErrors: readonly LanguageError[] | undefined
+	parserErrors: readonly LanguageError[]
+	version: number
+}
 interface DocumentEvent extends DocAndNode {}
 interface DocumentErrorEvent {
 	/**
@@ -307,6 +326,12 @@ export class Project extends EventDispatcher<{
 	readonly #clientManagedDocAndNodes = new Map<string, DocAndNode>()
 	/** Logical project URI to the URI used by the language client, and vice versa. */
 	readonly #clientManagedUriMap = new TwoWayMap<string, string>()
+	/**
+	 * What {@link withClientFeatureAccess} published for an AST, keyed by that AST. Weak so that
+	 * the entry of a document that was closed, edited or reparsed — all of which leave a new node
+	 * behind — goes away with the node it describes, without a cleanup path of its own.
+	 */
+	readonly #featurePublishedStates = new WeakMap<FileNode<AstNode>, PublishedFeatureState>()
 	readonly #configService: ConfigService
 	readonly #symbolUpToDateUris = new Set<string>()
 	/**
@@ -2551,6 +2576,13 @@ export class Project extends EventDispatcher<{
 	 * registering itself while the callback walks the symbol table is the same race in the other
 	 * direction, and the queue is what orders the two.
 	 *
+	 * The publish is the one part that does not repeat. Every stage returns early once its own
+	 * results are on the node, so a second request for an unedited document runs no binder and no
+	 * checker and would republish what the first one already sent — and a client that redraws its
+	 * problems view on a publish drops the hover that asked, which sends the request again. See
+	 * {@link takeFeaturePublish} for what counts as unchanged and for the publishes it leaves
+	 * alone.
+	 *
 	 * The analysis is therefore looked for twice, once before entering the queue and once from
 	 * inside it. Only the second check is authoritative: an analysis registers itself through this
 	 * same queue, so one that started between the first check and the enqueue is already recorded by
@@ -2582,9 +2614,52 @@ export class Project extends EventDispatcher<{
 			}
 			await this.bind(result.doc, result.node)
 			await this.check(result.doc, result.node)
-			this.emit('documentUpdated', result)
+			if (this.takeFeaturePublish(result)) {
+				this.emit('documentUpdated', result)
+			}
 			return await callback({ kind: 'checked', doc: result.doc, node: result.node })
 		})
+	}
+
+	/**
+	 * Whether {@link withClientFeatureAccess} still has something to publish for `result`, recording
+	 * it as published when it has.
+	 *
+	 * `false` only for a document whose stages all returned early on results this very method
+	 * already saw published, which is the request that arrives on an unedited document after
+	 * another one just answered for it. Anything a stage recomputed — including a check that ends
+	 * up reporting nothing, which is what retracts the diagnostics a client is still displaying —
+	 * leaves a different set of arrays on the node and publishes.
+	 *
+	 * Only the publishes of this gate are recorded, so a request is still the thing that brings an
+	 * open document back in front of a client after another code path published it: the record is
+	 * what the gate sent, not what the client last received. This gate is also the only reader of
+	 * the record, and every one of its calls runs inside the lifecycle queue, so the read and the
+	 * write below cannot be split by another request.
+	 */
+	private takeFeaturePublish({ doc, node }: DocAndNode): boolean {
+		const previous = this.#featurePublishedStates.get(node)
+		const current: PublishedFeatureState = {
+			binderErrors: node.binderErrors,
+			checkerErrors: node.checkerErrors,
+			checkerFailed: node.checkerFailed,
+			linterErrors: node.linterErrors,
+			parserErrors: node.parserErrors,
+			version: doc.version,
+		}
+		if (
+			previous
+			&& previous.binderErrors === current.binderErrors
+			&& previous.checkerErrors === current.checkerErrors
+			&& previous.checkerFailed === current.checkerFailed
+			&& previous.linterErrors === current.linterErrors
+			&& previous.parserErrors === current.parserErrors
+			&& previous.version === current.version
+		) {
+			return false
+		}
+		this.#featurePublishedStates.set(node, current)
+		return true
 	}
 
 	/**
