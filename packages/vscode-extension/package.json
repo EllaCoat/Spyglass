@@ -1,6 +1,6 @@
 {
   "name": "tsb-spyglass",
-  "version": "0.4.2",
+  "version": "0.5.2",
   "type": "commonjs",
   "main": "dist/extension.js",
   "author": "Spyglass Contributors",
