@@ -20,13 +20,19 @@ import type { Project } from './Project.js'
  * The format version of the cache. Should be increased when any changes that
  * could invalidate the cache are introduced to the Spyglass codebase.
  *
+ * Note: a change to what a checker reports counts as such a change, and version 10 is one.
+ * {@link CacheFile.errors} carries the diagnostics of the build that wrote the cache, and
+ * {@link CacheService#validate} classifies a file whose content is unchanged as unchanged, so it
+ * is never re-checked. Without a bump the corrected diagnostics only reach the files a user
+ * already had cached once something else invalidates them.
+ *
  * Note: URI normalization of projectRoots (PR #25) does NOT require bumping this version.
  * The version check runs after cache files are located by hash-derived filename, so
  * pre-normalization cache files simply become orphaned (unread) rather than triggering
  * migration or reset. Bumping would only invalidate the live cache of users already on
  * canonical URIs (Linux/macOS + lowercase-drive Windows), for no gain.
  */
-export const LatestCacheVersion = 9
+export const LatestCacheVersion = 10
 const ChecksumReadConcurrency = 32
 
 /**

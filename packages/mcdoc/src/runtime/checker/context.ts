@@ -24,6 +24,13 @@ export type TypeInfoAttacher<T> = (
 	node: T,
 	definition: SimplifiedMcdocType,
 	description?: string,
+	/**
+	 * Resolves the same type again without letting `#[canonical]` union members shadow their
+	 * alternatives, which is what a value assigned to this node may actually be. Only differs
+	 * from `definition` when the context has `requireCanonical` set, and may need an extra
+	 * simplification, so only call it where the distinction matters.
+	 */
+	getNonCanonicalTypeDef?: () => SimplifiedMcdocType,
 ) => void
 
 export type NodeAttacher<T> = (node: T, attacher: (node: core.AstNode) => void) => void

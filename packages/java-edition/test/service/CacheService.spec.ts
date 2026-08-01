@@ -30,6 +30,7 @@ interface SerializedCacheFixture {
 		files: Record<string, string>
 	}
 	contextHash: string
+	errors?: Record<string, core.PosRangeLanguageError[]>
 	initializerHash: string
 	lintHash?: string
 	version: number
@@ -164,7 +165,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 	}
 
 	it('does not report an unchanged binary file as changed after cache reload', async () => {
-		assert.equal(core.LatestCacheVersion, 9)
+		assert.equal(core.LatestCacheVersion, 10)
 
 		const first = createProject()
 		try {
@@ -241,7 +242,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		}
 	})
 
-	it('persists the v9 component hashes and separate raw/text file hashes', async () => {
+	it('persists the v10 component hashes and separate raw/text file hashes', async () => {
 		const project = createProject()
 		try {
 			await readyProject(project)
@@ -250,7 +251,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		}
 
 		const cache = await readCacheFile()
-		assert.equal(cache.version, 9)
+		assert.equal(cache.version, 10)
 		for (const key of ['contextHash', 'initializerHash', 'lintHash'] as const) {
 			const hash = cache[key]
 			assert.ok(typeof hash === 'string')
@@ -265,7 +266,7 @@ describe('CacheService binary file hashing (#1706)', () => {
 		assert.notEqual(rawHash, textHash)
 	})
 
-	it('rejects v8 caches, newer caches after downgrade, and incomplete v9 schemas', async () => {
+	it('rejects v9 caches, newer caches after downgrade, and incomplete v10 schemas', async () => {
 		const seed = createProject()
 		try {
 			await readyProject(seed)
@@ -276,9 +277,9 @@ describe('CacheService binary file hashing (#1706)', () => {
 
 		for (
 			const fixture of [
-				{ name: 'v8', patch: { version: 8 } },
-				{ name: 'newer v10', patch: { version: 10 } },
-				{ name: 'incomplete v9', patch: { lintHash: undefined } },
+				{ name: 'v9', patch: { version: 9 } },
+				{ name: 'newer v11', patch: { version: 11 } },
+				{ name: 'incomplete v10', patch: { lintHash: undefined } },
 			]
 		) {
 			const cache = structuredClone(validCache)
@@ -295,6 +296,50 @@ describe('CacheService binary file hashing (#1706)', () => {
 			} finally {
 				await project.close()
 			}
+		}
+	})
+
+	it('drops the diagnostics of a cache written for an older format version', async () => {
+		const seed = createProject()
+		try {
+			await readyProject(seed)
+		} finally {
+			await seed.close()
+		}
+		const validCache = await readCacheFile()
+		// A cache carries the diagnostics its own build produced, and an unchanged file is not
+		// re-checked, so adopting a cache from a build whose checkers reported something else
+		// keeps reporting it. Bumping the format version is what ends that, which only holds as
+		// long as a fix to a checker comes with a bump.
+		const staleError: core.PosRangeLanguageError = {
+			message: 'diagnostic of a build whose checkers have since been fixed',
+			posRange: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } },
+			severity: 3,
+		}
+		const withStaleErrors = (version: number): SerializedCacheFixture => ({
+			...structuredClone(validCache),
+			errors: { [binaryUri]: [staleError] },
+			version,
+		})
+
+		// The current version does restore them, so the assertion below measures the version
+		// check rather than something else dropping the entry on the way.
+		await writeCacheFile(withStaleErrors(core.LatestCacheVersion))
+		const current = createProject()
+		try {
+			await current.init()
+			assert.deepEqual(current.cacheService.errors[binaryUri], [staleError])
+		} finally {
+			await current.close()
+		}
+
+		await writeCacheFile(withStaleErrors(core.LatestCacheVersion - 1))
+		const outdated = createProject()
+		try {
+			await outdated.init()
+			assert.deepEqual(outdated.cacheService.errors, {})
+		} finally {
+			await outdated.close()
 		}
 	})
 

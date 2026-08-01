@@ -122,6 +122,27 @@ namespace ModuleSymbolData {
 
 export interface TypeDefSymbolData {
 	typeDef: McdocType
+	/**
+	 * Simplified forms of {@link typeDef}, cached when `env.enableMcdocCaching` is set.
+	 *
+	 * `#[canonical]` union members shadow their alternatives only for checkers that set
+	 * `requireCanonical`, so one symbol has two simplified forms and each needs its own slot.
+	 */
+	simplifiedTypeDefs?: {
+		canonical?: SimplifiedMcdocType
+		nonCanonical?: SimplifiedMcdocType
+	}
+	/**
+	 * The single slot that predates {@link simplifiedTypeDefs}. Whichever of the two contexts
+	 * reached the symbol first wrote it, so its content cannot be attributed to either slot.
+	 *
+	 * Symbols are restored from the on-disk cache as they were written, so entries in this shape
+	 * outlive the build that wrote them. Reading one as if it were a specific slot is what the
+	 * split exists to prevent, hence it is only ever discarded — declared so that the discarding
+	 * is explicit rather than an untyped leftover.
+	 *
+	 * @deprecated
+	 */
 	simplifiedTypeDef?: SimplifiedMcdocType
 }
 export namespace TypeDefSymbolData {
