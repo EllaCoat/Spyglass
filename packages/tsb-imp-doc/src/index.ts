@@ -9,6 +9,11 @@ import { checkAlias, impDoc as checkImpDoc } from './checker/impDoc.js'
 import { registerAliasCompleters } from './completer/alias.js'
 import { registerEntityCompleters } from './completer/entity.js'
 import { registerVisibilityCompleters } from './completer/visibility.js'
+import {
+	bareDeclaration,
+	bareDeclarationConfigValidator,
+	isBareDeclaration,
+} from './linter/bareDeclaration.js'
 import { conflictConfigValidator, visibilityConflict } from './linter/conflict.js'
 import { contractCheckLinter, contractConfigValidator } from './linter/contract.js'
 import { configValidator, privateVisibility } from './linter/private.js'
@@ -83,6 +88,11 @@ export const initialize: ProjectInitializer = ({ meta }) => {
 		configValidator: conflictConfigValidator,
 		linter: visibilityConflict,
 		nodePredicate: node => node.type === 'file',
+	})
+	meta.registerLinter('impDocBareDeclaration', {
+		configValidator: bareDeclarationConfigValidator,
+		linter: bareDeclaration,
+		nodePredicate: isBareDeclaration,
 	})
 	meta.registerLinter('impDocContractCheck', {
 		configValidator: contractConfigValidator,

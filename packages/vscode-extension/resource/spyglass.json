@@ -435,6 +435,10 @@
 					"description": "Report symbols declared with conflicting IMP-Doc visibility in more than one place. Fork-only rule.",
 					"$ref": "#/definitions/ImpDocBooleanLint"
 				},
+				"impDocBareDeclaration": {
+					"description": "Report `#declare` / `#define` directives that own no IMP-Doc block, and are therefore declared public no matter what the surrounding function header annotates. Fork-only rule. Off unless configured.",
+					"$ref": "#/definitions/ImpDocBooleanLint"
+				},
 				"impDocContractCheck": {
 					"description": "Semantic checks for typed IMP-Doc function contracts. Fork-only rule. Defaults to `off`.",
 					"enum": [ "off", "information", "warning", "error" ]

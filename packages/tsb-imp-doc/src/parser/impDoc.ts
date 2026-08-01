@@ -657,6 +657,44 @@ function overlapsAnyDeclarationLine(
 }
 
 /**
+ * Recovers a `#declare` / `#define` directive that owns no IMP-Doc block, i.e.
+ * one written on a plain comment line rather than below a `#>` block of its own
+ * (a blank line between the function header and the directive is enough).
+ *
+ * v3 never routed these through the doc-comment plugin: `#declare` lived in the
+ * CommandTree `comments` section, so a directive registered its symbol wherever
+ * it appeared. Reproducing that here keeps such symbols resolvable instead of
+ * leaving every reference to them reported as undeclared.
+ *
+ * The recovered node is nested inside the comment rather than replacing it, so
+ * everything that already treats the line as a comment keeps working; the
+ * binder is reached through the fallback binder's shallowest-bound-child walk.
+ * Acceptance stays as narrow as v3's literal parser: {@link parseDeclarationLine}
+ * only matches the exact `#declare` / `#define` literal followed by a space, so
+ * prose comments (`# declare ...`, `#declared ...`) are left untouched.
+ */
+function recoverBareDeclaration(
+	comment: core.AstNode,
+	trimmed: string,
+	src: core.Source,
+	ctx: core.ParserContext,
+): void {
+	if (!trimmed.startsWith('#declare') && !trimmed.startsWith('#define')) {
+		return
+	}
+	const declaration = parseDeclarationLine(
+		src,
+		{ indent: '', range: comment.range, raw: src.slice(comment) },
+		ctx,
+	)
+	if (!declaration) {
+		return
+	}
+	declaration.bare = true
+	;(comment.children ??= []).push(declaration)
+}
+
+/**
  * Nests static function references scanned from a `mcfunction:macro` line as
  * children of the `mcfunction:macro/other` segment that contains them. Nesting
  * keeps `AstNode.findChildIndex`'s binary-search invariant intact (a sibling
@@ -707,7 +745,13 @@ export function extendMcfunctionParser(
 				children.push(child)
 				continue
 			}
-			if (child.type !== 'comment' || !src.slice(child).trimStart().startsWith('#>')) {
+			if (child.type !== 'comment') {
+				children.push(child)
+				continue
+			}
+			const trimmed = src.slice(child).trimStart()
+			if (!trimmed.startsWith('#>')) {
+				recoverBareDeclaration(child, trimmed, src, ctx)
 				children.push(child)
 				continue
 			}

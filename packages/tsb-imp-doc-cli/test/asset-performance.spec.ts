@@ -85,7 +85,7 @@ describe('Phase 5b Asset profiler', () => {
 			profilers: session.factory,
 		})
 
-		assert.equal(result.filesScanned, 18)
+		assert.equal(result.filesScanned, 19)
 		const output = session.toOutput()
 		assert.deepEqual(
 			output.profilers.map(profiler => profiler.id),
@@ -95,7 +95,7 @@ describe('Phase 5b Asset profiler', () => {
 			// The lint stage runs one pass per enabled rule
 			// (impDocPrivate + impDocPrivateBestEffort), so it records
 			// one task per file per rule.
-			assert.equal(profiler.totalTasks, profiler.id === 'project#lint' ? 36 : 18)
+			assert.equal(profiler.totalTasks, profiler.id === 'project#lint' ? 38 : 19)
 			assert.ok(profiler.tasks.length > 0)
 		}
 	})
@@ -152,7 +152,7 @@ describe('serialize stage profiler', () => {
 		const manifest = summaries.find(candidate => candidate.id === SerializeManifestProfilerId)
 		assert.ok(manifest)
 		assert.equal(manifest.style, 'top-n')
-		assert.equal(manifest.totalTasks, 18)
+		assert.equal(manifest.totalTasks, 19)
 	})
 
 	it('stops after the dependency graph when no cache path is configured', async () => {

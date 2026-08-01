@@ -69,6 +69,29 @@ function declarationsOf(docs: readonly ImpDocNode[]): ImpDocDeclarationNode[] {
 	return docs.flatMap(doc => doc.declaration?.declarations ?? [])
 }
 
+function isDeclarationNode(node: AstNode): node is ImpDocDeclarationNode {
+	return node.type === 'impDoc:declaration'
+}
+
+/** Stands in for the mcfunction parser on fixtures whose lines are all comments. */
+function commentOnlyParser(src: Source): AstNode {
+	const children: AstNode[] = []
+	for (const match of src.string.matchAll(/^[\t ]*#/gm)) {
+		const hashStart = match.index + match[0].length - 1
+		const lineEnd = src.string.indexOf('\n', hashStart)
+		children.push({
+			type: 'comment',
+			range: { start: hashStart, end: lineEnd < 0 ? src.string.length : lineEnd },
+		})
+	}
+	src.cursor = src.string.length
+	return {
+		type: 'fixture:mcfunction',
+		range: { start: 0, end: src.string.length },
+		children,
+	}
+}
+
 function assertTokenRanges(
 	content: string,
 	declarations: readonly ImpDocDeclarationNode[],
@@ -404,6 +427,43 @@ describe('IMP-Doc parser', () => {
 				['entity', '@s'],
 				['tag', 'foo/bar'],
 			],
+		)
+	})
+
+	it('recovers bare #declare / #define lines that own no IMP-Doc block', async () => {
+		const content = await loadFixture('19-bare-declaration.mcfunction')
+		const src = new Source(content)
+		const err = new ErrorReporter()
+		const result = extendMcfunctionParser(commentOnlyParser)(
+			src,
+			createParserContext(err),
+		)
+		if (result === Failure) {
+			assert.fail('adapted mcfunction parse should not be Failure')
+		}
+		AstNode.setParents(result)
+
+		assert.deepEqual(err.errors, [])
+		const bare = (result.children ?? [])
+			.filter(child => child.type === 'comment')
+			.flatMap(child => (child.children ?? []).filter(isDeclarationNode))
+		assert.deepEqual(
+			bare.map(node => [node.category, node.name.raw, node.bare]),
+			[
+				['tag', 'BareTag', true],
+				['storage', 'fixture:bare', true],
+			],
+		)
+		for (const node of bare) {
+			assert.equal(node.parent?.type, 'comment')
+		}
+		assertTokenRanges(content, bare)
+
+		// The dedicated `#> Scoped` block keeps owning its own declaration.
+		const docs = result.children?.filter(ImpDocNode.is) ?? []
+		assert.deepEqual(
+			declarationsOf(docs).map(node => [node.category, node.name.raw, node.bare]),
+			[['tag', 'ScopedTag', undefined]],
 		)
 	})
 

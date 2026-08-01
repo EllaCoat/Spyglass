@@ -12,6 +12,7 @@ import type {
 } from '../lib/index.js'
 import {
 	canonicalizeLegacyDeclarationSymbolName,
+	extendMcfunctionParser,
 	getCanonicalSymbolCategory,
 	getImpDocSymbolData,
 	impDoc,
@@ -165,6 +166,116 @@ async function bindFixture(name: string): Promise<{
 	})
 	return { err, declarations, symbols }
 }
+
+/** Stands in for the mcfunction parser on fixtures whose lines are all comments. */
+function commentOnlyParser(src: core.Source): core.AstNode {
+	const children: core.AstNode[] = []
+	for (const match of src.string.matchAll(/^[\t ]*#/gm)) {
+		const hashStart = match.index + match[0].length - 1
+		const lineEnd = src.string.indexOf('\n', hashStart)
+		children.push({
+			type: 'comment',
+			range: { start: hashStart, end: lineEnd < 0 ? src.string.length : lineEnd },
+		})
+	}
+	src.cursor = src.string.length
+	return {
+		type: 'fixture:mcfunction',
+		range: { start: 0, end: src.string.length },
+		children,
+	}
+}
+
+function collectDeclarations(node: core.AstNode): ImpDocDeclarationNode[] {
+	if (node.type === 'impDoc:declaration') {
+		return [node as ImpDocDeclarationNode]
+	}
+	return (node.children ?? []).flatMap(collectDeclarations)
+}
+
+/**
+ * Full parser-to-binder path, unlike {@link bindFixture} which drives the
+ * `impDoc` component parser directly. Bare `#declare` lines only exist once the
+ * mcfunction adapter has run over the whole document.
+ */
+async function bindDocument(name: string): Promise<{
+	err: core.ErrorReporter
+	declarations: ImpDocDeclarationNode[]
+	symbols: core.SymbolUtil
+}> {
+	const content = await readFile(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
+	const err = new core.ErrorReporter()
+	const root = extendMcfunctionParser(commentOnlyParser)(
+		new core.Source(content),
+		{ err } as Parameters<typeof impDoc>[1],
+	)
+	assert.notEqual(root, core.Failure)
+	const file = root as core.AstNode
+	core.AstNode.setParents(file)
+
+	const symbols = new core.SymbolUtil(core.SymbolTable.link({
+		function: {
+			'fixture:_index.d': { definition: [{ uri: Uri }] },
+		},
+	} as core.UnlinkedSymbolTable))
+	symbols.buildCache()
+	const ctx = {
+		doc: {
+			uri: Uri,
+			languageId: 'mcfunction',
+			version: 1,
+			lineCount: content.split(/\r?\n/u).length,
+			getText: () => content,
+			offsetAt: (position: { character: number }) => position.character,
+			positionAt: (offset: number) => ({ line: 0, character: offset }),
+		},
+		err,
+		symbols,
+	} as unknown as core.BinderContext
+	const declarations = collectDeclarations(file)
+	symbols.contributeAs('binder', () => {
+		for (const node of declarations) {
+			bindDeclaration(node, ctx)
+		}
+	})
+	return { err, declarations, symbols }
+}
+
+describe('IMP-Doc bare declaration binder', () => {
+	it('registers directives that own no IMP-Doc block as public (v3 defaultVisibility)', async () => {
+		const { declarations, err, symbols } = await bindDocument(
+			'19-bare-declaration.mcfunction',
+		)
+
+		assert.deepEqual(err.errors, [])
+		assert.deepEqual(
+			declarations.map(node => [node.category, node.name.raw, node.bare === true]),
+			[
+				['tag', 'BareTag', true],
+				['storage', 'fixture:bare', true],
+				['tag', 'ScopedTag', false],
+			],
+		)
+
+		for (const [category, name] of [['tag', 'BareTag'], ['storage', 'fixture:bare']]) {
+			const symbol = symbols.lookup(category!, [name!]).symbol
+			assert.ok(symbol, `${category}:${name}`)
+			// The enclosing header carries `@within function fixture:**`; a bare
+			// directive must not inherit it, or the symbol becomes stricter than
+			// v3 registered it.
+			assert.deepEqual(declaredVisibility(symbol), { type: 'public' }, `${category}:${name}`)
+			assert.equal(
+				getImpDocSymbolData(symbol.data)?.declarations?.[0]?.owner,
+				'fixture:_index.d',
+			)
+			assert.equal(symbol.visibility, 2)
+		}
+
+		const scoped = symbols.lookup('tag', ['ScopedTag']).symbol
+		assert.ok(scoped)
+		assert.deepEqual(declaredVisibility(scoped), { type: 'public' })
+	})
+})
 
 describe('IMP-Doc declaration binder visibility fallback', () => {
 	it('preserves valid variants and defaults annotation-free declarations to public', () => {
